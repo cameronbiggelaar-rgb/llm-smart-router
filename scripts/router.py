@@ -72,6 +72,8 @@ class RoutingDecision:
     is_fallback: bool = False       # True if this is a fallback from a failed model
     original_model: str = ""        # the model that was tried first (if fallback)
     all_exhausted: bool = False     # True when every model is unavailable
+    limp_home: bool = False         # True when in limp-home mode (local only)
+    limp_home_reason: str = ""      # why we're in limp-home mode
 
 
 @dataclass
@@ -404,6 +406,109 @@ def probe_all_recovering() -> List[str]:
     return recovered
 
 
+# ── Limp-home mode ────────────────────────────────────────────────────────────
+
+# Track whether we're in limp-home mode
+_LIMP_HOME_ACTIVE: bool = False
+_LIMP_HOME_SINCE: float = 0.0
+_LIMP_HOME_REASON: str = ""
+
+
+def is_limp_home() -> bool:
+    """Check if the system is in limp-home mode (all cloud models unavailable)."""
+    return _LIMP_HOME_ACTIVE
+
+
+def get_limp_home_info() -> Dict[str, Any]:
+    """Get information about the current limp-home state."""
+    return {
+        "active": _LIMP_HOME_ACTIVE,
+        "since": _LIMP_HOME_SINCE,
+        "reason": _LIMP_HOME_REASON,
+        "duration_seconds": time.time() - _LIMP_HOME_SINCE if _LIMP_HOME_ACTIVE else 0,
+    }
+
+
+def _check_limp_home() -> None:
+    """Check if we should enter or exit limp-home mode.
+
+    Enters limp-home when all cloud models are unavailable.
+    Exits limp-home when at least one cloud model recovers.
+    """
+    global _LIMP_HOME_ACTIVE, _LIMP_HOME_SINCE, _LIMP_HOME_REASON
+
+    # Probe recovering models first
+    probe_all_recovering()
+
+    # Check if any cloud model is available
+    cloud_models = [m for m in MODEL_COST_ORDER
+                    if m not in ("llama3.1:8b", "qwen3:14b", "dolphin3")]
+    any_cloud_available = any(is_model_available(m) for m in cloud_models)
+
+    # Check if any local model is available
+    local_available = is_model_available("qwen3:14b") or is_model_available("llama3.1:8b")
+
+    if not any_cloud_available and local_available and not _LIMP_HOME_ACTIVE:
+        # Entering limp-home mode
+        _LIMP_HOME_ACTIVE = True
+        _LIMP_HOME_SINCE = time.time()
+        _LIMP_HOME_REASON = "all cloud models exhausted, running on local only"
+        _log_recovery_event("SYSTEM", "limp_home_entered",
+                            f"cloud exhausted, local available")
+        logger.warning("⚠️  LIMP-HOME MODE ACTIVATED — all cloud models exhausted, running on local only")
+
+    elif any_cloud_available and _LIMP_HOME_ACTIVE:
+        # Exiting limp-home mode
+        duration = time.time() - _LIMP_HOME_SINCE
+        _LIMP_HOME_ACTIVE = False
+        _LIMP_HOME_SINCE = 0.0
+        _LIMP_HOME_REASON = ""
+        _log_recovery_event("SYSTEM", "limp_home_exited",
+                            f"cloud recovered after {duration:.0f}s")
+        logger.info("✅ Limp-home mode exited — cloud models recovered after %.0fs", duration)
+
+
+def get_limp_home_message() -> str:
+    """Get a user-facing message about limp-home mode."""
+    if not _LIMP_HOME_ACTIVE:
+        return ""
+
+    duration = int(time.time() - _LIMP_HOME_SINCE)
+    return (
+        "⚠️  **Limp-home mode active** — all cloud models are currently exhausted.\n"
+        f"Running on local models only ({_best_local_model()}). "
+        "Capability is significantly reduced:\n"
+        "  • Simple Q&A and basic tasks: ✅ should work\n"
+        "  • Complex coding, debugging, planning: ⚠️ may struggle\n"
+        "  • Subagent delegation: ❌ paused until cloud recovers\n"
+        f"Duration: {duration // 60}m {duration % 60}s\n"
+        "Cloud models will be re-checked automatically every 2 minutes."
+    )
+
+
+def _best_local_model() -> str:
+    """Get the best available local model."""
+    if is_model_available("qwen3:14b"):
+        return "qwen3:14b"
+    if is_model_available("llama3.1:8b"):
+        return "llama3.1:8b"
+    return "none"
+
+
+def _select_limp_home_model(task_type: str, complexity_score: float) -> str:
+    """Select the best local model for a task in limp-home mode.
+
+    In limp-home mode, we only use local models. The routing is simpler:
+    - qwen3:14b (better) for anything non-trivial
+    - llama3.1:8b (basic) for simple Q&A
+    """
+    if is_model_available("qwen3:14b"):
+        return "qwen3:14b"
+    if is_model_available("llama3.1:8b"):
+        return "llama3.1:8b"
+    return ""
+
+
 # ── Routing logic ─────────────────────────────────────────────────────────────
 
 def route_task(
@@ -436,6 +541,45 @@ def route_task(
     # Try to recover any models that may have come back
     probe_all_recovering()
 
+    # Check limp-home status
+    _check_limp_home()
+
+    # Compute capability tier needed (used by both limp-home and normal routing)
+    min_tier = _estimate_min_tier(
+        complexity_score=complexity_score,
+        task_type=task_type,
+        has_niche_references=has_niche_references,
+        has_format_constraint=has_format_constraint,
+        instruction_count=instruction_count,
+        is_subagent=is_subagent,
+        parent_model=parent_model,
+    )
+
+    # ── Limp-home mode: local models only ──
+    if _LIMP_HOME_ACTIVE:
+        local_model = _select_limp_home_model(task_type, complexity_score)
+        if not local_model:
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason="limp-home mode but no local models available",
+                fallback_chain=[],
+                all_exhausted=True,
+                limp_home=True,
+                limp_home_reason=_LIMP_HOME_REASON,
+            )
+
+        # In limp-home, we still try to match capability but accept what we get
+        local_tier = MODEL_CAPABILITY_TIERS.get(local_model, 1)
+        return RoutingDecision(
+            selected_model=local_model,
+            selected_provider="local",
+            reason=f"limp-home mode — {local_model} (tier {local_tier}) vs needed tier {min_tier}",
+            fallback_chain=[local_model],
+            limp_home=True,
+            limp_home_reason=_LIMP_HOME_REASON,
+        )
+
     # ── Private mode override ──
     if is_private:
         return RoutingDecision(
@@ -456,16 +600,6 @@ def route_task(
         )
 
     # ── Capability-based routing ──
-    min_tier = _estimate_min_tier(
-        complexity_score=complexity_score,
-        task_type=task_type,
-        has_niche_references=has_niche_references,
-        has_format_constraint=has_format_constraint,
-        instruction_count=instruction_count,
-        is_subagent=is_subagent,
-        parent_model=parent_model,
-    )
-
     # Find the cheapest available model that meets the minimum tier
     selected = _select_model(min_tier)
     fallback_chain = _build_fallback_chain(selected)
@@ -521,6 +655,23 @@ def escalate_on_failure(
     # Check circuit breaker threshold
     if status and status.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
         open_circuit(failed_model, error_type)
+
+    # Check if we should enter limp-home mode
+    _check_limp_home()
+
+    if _LIMP_HOME_ACTIVE:
+        local_model = _select_limp_home_model("other", 0.5)
+        if local_model:
+            return RoutingDecision(
+                selected_model=local_model,
+                selected_provider="local",
+                reason=f"limp-home mode after {failed_model} ({error_type})",
+                fallback_chain=[local_model],
+                is_fallback=True,
+                original_model=failed_model,
+                limp_home=True,
+                limp_home_reason=_LIMP_HOME_REASON,
+            )
 
     # Find the next available model with higher capability
     failed_tier = MODEL_CAPABILITY_TIERS.get(failed_model, 0)
