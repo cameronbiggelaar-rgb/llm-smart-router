@@ -508,19 +508,33 @@ def _notify_callbacks(event: str, info: Dict[str, Any]) -> None:
             logger.error("Limp-home callback %s failed: %s", cb["name"], e)
 
 
-def check_limp_home_status() -> Dict[str, Any]:
+def check_limp_home_status(needs_llm: bool = False) -> Dict[str, Any]:
     """Public API for in-flight projects to check if they should pause.
 
-    Returns the current limp-home info. Projects should call this at
-    the start of each iteration/batch and pause if active.
+    Args:
+        needs_llm: Set True if this project requires cloud LLM capability.
+                   Non-LLM projects (data processing, file ops, scripts)
+                   should pass False — they run regardless of limp-home.
+
+    Returns:
+        Dict with active, since, reason, duration_seconds, needs_llm.
+        When needs_llm=True and active=True, the project should pause.
 
     Usage:
-        status = check_limp_home_status()
+        # LLM-dependent project — pause if cloud is exhausted
+        status = check_limp_home_status(needs_llm=True)
         if status["active"]:
             print(f"PAUSING — limp-home active for {status['duration_seconds']}s")
             return
+
+        # Non-LLM project — always runs
+        status = check_limp_home_status(needs_llm=False)
+        # status["active"] is informational only
     """
-    return get_limp_home_info()
+    info = get_limp_home_info()
+    info["needs_llm"] = needs_llm
+    info["should_pause"] = needs_llm and info["active"]
+    return info
 
 
 def _check_limp_home() -> None:
