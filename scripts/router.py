@@ -413,6 +413,12 @@ _LIMP_HOME_ACTIVE: bool = False
 _LIMP_HOME_SINCE: float = 0.0
 _LIMP_HOME_REASON: str = ""
 
+# Callbacks registered by in-flight projects
+_LIMP_HOME_CALLBACKS: List[Dict[str, Any]] = []  # {name, on_enter, on_exit, notify}
+
+# Path to status signal file (for cron jobs and subagents to poll)
+LIMP_HOME_SIGNAL_FILE = str(Path.home() / ".hermes" / "data" / "limp_home_status.json")
+
 
 def is_limp_home() -> bool:
     """Check if the system is in limp-home mode (all cloud models unavailable)."""
@@ -429,11 +435,101 @@ def get_limp_home_info() -> Dict[str, Any]:
     }
 
 
+def _write_limp_home_signal() -> None:
+    """Write the current limp-home status to a JSON signal file.
+
+    This file is polled by cron jobs, subagents, and long-running
+    projects to check if they should pause or continue.
+    """
+    path = Path(LIMP_HOME_SIGNAL_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    info = get_limp_home_info()
+    info["timestamp"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(info, indent=2))
+
+
+def register_limp_home_callback(
+    name: str,
+    on_enter: Optional[callable] = None,
+    on_exit: Optional[callable] = None,
+    notify: bool = True,
+) -> str:
+    """Register a callback for limp-home state changes.
+
+    In-flight projects (batch audits, subagent chains, cron jobs) call
+    this to get notified when limp-home enters or exits.
+
+    Args:
+        name: Human-readable name for the callback (e.g. "batch-audit-runner").
+        on_enter: Function to call when limp-home activates. Receives info dict.
+        on_exit: Function to call when limp-home exits. Receives info dict.
+        notify: If True, the callback is notified immediately if limp-home
+                is already active at registration time.
+
+    Returns:
+        Callback ID (for deregistration).
+    """
+    callback_id = f"{name}_{int(time.time())}"
+    _LIMP_HOME_CALLBACKS.append({
+        "id": callback_id,
+        "name": name,
+        "on_enter": on_enter,
+        "on_exit": on_exit,
+    })
+
+    # If limp-home is already active, notify immediately
+    if notify and _LIMP_HOME_ACTIVE and on_enter:
+        try:
+            on_enter(get_limp_home_info())
+        except Exception as e:
+            logger.error("Limp-home callback %s on_enter failed: %s", name, e)
+
+    logger.info("Registered limp-home callback: %s (%s)", name, callback_id)
+    return callback_id
+
+
+def unregister_limp_home_callback(callback_id: str) -> bool:
+    """Remove a previously registered callback."""
+    global _LIMP_HOME_CALLBACKS
+    before = len(_LIMP_HOME_CALLBACKS)
+    _LIMP_HOME_CALLBACKS = [c for c in _LIMP_HOME_CALLBACKS if c["id"] != callback_id]
+    return len(_LIMP_HOME_CALLBACKS) < before
+
+
+def _notify_callbacks(event: str, info: Dict[str, Any]) -> None:
+    """Notify all registered callbacks of a limp-home state change."""
+    for cb in _LIMP_HOME_CALLBACKS:
+        try:
+            if event == "enter" and cb.get("on_enter"):
+                cb["on_enter"](info)
+            elif event == "exit" and cb.get("on_exit"):
+                cb["on_exit"](info)
+        except Exception as e:
+            logger.error("Limp-home callback %s failed: %s", cb["name"], e)
+
+
+def check_limp_home_status() -> Dict[str, Any]:
+    """Public API for in-flight projects to check if they should pause.
+
+    Returns the current limp-home info. Projects should call this at
+    the start of each iteration/batch and pause if active.
+
+    Usage:
+        status = check_limp_home_status()
+        if status["active"]:
+            print(f"PAUSING — limp-home active for {status['duration_seconds']}s")
+            return
+    """
+    return get_limp_home_info()
+
+
 def _check_limp_home() -> None:
     """Check if we should enter or exit limp-home mode.
 
     Enters limp-home when all cloud models are unavailable.
     Exits limp-home when at least one cloud model recovers.
+    Notifies all registered callbacks on state change.
+    Writes signal file for external polling.
     """
     global _LIMP_HOME_ACTIVE, _LIMP_HOME_SINCE, _LIMP_HOME_REASON
 
@@ -457,6 +553,10 @@ def _check_limp_home() -> None:
                             f"cloud exhausted, local available")
         logger.warning("⚠️  LIMP-HOME MODE ACTIVATED — all cloud models exhausted, running on local only")
 
+        # Write signal file and notify callbacks
+        _write_limp_home_signal()
+        _notify_callbacks("enter", get_limp_home_info())
+
     elif any_cloud_available and _LIMP_HOME_ACTIVE:
         # Exiting limp-home mode
         duration = time.time() - _LIMP_HOME_SINCE
@@ -466,6 +566,10 @@ def _check_limp_home() -> None:
         _log_recovery_event("SYSTEM", "limp_home_exited",
                             f"cloud recovered after {duration:.0f}s")
         logger.info("✅ Limp-home mode exited — cloud models recovered after %.0fs", duration)
+
+        # Write signal file and notify callbacks
+        _write_limp_home_signal()
+        _notify_callbacks("exit", {"duration_seconds": duration})
 
 
 def get_limp_home_message() -> str:
