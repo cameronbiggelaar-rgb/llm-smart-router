@@ -264,22 +264,28 @@ def count_corrections(messages: List[Dict[str, Any]]) -> int:
     """Count the number of user corrections in a session's message history.
 
     A correction is a user message that follows an assistant message and
-    matches correction patterns.
+    matches correction patterns. Tool and system messages between the
+    assistant response and the user's correction are ignored.
+
+    This correctly handles the real message stream:
+        user → assistant → tool → tool → assistant → user (correction)
     """
-    if not messages or len(messages) < 3:
+    if not messages or len(messages) < 2:
         return 0
 
     count = 0
-    for i in range(1, len(messages) - 1):
-        prev = messages[i - 1]
-        curr = messages[i]
-        next_msg = messages[i + 1]
+    last_assistant_idx = -1
 
-        # Pattern: user → assistant → user (correction)
-        if (prev.get("role") == "user"
-                and curr.get("role") == "assistant"
-                and next_msg.get("role") == "user"):
-            content = next_msg.get("content", "")
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "")
+
+        if role == "assistant":
+            last_assistant_idx = i
+
+        elif role == "user" and last_assistant_idx >= 0:
+            # This user message follows an assistant message (possibly with
+            # tool/session_meta messages in between)
+            content = msg.get("content", "")
             if isinstance(content, str) and is_correction_message(content):
                 count += 1
 
@@ -406,7 +412,7 @@ def extract_features(
     is_sub = bool(parent_id)
     parent_model = parent_session.get("model", "") if parent_session else ""
 
-    # Correction detection
+    # Correction detection — scan ALL messages, not just first
     correction_count = count_corrections(messages or [])
 
     # Model switch detection — check if the model changed mid-session
@@ -414,6 +420,34 @@ def extract_features(
     if usage_rows:
         models_used = set(u.get("model", "") for u in usage_rows if u.get("model"))
         model_switched = len(models_used) > 1
+
+    # ── "Would cheaper have worked?" probe (static analysis) ──
+    # Compare the model actually used against what the router would select.
+    # If the actual model is much more expensive than the router's recommendation,
+    # and the session was successful with no corrections, it's a routing miss.
+    cheaper_model_would_work = False
+    recommended_model = ""
+    if model_used and model_used in MODEL_CAPABILITY_TIERS:
+        from router import route_task
+        decision = route_task(
+            complexity_score=complexity,
+            task_type=task_type,
+            has_niche_references=niche_refs,
+            has_format_constraint=fmt_constraint,
+            instruction_count=instr_count,
+            is_subagent=is_sub,
+            parent_model=parent_model,
+        )
+        recommended_model = decision.selected_model
+        actual_tier = MODEL_CAPABILITY_TIERS.get(model_used, 0)
+        recommended_tier = MODEL_CAPABILITY_TIERS.get(recommended_model, 0)
+        # If the router would pick a cheaper model, and the session succeeded
+        # without corrections, that's a routing miss
+        if (recommended_tier < actual_tier
+                and success
+                and correction_count == 0
+                and not model_switched):
+            cheaper_model_would_work = True
 
     # Timestamp
     timestamp = ""
@@ -452,4 +486,6 @@ def extract_features(
         user_correction_count=correction_count,
         model_switched=model_switched,
         session_message_count=message_count,
+        cheaper_model_would_work=cheaper_model_would_work,
+        recommended_model=recommended_model,
     )

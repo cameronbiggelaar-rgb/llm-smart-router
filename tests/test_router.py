@@ -645,6 +645,8 @@ class TestCorrectionDetection:
         messages = [
             {"role": "user", "content": "Write a function"},
             {"role": "assistant", "content": "Here's the code"},
+            {"role": "tool", "content": "output"},
+            {"role": "assistant", "content": "Done"},
             {"role": "user", "content": "No, that's not what I wanted"},
             {"role": "assistant", "content": "OK, let me fix it"},
             {"role": "user", "content": "That's still wrong"},

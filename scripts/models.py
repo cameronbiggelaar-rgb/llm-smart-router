@@ -55,6 +55,10 @@ class RouterLog:
     model_switched: bool = False         # user manually switched models mid-session
     session_message_count: int = 0       # total messages in session
 
+    # ── Model fit probe (Phase 2) ──
+    cheaper_model_would_work: bool = False  # router would have picked a cheaper model
+    recommended_model: str = ""            # what the router would have selected
+
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
@@ -216,7 +220,11 @@ CREATE TABLE IF NOT EXISTS router_logs (
     delegation_depth INTEGER NOT NULL DEFAULT 0,
     user_correction_count INTEGER NOT NULL DEFAULT 0,
     model_switched INTEGER NOT NULL DEFAULT 0,
-    session_message_count INTEGER NOT NULL DEFAULT 0
+    session_message_count INTEGER NOT NULL DEFAULT 0,
+
+    -- Model fit probe (Phase 2)
+    cheaper_model_would_work INTEGER NOT NULL DEFAULT 0,
+    recommended_model TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_router_logs_timestamp ON router_logs(timestamp);
@@ -301,9 +309,10 @@ def insert_router_log(conn: sqlite3.Connection, log: RouterLog) -> int:
             complexity_score, instruction_count,
             has_format_constraint, has_niche_references,
             is_subagent, parent_model, delegation_depth,
-            user_correction_count, model_switched, session_message_count
+            user_correction_count, model_switched, session_message_count,
+            cheaper_model_would_work, recommended_model
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             log.timestamp,
             log.session_id,
@@ -334,6 +343,8 @@ def insert_router_log(conn: sqlite3.Connection, log: RouterLog) -> int:
             log.user_correction_count,
             1 if log.model_switched else 0,
             log.session_message_count,
+            1 if log.cheaper_model_would_work else 0,
+            log.recommended_model,
         ),
     )
     return cur.lastrowid
