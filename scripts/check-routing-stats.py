@@ -29,25 +29,12 @@ ROUTER_LOGS = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "dat
 # Switch timestamp: 2026-07-31 14:31 AEST = 04:31 UTC
 SWITCH_TS = datetime(2026, 7, 31, 4, 31, 0, tzinfo=timezone.utc).timestamp()
 
-# Compute units (relative to deepseek-v4-flash = 1.0)
-COMPUTE_UNITS = {
-    "llama3.1:8b": 0.0,
-    "qwen3:14b": 0.0,
-    "deepseek-v4-flash": 1.0,
-    "minimax-m2.7:cloud": 2.0,
-    "glm-5": 2.0,
-    "glm-5.1": 2.5,
-    "glm-5.2:cloud": 3.0,
-    "deepseek-v4-pro": 4.0,
-    "deepseek-v3.1:671b": 10.0,
-    "gpt-5.5": 30.0,
-}
-
 # Tier reference
 TIERS = {
     "llama3.1:8b": 1,
     "qwen3:14b": 2,
     "deepseek-v4-flash": 3,
+    "deepseek-v4-flash:cloud": 3,
     "minimax-m2.7:cloud": 4,
     "glm-5": 4,
     "glm-5.1": 5,
@@ -55,6 +42,21 @@ TIERS = {
     "deepseek-v4-pro": 7,
     "deepseek-v3.1:671b": 8,
     "gpt-5.5": 10,
+}
+
+# Compute units (relative to deepseek-v4-flash = 1.0)
+COMPUTE_UNITS = {
+    "llama3.1:8b": 0.0,
+    "qwen3:14b": 0.0,
+    "deepseek-v4-flash": 1.0,
+    "deepseek-v4-flash:cloud": 1.0,
+    "minimax-m2.7:cloud": 2.0,
+    "glm-5": 2.0,
+    "glm-5.1": 2.5,
+    "glm-5.2:cloud": 3.0,
+    "deepseek-v4-pro": 4.0,
+    "deepseek-v3.1:671b": 10.0,
+    "gpt-5.5": 30.0,
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -78,36 +80,47 @@ def main():
     conn = sqlite3.connect(STATE_DB)
     conn.row_factory = sqlite3.Row
 
-    # ── Sessions since switch ──────────────────────────────────────────────
-    sessions = conn.execute("""
-        SELECT id, model, parent_session_id, started_at, message_count, tool_call_count
-        FROM sessions WHERE started_at > ?
-        ORDER BY started_at
+    # ── Sessions with activity since switch ────────────────────────────────
+    # Use last_seen from model_usage to catch sessions that started before
+    # the switch but continued after (e.g. long-running subagent chains)
+    usage = conn.execute("""
+        SELECT u.session_id, u.model, u.billing_provider, u.api_call_count,
+               u.input_tokens, u.output_tokens, u.first_seen, u.last_seen,
+               s.started_at, s.parent_session_id
+        FROM session_model_usage u
+        JOIN sessions s ON s.id = u.session_id
+        WHERE u.last_seen > ?
+        ORDER BY u.last_seen
     """, (SWITCH_TS,)).fetchall()
 
-    sids = [s["id"] for s in sessions]
-    total_sessions = len(sessions)
-    main_sessions = sum(1 for s in sessions if not s["parent_session_id"])
+    # Deduplicate by session_id — take the latest model_usage per session
+    seen_sessions = set()
+    session_list = []
+    for r in usage:
+        if r["session_id"] not in seen_sessions:
+            seen_sessions.add(r["session_id"])
+            session_list.append(r)
+
+    total_sessions = len(session_list)
+    main_sessions = sum(1 for s in session_list if not s["parent_session_id"])
     sub_sessions = total_sessions - main_sessions
 
-    # ── Model usage ────────────────────────────────────────────────────────
-    usage = []
-    if sids:
-        placeholders = ",".join("?" * len(sids))
-        usage = conn.execute(f"""
-            SELECT model, billing_provider, SUM(api_call_count) as calls,
-                   SUM(input_tokens) as total_in, SUM(output_tokens) as total_out
-            FROM session_model_usage WHERE session_id IN ({placeholders})
-            GROUP BY model, billing_provider
-            ORDER BY calls DESC
-        """, sids).fetchall()
+    # Aggregate model usage across all records
+    model_agg = {}
+    for r in usage:
+        key = (r["model"], r["billing_provider"])
+        if key not in model_agg:
+            model_agg[key] = {"calls": 0, "total_in": 0, "total_out": 0}
+        model_agg[key]["calls"] += r["api_call_count"]
+        model_agg[key]["total_in"] += r["input_tokens"]
+        model_agg[key]["total_out"] += r["output_tokens"]
 
-    total_calls = sum(r["calls"] for r in usage)
-    total_in = sum(r["total_in"] for r in usage)
-    total_out = sum(r["total_out"] for r in usage)
+    total_calls = sum(v["calls"] for v in model_agg.values())
+    total_in = sum(v["total_in"] for v in model_agg.values())
+    total_out = sum(v["total_out"] for v in model_agg.values())
 
     # ── Compute savings ────────────────────────────────────────────────────
-    actual_units = sum(r["calls"] * COMPUTE_UNITS.get(r["model"], 1.0) for r in usage)
+    actual_units = sum(data["calls"] * COMPUTE_UNITS.get(model, 1.0) for (model, _), data in model_agg.items())
     gpt55_units = total_calls * COMPUTE_UNITS.get("gpt-5.5", 30.0)
     savings_pct = ((gpt55_units - actual_units) / gpt55_units * 100) if gpt55_units > 0 else 0
 
@@ -161,15 +174,15 @@ def main():
             },
             "models": [
                 {
-                    "model": r["model"],
-                    "provider": r["billing_provider"],
-                    "calls": r["calls"],
-                    "input_tokens": r["total_in"],
-                    "output_tokens": r["total_out"],
-                    "tier": TIERS.get(r["model"], 0),
-                    "compute_units": COMPUTE_UNITS.get(r["model"], 1.0),
+                    "model": model,
+                    "provider": provider,
+                    "calls": data["calls"],
+                    "input_tokens": data["total_in"],
+                    "output_tokens": data["total_out"],
+                    "tier": TIERS.get(model, 0),
+                    "compute_units": COMPUTE_UNITS.get(model, 1.0),
                 }
-                for r in usage
+                for (model, provider), data in sorted(model_agg.items(), key=lambda x: -x[1]["calls"])
             ],
             "task_types": task_types,
             "corrections": corrections,
@@ -197,10 +210,10 @@ def main():
     print("  ── Model Distribution ──")
     print(f"  {'Model':30s} {'Tier':5s} {'Calls':8s} {'%':6s} {'Compute':8s}")
     print(f"  {'─'*30} {'─'*5} {'─'*8} {'─'*6} {'─'*8}")
-    for r in usage:
-        pct = r["calls"] / total_calls * 100 if total_calls > 0 else 0
-        cu = COMPUTE_UNITS.get(r["model"], 1.0)
-        print(f"  {r['model']:30s} {TIERS.get(r['model'], 0):<5d} {r['calls']:8d} {pct:5.1f}% {cu:7.1f}x")
+    for (model, provider), data in sorted(model_agg.items(), key=lambda x: -x[1]["calls"]):
+        pct = data["calls"] / total_calls * 100 if total_calls > 0 else 0
+        cu = COMPUTE_UNITS.get(model, 1.0)
+        print(f"  {model:30s} {TIERS.get(model, 0):<5d} {data['calls']:8d} {pct:5.1f}% {cu:7.1f}x")
     print()
 
     # ── Compute savings ────────────────────────────────────────────────────
