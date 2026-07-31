@@ -34,6 +34,7 @@ PLANNING_KEYWORDS = [
     "approach to", "roadmap", "timeline", "milestone", "proposal", "spec",
     "decision", "trade-off", "evaluate options",
     "how should we", "what if we", "consider", "recommend",
+    "system design", "design the", "architect",
 ]
 
 RESEARCH_KEYWORDS = [
@@ -41,6 +42,16 @@ RESEARCH_KEYWORDS = [
     "search for", "look up", "investigate", "analyze",
     "tell me about", "what are", "define", "describe",
     "latest", "news", "update on", "status of",
+]
+
+TESTING_KEYWORDS = [
+    "run test", "run pytest", "run the test", "run the tests",
+    "write test", "write a test", "write tests", "create test",
+    "add test", "test for", "unit test", "test case", "test coverage",
+    "fix test", "fix the test", "fix tests", "fixing test",
+    "test failing", "test broken", "test error", "broken test",
+    "pytest", "unittest", "test suite", "test output", "test result",
+    "assert", "test_", "test that", "test if",
 ]
 
 DEBUGGING_KEYWORDS = [
@@ -121,7 +132,7 @@ def classify_task(
     tool_call_count: int = 0,
     session_model: str = "",
 ) -> str:
-    """Classify a task into one of: coding, qa, research, planning, debugging, other.
+    """Classify a task into one of: coding, testing, qa, research, planning, debugging, other.
 
     Uses heuristic keyword matching on the prompt text, with tool call
     count and session model as secondary signals.
@@ -139,6 +150,10 @@ def classify_task(
     # Debugging keywords checked first (most specific)
     if any(kw in text for kw in DEBUGGING_KEYWORDS):
         return "debugging"
+
+    # Testing keywords checked before coding (test-specific tasks)
+    if any(kw in text for kw in TESTING_KEYWORDS):
+        return "testing"
 
     # Planning keywords checked before coding (design/architecture phrases)
     if any(kw in text for kw in PLANNING_KEYWORDS):

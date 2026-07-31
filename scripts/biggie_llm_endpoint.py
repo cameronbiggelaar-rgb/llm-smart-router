@@ -478,6 +478,7 @@ async def chat_completions(request: Request):
         has_format_constraint=features["has_format_constraint"],
         instruction_count=features["instruction_count"],
         force_model=force_model if force_model else "",
+        prompt=features["prompt_text"],
     )
 
     # Apply routing profile

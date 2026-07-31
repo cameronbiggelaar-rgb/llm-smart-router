@@ -1,0 +1,104 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Biggie LLM Router — Activity Routing Table
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Maps task types and sub-type keywords to default model tiers.
+# The router uses these as a FLOOR — complexity scoring can still
+# escalate above the default when the task is genuinely complex.
+#
+# Format:
+#   task_type:
+#     default_tier: N          # fallback if no sub-type matches
+#     sub_types:
+#       - keywords: ["word1", "word2"]   # any of these in the prompt
+#         tier: N                         # override for this sub-type
+#
+# Tier reference:
+#   1  = llama3.1:8b         (local, free)
+#   2  = qwen3:14b           (local, free)
+#   3  = deepseek-v4-flash   (ollama-cloud, cheapest cloud)
+#   4  = minimax-m2.7:cloud  (ollama-cloud)
+#      = glm-5               (ollama-cloud)
+#   5  = glm-5.1             (ollama-cloud)
+#   6  = glm-5.2:cloud       (ollama-cloud)
+#   7  = deepseek-v4-pro     (ollama-cloud)
+#   8  = deepseek-v3.1:671b  (ollama-cloud, most expensive cloud)
+#   10 = gpt-5.5             (openai-codex, most capable)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+routing:
+  # ── Testing ──────────────────────────────────────────────────────────────
+  # Running tests is simple execution. Writing tests needs code-level reasoning.
+  testing:
+    default_tier: 3
+    sub_types:
+      - keywords: ["run test", "run pytest", "run the test", "execute test", "check test", "test output", "test result", "test suite", "run the tests", "run tests"]
+        tier: 3
+      - keywords: ["write test", "create test", "add test", "test for", "unit test for", "test case", "test coverage", "write a test", "write tests", "create tests"]
+        tier: 5
+      - keywords: ["fix test", "debug test", "test failing", "test broken", "test error", "test not", "fix the test", "fix tests", "fixing test", "broken test"]
+        tier: 6
+
+  # ── Documentation ────────────────────────────────────────────────────────
+  # Writing docs, comments, READMEs — pattern-matching, rarely needs deep reasoning.
+  documentation:
+    default_tier: 2
+    sub_types:
+      - keywords: ["readme", "documentation", "docstring", "comment", "docs", "read the docs"]
+        tier: 2
+      - keywords: ["api doc", "technical spec", "architecture doc", "design doc"]
+        tier: 4
+
+  # ── Coding ───────────────────────────────────────────────────────────────
+  # Broad category — sub-types determine the tier.
+  coding:
+    default_tier: 4
+    sub_types:
+      - keywords: ["refactor", "rename", "format", "lint", "sort import", "clean up"]
+        tier: 3
+      - keywords: ["implement", "write a function", "create class", "add feature", "build"]
+        tier: 6
+      - keywords: ["review code", "code review", "review pr", "review this"]
+        tier: 4
+      - keywords: ["optimize", "performance", "speed up", "reduce memory"]
+        tier: 6
+
+  # ── Debugging ─────────────────────────────────────────────────────────────
+  # Already gets +2 tier boost from complexity scoring. This is the floor.
+  debugging:
+    default_tier: 5
+    sub_types:
+      - keywords: ["simple bug", "typo", "syntax error", "import error"]
+        tier: 4
+      - keywords: ["fix test", "fix the test", "fix tests", "fixing test", "test failing", "test broken", "broken test", "test error"]
+        tier: 6
+      - keywords: ["crash", "segfault", "memory leak", "race condition", "deadlock"]
+        tier: 7
+
+  # ── Architecture / Planning ───────────────────────────────────────────────
+  # Needs full reasoning — always high tier.
+  planning:
+    default_tier: 7
+    sub_types:
+      - keywords: ["quick plan", "simple design", "brief proposal"]
+        tier: 5
+      - keywords: ["architecture", "system design", "production", "scalable", "migration"]
+        tier: 8
+
+  # ── Research ──────────────────────────────────────────────────────────────
+  # Depends on depth — could escalate.
+  research:
+    default_tier: 4
+    sub_types:
+      - keywords: ["quick search", "simple lookup", "what is", "define"]
+        tier: 3
+      - keywords: ["deep research", "compare", "analyze", "investigate", "literature"]
+        tier: 6
+
+  # ── QA / Simple Q&A ──────────────────────────────────────────────────────
+  # Already routes to local. This is the floor.
+  qa:
+    default_tier: 1
+    sub_types:
+      - keywords: ["complex question", "explain in detail", "how does x work"]
+        tier: 3

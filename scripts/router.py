@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 
 from models import MODEL_COST_ORDER, MODEL_CAPABILITY_TIERS
 
@@ -639,6 +642,7 @@ def route_task(
     parent_model: str = "",
     is_private: bool = False,
     force_model: str = "",
+    prompt: str = "",
 ) -> RoutingDecision:
     """Select the best model for a task based on its features.
 
@@ -671,6 +675,7 @@ def route_task(
         instruction_count=instruction_count,
         is_subagent=is_subagent,
         parent_model=parent_model,
+        prompt=prompt,
     )
 
     # ── Limp-home mode: local models only ──
@@ -878,6 +883,82 @@ def call_private_model(prompt: str, system_prompt: str = "") -> str:
         raise RuntimeError(f"Local model call failed: {e}")
 
 
+# ── Routing table ──────────────────────────────────────────────────────────────
+
+# Path to the routing table YAML
+ROUTING_TABLE_PATH = Path(__file__).parent / "routing_table.yaml"
+
+# Cache for the loaded routing table
+_routing_table: Optional[Dict[str, Any]] = None
+
+
+def load_routing_table() -> Dict[str, Any]:
+    """Load the activity routing table from YAML.
+
+    Returns the parsed routing table, or an empty dict if the file
+    doesn't exist or is invalid.
+    """
+    global _routing_table
+    if _routing_table is not None:
+        return _routing_table
+
+    if not ROUTING_TABLE_PATH.exists():
+        logger.warning("Routing table not found at %s", ROUTING_TABLE_PATH)
+        _routing_table = {}
+        return _routing_table
+
+    try:
+        with open(ROUTING_TABLE_PATH) as f:
+            data = yaml.safe_load(f) or {}
+        _routing_table = data.get("routing", {})
+        logger.info("Loaded routing table with %d task types", len(_routing_table))
+        return _routing_table
+    except Exception as e:
+        logger.error("Failed to load routing table: %s", e)
+        _routing_table = {}
+        return _routing_table
+
+
+def match_sub_type(task_type: str, prompt: str) -> Optional[int]:
+    """Match a prompt against the routing table's sub-types for a task type.
+
+    Args:
+        task_type: The classified task type (e.g. 'testing', 'coding').
+        prompt: The user's prompt text.
+
+    Returns:
+        The tier override if a sub-type matches, None otherwise.
+    """
+    table = load_routing_table()
+    task_config = table.get(task_type)
+    if not task_config:
+        return None
+
+    prompt_lower = prompt.lower()
+    for sub in task_config.get("sub_types", []):
+        keywords = sub.get("keywords", [])
+        if any(kw in prompt_lower for kw in keywords):
+            return sub.get("tier")
+
+    return None
+
+
+def get_default_tier(task_type: str) -> int:
+    """Get the default tier for a task type from the routing table.
+
+    Args:
+        task_type: The classified task type.
+
+    Returns:
+        The default tier, or 0 if not configured (meaning no override).
+    """
+    table = load_routing_table()
+    task_config = table.get(task_type)
+    if task_config:
+        return task_config.get("default_tier", 0)
+    return 0
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _estimate_min_tier(
@@ -888,34 +969,58 @@ def _estimate_min_tier(
     instruction_count: int,
     is_subagent: bool,
     parent_model: str,
+    prompt: str = "",
 ) -> int:
     """Estimate the minimum capability tier needed for a task.
 
+    Uses the activity routing table as a FLOOR — the routing table
+    defines the minimum tier for each task type and sub-type, and
+    complexity scoring can still escalate above it.
+
     Returns a tier from MODEL_CAPABILITY_TIERS (1-10).
     """
-    # Start from complexity
-    if complexity_score < 0.15:
-        min_tier = 1  # local 8b
-    elif complexity_score < 0.3:
-        min_tier = 3  # deepseek-v4-flash
-    elif complexity_score < 0.5:
-        min_tier = 4  # minimax/glm-5
-    elif complexity_score < 0.7:
-        min_tier = 6  # glm-5.2
-    elif complexity_score < 0.85:
-        min_tier = 8  # deepseek-v3.1:671b
-    else:
-        min_tier = 10  # gpt-5.5
+    # Start from the routing table's default tier for this task type
+    routing_default = get_default_tier(task_type)
+    sub_type_tier = match_sub_type(task_type, prompt) if prompt else None
 
-    # Task type adjustments
-    task_boosts = {
-        "debugging": 2,    # debugging needs more capability
-        "planning": 1,     # planning benefits from stronger models
-        "coding": 0,       # coding is baseline
-        "research": 0,
-        "qa": -1,          # simple Q&A can use cheaper models
-    }
-    min_tier += task_boosts.get(task_type, 0)
+    if sub_type_tier is not None:
+        # Sub-type match gives the most specific floor
+        min_tier = sub_type_tier
+    elif routing_default > 0:
+        # Task type default gives a general floor
+        min_tier = routing_default
+    else:
+        # Fall back to complexity-based scoring
+        if complexity_score < 0.15:
+            min_tier = 1
+        elif complexity_score < 0.3:
+            min_tier = 3
+        elif complexity_score < 0.5:
+            min_tier = 4
+        elif complexity_score < 0.7:
+            min_tier = 6
+        elif complexity_score < 0.85:
+            min_tier = 8
+        else:
+            min_tier = 10
+
+    # Complexity can still escalate above the routing table floor
+    complexity_tier = 1
+    if complexity_score < 0.15:
+        complexity_tier = 1
+    elif complexity_score < 0.3:
+        complexity_tier = 3
+    elif complexity_score < 0.5:
+        complexity_tier = 4
+    elif complexity_score < 0.7:
+        complexity_tier = 6
+    elif complexity_score < 0.85:
+        complexity_tier = 8
+    else:
+        complexity_tier = 10
+
+    # Take the max of routing floor and complexity-based tier
+    min_tier = max(min_tier, complexity_tier)
 
     # Niche references need more capable models
     if has_niche_references:
@@ -935,10 +1040,8 @@ def _estimate_min_tier(
     if is_subagent:
         if parent_model and parent_model in MODEL_CAPABILITY_TIERS:
             parent_tier = MODEL_CAPABILITY_TIERS[parent_model]
-            # Subagents can usually use one tier below parent
             min_tier = max(min_tier, parent_tier - 1)
         else:
-            # Unknown parent — default to cheap
             min_tier = max(min_tier, 3)
 
     # Clamp to valid range
