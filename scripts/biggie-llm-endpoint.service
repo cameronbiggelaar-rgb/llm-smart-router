@@ -1,0 +1,27 @@
+[Unit]
+Description=Biggie LLM Endpoint — Smart model router
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/home/hermes/.hermes/skills/llm-smart-router/scripts
+ExecStart=/usr/bin/python3 /home/hermes/.hermes/skills/llm-smart-router/scripts/biggie_llm_endpoint.py
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=BIGGIE_LLM_HOST=127.0.0.1
+Environment=BIGGIE_LLM_PORT=8080
+Environment=BIGGIE_ROUTING_PROFILE=goldilocks
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes/data
+
+[Install]
+WantedBy=multi-user.target
