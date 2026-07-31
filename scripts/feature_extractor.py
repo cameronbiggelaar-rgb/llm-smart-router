@@ -59,6 +59,15 @@ COMPLEXITY_INSTRUCTION_PATTERNS = [
     r"make sure", r"ensure that", r"don't forget", r"remember to",
     r"after that", r"once you've", r"before you",
     r"if.*then.*else", r"depending on", r"based on",
+    # Multi-file / multi-task signals
+    r"across\s+\d+\s+(file|source|module|component)s?",
+    r"\d+\s+(file|source|module|component)s?\s+(across|in|to)",
+    r"F\d+[-\s]*F?\d+",  # F1-F11, F1-F5
+    r"production[- ]critical",
+    r"implement all",
+    r"end[- ]to[- ]end",
+    r"from scratch",
+    r"full\s+(implementation|pipeline|workflow|system)",
 ]
 
 # Format/output constraints
@@ -83,6 +92,9 @@ NICHE_REFERENCES = [
     "arm64", "aarch64", "risc-v", "avx512",
     "hermes agent", "hermes gateway", "hermes skill",
     "openai codex", "responses api",
+    # Domain-specific / project-specific
+    "production[- ]critical", "sprint", "hei project",
+    "llm smart router", "biggie llm",
 ]
 
 # Correction signal patterns — user messages that indicate the model got it wrong

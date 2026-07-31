@@ -284,20 +284,41 @@ def apply_routing_profile(decision: RoutingDecision, features: Dict[str, Any]) -
 # ── Feature extraction from chat messages ─────────────────────────────────────
 
 def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Extract routing features from a chat completion request's messages."""
-    prompt_text = ""
+    """Extract routing features from a chat completion request's messages.
+
+    Uses the FIRST user message for complexity scoring (captures the actual
+    task), and the full message history for session length context.
+    """
+    first_prompt = ""
+    last_prompt = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                first_prompt = content
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        first_prompt = part.get("text", "")
+                        break
+            break
+
+    # Also get the last user message for context
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, str):
-                prompt_text = content
+                last_prompt = content
             elif isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        prompt_text = part.get("text", "")
+                        last_prompt = part.get("text", "")
                         break
             break
 
+    # Use the first prompt for complexity scoring (captures the actual task)
+    # Use the last prompt for task classification (most recent context)
+    prompt_text = first_prompt or last_prompt
     message_count = len(messages)
     tool_call_count = 0
     for msg in messages:
@@ -305,7 +326,7 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
             tool_call_count += len(msg["tool_calls"])
 
     complexity = score_complexity(prompt_text, tool_call_count, message_count)
-    task_type = classify_task(prompt_text, tool_call_count)
+    task_type = classify_task(last_prompt or first_prompt, tool_call_count)
     niche = has_niche_references(prompt_text)
     fmt = has_format_constraint(prompt_text)
     instr_count = count_instructions(prompt_text)
