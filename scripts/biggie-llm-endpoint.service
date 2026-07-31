@@ -19,6 +19,8 @@ Environment=BIGGIE_ROUTING_PROFILE=goldilocks
 # Security
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
 ReadWritePaths=/home/hermes/.hermes/data /home/hermes/.hermes/skills/llm-smart-router/data
 ReadOnlyPaths=/home/hermes/.hermes/config.yaml /home/hermes/.hermes/skills/llm-smart-router
 
