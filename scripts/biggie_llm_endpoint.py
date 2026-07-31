@@ -85,6 +85,9 @@ BUILTIN_PROVIDER_KEYS = {
 # Routing profile: cheap, goldilocks, expensive
 ROUTING_PROFILE = os.environ.get("BIGGIE_ROUTING_PROFILE", "goldilocks").lower()
 
+# Path to Hermes config
+HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+
 # Port and host
 PORT = int(os.environ.get("BIGGIE_LLM_PORT", "8080"))
 HOST = os.environ.get("BIGGIE_LLM_HOST", "127.0.0.1")
