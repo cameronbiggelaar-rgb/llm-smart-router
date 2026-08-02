@@ -581,7 +581,25 @@ async def proxy_to_backend(
             async with httpx.AsyncClient(timeout=300.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
                 resp.raise_for_status()
-                return resp.json()
+                ollama_data = resp.json()
+                # Convert Ollama format to OpenAI Chat Completions format
+                import time
+                return {
+                    "id": f"chatcmpl-{int(time.time())}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": ollama_data.get("model", backend_model),
+                    "choices": [{
+                        "index": 0,
+                        "message": ollama_data.get("message", {"role": "assistant", "content": ""}),
+                        "finish_reason": ollama_data.get("done_reason", "stop"),
+                    }],
+                    "usage": {
+                        "prompt_tokens": ollama_data.get("prompt_eval_count", 0),
+                        "completion_tokens": ollama_data.get("eval_count", 0),
+                        "total_tokens": (ollama_data.get("prompt_eval_count", 0) or 0) + (ollama_data.get("eval_count", 0) or 0),
+                    },
+                }
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
