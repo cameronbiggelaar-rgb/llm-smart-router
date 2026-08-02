@@ -31,6 +31,17 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+# Load .env file for API keys (systemd EnvironmentFile may not work with ProtectHome)
+_env_path = Path.home() / ".hermes" / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                if _key not in os.environ:
+                    os.environ[_key] = _val
+
 # Add the router module to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -76,7 +87,7 @@ BUILTIN_PROVIDER_URLS = {
 
 # Built-in provider API key env vars
 BUILTIN_PROVIDER_KEYS = {
-    "ollama-cloud": "OLLAMA_CLOUD_API_KEY",
+    "ollama-cloud": "OLLAMA_API_KEY",
     "openai-codex": "OPENAI_CODEX_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "minimax": "MINIMAX_API_KEY",
@@ -195,42 +206,16 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
         if provider == BIGGIE_PROVIDER_NAME:
             continue
 
-        # Get provider config
-        pconf = hermes.get("providers", {}).get(provider, {})
-        base_url = pconf.get("base_url", "")
-        api_key_env = pconf.get("api_key_env", "")
-        api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        _add_backend(backends, hermes, provider, model)
 
-        # Determine the backend model name
-        # Hermes model names sometimes have provider prefixes (e.g. "deepseek-v4-flash:cloud")
-        # Strip those for the backend call
-        backend_model = re.sub(r":\w+$", "", model)
-
-        # Determine the provider type for the backend URL
-        if provider == "local-ollama" or provider == "mac-ollama":
-            backend_provider = "local"
-        elif provider == "openai-codex":
-            backend_provider = "openai-codex"
-        else:
-            backend_provider = provider
-
-        # If no base_url from config, use built-in URL
-        if not base_url:
-            base_url = BUILTIN_PROVIDER_URLS.get(provider, "")
-
-        # If no api_key from config, try built-in env var
-        if not api_key:
-            key_env = BUILTIN_PROVIDER_KEYS.get(provider, "")
-            if key_env:
-                api_key = os.environ.get(key_env, "")
-
-        backends[model] = {
-            "provider": backend_provider,
-            "hermes_provider": provider,
-            "base_url": base_url,
-            "api_key": api_key,
-            "backend_model": backend_model,
-        }
+    # Also discover the primary model/provider from the model section
+    # (e.g. gpt-5.5 on openai-codex, which may not be in the fallback chain)
+    default_model = hermes.get("default_model", "")
+    default_provider = hermes.get("default_provider", "")
+    if default_model and default_provider and default_provider != BIGGIE_PROVIDER_NAME:
+        # Check if it's already been added via the fallback chain
+        if default_model not in backends:
+            _add_backend(backends, hermes, default_provider, default_model)
 
     # Also add local models if they're not already in the chain
     local_models = ["llama3.1:8b", "qwen3:14b", "dolphin3"]
@@ -245,6 +230,53 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
             }
 
     return backends
+
+
+def _add_backend(
+    backends: Dict[str, Dict[str, Any]],
+    hermes: Dict[str, Any],
+    provider: str,
+    model: str,
+) -> None:
+    """Add a backend to the backends dict if not already present."""
+    if model in backends:
+        return
+
+    pconf = hermes.get("providers", {}).get(provider, {})
+    base_url = pconf.get("base_url", "")
+    api_key_env = pconf.get("api_key_env", "")
+    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+
+    # Determine the backend model name
+    # Hermes model names sometimes have provider suffixes (e.g. "deepseek-v4-flash:cloud")
+    # Strip those for the backend call, but keep model tags like ":8b" or ":14b"
+    backend_model = re.sub(r":(cloud|local|ollama)$", "", model)
+
+    # Determine the provider type for the backend URL
+    if provider in ("local-ollama", "mac-ollama"):
+        backend_provider = "local"
+    elif provider == "openai-codex":
+        backend_provider = "openai-codex"
+    else:
+        backend_provider = provider
+
+    # If no base_url from config, use built-in URL
+    if not base_url:
+        base_url = BUILTIN_PROVIDER_URLS.get(provider, "")
+
+    # If no api_key from config, try built-in env var
+    if not api_key:
+        key_env = BUILTIN_PROVIDER_KEYS.get(provider, "")
+        if key_env:
+            api_key = os.environ.get(key_env, "")
+
+    backends[model] = {
+        "provider": backend_provider,
+        "hermes_provider": provider,
+        "base_url": base_url,
+        "api_key": api_key,
+        "backend_model": backend_model,
+    }
 
 
 # ── Routing profile ───────────────────────────────────────────────────────────
@@ -501,6 +533,17 @@ async def chat_completions(request: Request):
     # Find the backend for the selected model
     backend = backends.get(decision.selected_model)
     if not backend:
+        # Router returns names without provider suffix (e.g. "deepseek-v4-flash")
+        # but backends are keyed with suffix (e.g. "deepseek-v4-flash:cloud")
+        # Try all known provider suffixes
+        for suffix in [":cloud", ":local", ":ollama"]:
+            with_suffix = decision.selected_model + suffix
+            if with_suffix in backends:
+                backend = backends[with_suffix]
+                decision.selected_model = with_suffix
+                break
+
+    if not backend:
         # Try to find a fallback — any model on any provider
         logger.warning("Selected model %s not in discovered backends, trying fallbacks", decision.selected_model)
         for model_name, bk in backends.items():
@@ -557,6 +600,15 @@ async def chat_completions(request: Request):
 
         # Try the escalated model
         backend = backends.get(escalation.selected_model)
+        if not backend:
+            # Try with provider suffixes
+            for suffix in [":cloud", ":local", ":ollama"]:
+                with_suffix = escalation.selected_model + suffix
+                if with_suffix in backends:
+                    backend = backends[with_suffix]
+                    escalation.selected_model = with_suffix
+                    break
+
         if not backend:
             return JSONResponse(
                 status_code=503,

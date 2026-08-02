@@ -15,6 +15,7 @@ RestartSec=5
 Environment=BIGGIE_LLM_HOST=127.0.0.1
 Environment=BIGGIE_LLM_PORT=8080
 Environment=BIGGIE_ROUTING_PROFILE=goldilocks
+EnvironmentFile=/home/hermes/.hermes/.env
 
 # Security
 NoNewPrivileges=true
@@ -23,6 +24,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/hermes/.hermes/data /home/hermes/.hermes/skills/llm-smart-router/data
 ReadOnlyPaths=/home/hermes/.hermes/config.yaml /home/hermes/.hermes/skills/llm-smart-router
+# Allow reading the .env file for API keys
+ReadWritePaths=/home/hermes/.hermes/.env
 
 [Install]
 WantedBy=multi-user.target
