@@ -270,6 +270,35 @@ def _add_backend(
         if key_env:
             api_key = os.environ.get(key_env, "")
 
+    # For openai-codex, try to get the OAuth access token from auth.json
+    if not api_key and provider == "openai-codex":
+        try:
+            _auth_path = Path.home() / ".hermes" / "auth.json"
+            if _auth_path.exists():
+                with open(_auth_path) as _af:
+                    _auth_data = json.load(_af)
+                _pool = _auth_data.get("credential_pool", {})
+                _entries = _pool.get("openai-codex", [])
+                for _entry in _entries:
+                    if isinstance(_entry, dict):
+                        _status = _entry.get("last_status")
+                        _error = _entry.get("last_error_code")
+                        _token = _entry.get("access_token", "")
+                        if _status == "exhausted" and _error == 429:
+                            continue
+                        if _token:
+                            api_key = _token
+                            break
+                if not api_key:
+                    for _entry in _entries:
+                        if isinstance(_entry, dict):
+                            _token = _entry.get("access_token", "")
+                            if _token:
+                                api_key = _token
+                                break
+        except Exception:
+            pass
+
     backends[model] = {
         "provider": backend_provider,
         "hermes_provider": provider,
@@ -380,6 +409,7 @@ async def proxy_to_backend(
     Uses the backend's native API format:
     - Local Ollama: /api/chat
     - OpenAI-compatible: /v1/chat/completions
+    - OpenAI Codex: /responses (via Hermes' own adapter)
     """
     base_url = backend.get("base_url", "")
     api_key = backend.get("api_key", "")
@@ -389,26 +419,191 @@ async def proxy_to_backend(
     if not base_url:
         raise HTTPException(status_code=502, detail=f"No base_url for backend")
 
-    # Build the request body
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # ── OpenAI Codex (Responses API) ──────────────────────────────────────
+    if provider == "openai-codex":
+        # Use Hermes' own adapter to convert chat messages to Responses format
+        import sys
+        _hermes_path = str(Path.home() / ".hermes" / "hermes-agent")
+        if _hermes_path not in sys.path:
+            sys.path.insert(0, _hermes_path)
+
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _normalize_codex_response,
+        )
+
+        responses_input = _chat_messages_to_responses_input(messages)
+        # Codex backend uses "message" type items, not "input_text"/"output_text"
+        codex_input = []
+        for item in responses_input:
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            codex_input.append({
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": content}],
+            })
+
+        body = {
+            "model": backend_model,
+            "input": codex_input,
+            "store": False,
+            "stream": True,
+        }
+
+        for param in ("temperature", "top_p", "stop", "frequency_penalty", "presence_penalty"):
+            if param in request_body:
+                body[param] = request_body[param]
+
+        url = f"{base_url.rstrip('/')}/responses"
+
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("POST", url, json=body, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        error_text = await resp.aread()
+                        detail = f"Backend error: {error_text[:500].decode()}"
+                        logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
+                        if resp.status_code == 429:
+                            mark_rate_limited(backend_model)
+                        raise HTTPException(status_code=502, detail=detail)
+
+                    # Collect SSE events — assemble the response from stream events
+                    responses_data = None
+                    collected_output = []
+                    current_event = None
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if line.startswith("event: "):
+                            current_event = line[7:]
+                        elif line.startswith("data: "):
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(data)
+                                if current_event == "response.completed":
+                                    responses_data = event.get("response") or event
+                                    if collected_output:
+                                        responses_data["output"] = collected_output
+                                    break
+                                elif current_event == "response.output_item.added":
+                                    item = event.get("item") or event
+                                    if isinstance(item, dict) and item.get("type") == "message":
+                                        collected_output.append(item)
+                                elif current_event == "response.content_part.done":
+                                    part = event.get("part", {})
+                                    item_id = event.get("item_id", "")
+                                    if part.get("type") == "output_text":
+                                        for msg in collected_output:
+                                            if msg.get("id") == item_id:
+                                                msg["content"] = [part]
+                                                break
+                            except json.JSONDecodeError:
+                                continue
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            detail = f"Backend error: {e.response.text[:500]}"
+            logger.error("Backend %s returned %d: %s", provider, status, detail)
+            if status == 429:
+                mark_rate_limited(backend_model)
+            raise HTTPException(status_code=502, detail=detail)
+        except httpx.RequestError as e:
+            logger.error("Backend %s request failed: %s", provider, e)
+            raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+
+        if not responses_data:
+            raise HTTPException(status_code=502, detail="No response data from Codex API")
+
+        # Convert Responses format back to Chat Completions format
+        try:
+            from types import SimpleNamespace
+
+            def _dict_to_obj(d):
+                if isinstance(d, dict):
+                    return SimpleNamespace(**{k: _dict_to_obj(v) for k, v in d.items()})
+                elif isinstance(d, list):
+                    return [_dict_to_obj(v) for v in d]
+                return d
+
+            response_obj = _dict_to_obj(responses_data)
+            normalized = _normalize_codex_response(response_obj)
+            # normalized is (assistant_message, finish_reason)
+            if isinstance(normalized, tuple):
+                msg, reason = normalized
+            else:
+                msg, reason = normalized, "stop"
+
+            content = ""
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+            elif hasattr(msg, "content"):
+                content = msg.content
+
+            return {
+                "id": responses_data.get("id", ""),
+                "object": "chat.completion",
+                "created": responses_data.get("created_at", 0),
+                "model": responses_data.get("model", backend_model),
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content or "",
+                    },
+                    "finish_reason": reason or "stop",
+                }],
+                "usage": responses_data.get("usage", {}),
+            }
+        except Exception as e:
+            logger.error("Failed to normalize Codex response: %s", e)
+            raise HTTPException(status_code=502, detail=f"Codex response normalization failed: {e}")
+
+    # ── Local Ollama ───────────────────────────────────────────────────────
+    if provider == "local":
+        body = {
+            "model": backend_model,
+            "messages": messages,
+            "stream": False,
+        }
+        for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
+            if param in request_body:
+                body[param] = request_body[param]
+
+        url = f"{base_url.rstrip('/')}/api/chat"
+
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            detail = f"Backend error: {e.response.text[:500]}"
+            logger.error("Backend %s returned %d: %s", provider, status, detail)
+            if status == 429:
+                mark_rate_limited(backend_model)
+            raise HTTPException(status_code=502, detail=detail)
+        except httpx.RequestError as e:
+            logger.error("Backend %s request failed: %s", provider, e)
+            raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+
+    # ── OpenAI-compatible (Ollama Cloud, etc.) ─────────────────────────────
     body = {
         "model": backend_model,
         "messages": messages,
         "stream": False,
     }
-
     for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
         if param in request_body:
             body[param] = request_body[param]
 
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    # Local Ollama uses /api/chat
-    if provider == "local":
-        url = f"{base_url.rstrip('/')}/api/chat"
-    else:
-        url = f"{base_url.rstrip('/')}/chat/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
