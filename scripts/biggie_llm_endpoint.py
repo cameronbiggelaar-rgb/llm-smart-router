@@ -397,6 +397,63 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
     }
 
 
+# ── Request logging ────────────────────────────────────────────────────────────
+
+def _get_usage_tokens(response: dict, direction: str) -> int:
+    """Extract token counts from an OpenAI-compatible response."""
+    usage = response.get("usage", {}) if isinstance(response, dict) else {}
+    if direction == "input":
+        return usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+    return usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+
+
+def _log_request_to_db(
+    model_used: str,
+    provider: str,
+    task_type: str,
+    complexity_score: float,
+    input_tokens: int,
+    output_tokens: int,
+    latency_seconds: float,
+    routing_time_ms: int,
+    success: bool = True,
+    escalated: bool = False,
+    error_type: str = "",
+):
+    """Log a single request to the router_logs DB for analysis."""
+    try:
+        import sqlite3
+        from datetime import datetime, timezone
+
+        db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            """INSERT INTO router_logs (
+                timestamp, session_id, model_used, provider, task_type,
+                input_tokens, output_tokens, latency_seconds, complexity_score,
+                success, escalated, error_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                "",  # session_id — not available at endpoint level
+                model_used,
+                provider,
+                task_type,
+                input_tokens,
+                output_tokens,
+                latency_seconds,
+                complexity_score,
+                1 if success else 0,
+                1 if escalated else 0,
+                error_type,
+            ),
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        logger.warning("Failed to log request to DB: %s", e)
+
+
 # ── Backend proxy ─────────────────────────────────────────────────────────────
 
 async def proxy_to_backend(
@@ -705,6 +762,9 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     force_model = body.get("model", "")
 
+    # Track timing
+    t0 = time.time()
+
     # Discover available backends from Hermes config
     backends = discover_backends()
 
@@ -728,6 +788,9 @@ async def chat_completions(request: Request):
 
     # Apply routing profile
     decision = apply_routing_profile(decision, features)
+
+    # Record routing time
+    routing_time = time.time() - t0
 
     # If no model is available, return a clear error
     if not decision.selected_model:
@@ -789,7 +852,23 @@ async def chat_completions(request: Request):
 
     # Proxy to the backend
     try:
-        return await proxy_to_backend(backend, messages, body)
+        result = await proxy_to_backend(backend, messages, body)
+        total_time = time.time() - t0
+        llm_time = total_time - routing_time
+        # Log the request to DB
+        _log_request_to_db(
+            model_used=decision.selected_model,
+            provider=backend.get("provider", ""),
+            task_type=features["task_type"],
+            complexity_score=features["complexity_score"],
+            input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
+            output_tokens=_get_usage_tokens(result, "output") or 0,
+            latency_seconds=total_time,
+            routing_time_ms=round(routing_time * 1000),
+            success=True,
+            escalated=False,
+        )
+        return result
     except HTTPException:
         # Backend failed — try escalation
         logger.warning("Backend %s failed, escalating...", decision.selected_model)
@@ -835,7 +914,21 @@ async def chat_completions(request: Request):
             )
 
         logger.info("Escalated to: %s/%s", backend.get("provider"), escalation.selected_model)
-        return await proxy_to_backend(backend, messages, body)
+        result = await proxy_to_backend(backend, messages, body)
+        total_time = time.time() - t0
+        _log_request_to_db(
+            model_used=escalation.selected_model,
+            provider=backend.get("provider", ""),
+            task_type=features["task_type"],
+            complexity_score=features["complexity_score"],
+            input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
+            output_tokens=_get_usage_tokens(result, "output") or 0,
+            latency_seconds=total_time,
+            routing_time_ms=round(routing_time * 1000),
+            success=True,
+            escalated=True,
+        )
+        return result
 
 
 @app.get("/status")
