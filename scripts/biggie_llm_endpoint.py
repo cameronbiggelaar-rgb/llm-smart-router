@@ -78,8 +78,8 @@ BIGGIE_MODEL_NAMES = {"biggie-router", "biggie-llm"}
 
 # Built-in provider base URLs (Hermes knows these internally)
 BUILTIN_PROVIDER_URLS = {
-    "ollama-cloud": "https://api.ollama.cloud/v1",
-    "openai-codex": "https://api.openai.com/v1",
+    "ollama-cloud": "https://ollama.com/v1",
+    "openai-codex": "https://chatgpt.com/backend-api/codex",
     "openrouter": "https://openrouter.ai/api/v1",
     "minimax": "https://api.minimax.chat/v1",
     "bedrock": "",  # AWS IAM — no URL
