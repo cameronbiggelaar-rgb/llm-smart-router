@@ -68,6 +68,45 @@ from feature_extractor import (
 
 logger = logging.getLogger("biggie-llm-endpoint")
 
+# ── Cached state ───────────────────────────────────────────────────────────────
+
+# Cache for discovered backends — refreshed every 60s or on demand
+_backends_cache: Dict[str, Any] = {}
+_backends_cache_time: float = 0
+_BACKENDS_CACHE_TTL = 60  # seconds
+
+# Persistent httpx client for connection pooling
+_httpx_client: Optional[httpx.AsyncClient] = None
+
+# Persistent SQLite connection for request logging
+_sqlite_conn: Optional[Any] = None
+_sqlite_lock: Any = None  # will be threading.Lock
+
+def _get_httpx_client() -> httpx.AsyncClient:
+    """Get or create a shared httpx client with connection pooling."""
+    global _httpx_client
+    if _httpx_client is None:
+        _httpx_client = httpx.AsyncClient(timeout=300.0)
+    return _httpx_client
+
+
+def _get_db_connection() -> Any:
+    """Get or create a persistent SQLite connection."""
+    global _sqlite_conn, _sqlite_lock
+    if _sqlite_conn is None:
+        import sqlite3
+        import threading
+        _sqlite_lock = threading.Lock()
+        db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
+        _sqlite_conn = sqlite3.connect(str(db_path))
+    return _sqlite_conn
+
+
+def _invalidate_backends_cache():
+    """Force refresh of the backends cache on next request."""
+    global _backends_cache_time
+    _backends_cache_time = 0
+
 # ── Self-identification ───────────────────────────────────────────────────────
 
 # The endpoint's own identity — used to skip itself in routing
@@ -189,7 +228,13 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
     """Discover available backends from Hermes config.
 
     Returns {model_name: {provider, base_url, api_key, backend_model}}
+    Results are cached for 60 seconds to avoid re-parsing config on every request.
     """
+    global _backends_cache, _backends_cache_time
+    now = time.time()
+    if _backends_cache and (now - _backends_cache_time) < _BACKENDS_CACHE_TTL:
+        return _backends_cache
+
     hermes = load_hermes_config()
     backends: Dict[str, Dict[str, Any]] = {}
 
@@ -218,7 +263,7 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
             _add_backend(backends, hermes, default_provider, default_model)
 
     # Also add local models if they're not already in the chain
-    local_models = ["llama3.1:8b", "qwen3:14b", "dolphin3"]
+    local_models = ["llama3.1:8b", "dolphin3"]
     for m in local_models:
         if m not in backends:
             backends[m] = {
@@ -229,6 +274,8 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
                 "backend_model": m,
             }
 
+    _backends_cache = backends
+    _backends_cache_time = time.time()
     return backends
 
 
@@ -352,8 +399,9 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
     first message from hours ago. Also uses the full message count and tool
     call count for session length context.
     """
-    # Collect all user messages in order
+    # Collect all user messages and count tool calls in a single pass
     user_messages = []
+    tool_call_count = 0
     for msg in messages:
         if msg.get("role") == "user":
             content = msg.get("content", "")
@@ -364,6 +412,8 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
                     if isinstance(part, dict) and part.get("type") == "text":
                         user_messages.append(part.get("text", ""))
                         break
+        elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_call_count += len(msg["tool_calls"])
 
     # Use the last 8 user messages (or all if fewer) for complexity scoring
     recent_window = 8
@@ -374,10 +424,6 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
     last_prompt = user_messages[-1] if user_messages else ""
 
     message_count = len(messages)
-    tool_call_count = 0
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            tool_call_count += len(msg["tool_calls"])
 
     complexity = score_complexity(combined_prompt, tool_call_count, message_count)
     task_type = classify_task(last_prompt, tool_call_count)
@@ -420,36 +466,37 @@ def _log_request_to_db(
     escalated: bool = False,
     error_type: str = "",
 ):
-    """Log a single request to the router_logs DB for analysis."""
+    """Log a single request to the router_logs DB for analysis.
+
+    Uses a persistent SQLite connection to avoid open/close overhead.
+    """
     try:
-        import sqlite3
         from datetime import datetime, timezone
 
-        db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
-        db = sqlite3.connect(str(db_path))
-        db.execute(
-            """INSERT INTO router_logs (
-                timestamp, session_id, model_used, provider, task_type,
-                input_tokens, output_tokens, latency_seconds, complexity_score,
-                success, escalated, error_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                "",  # session_id — not available at endpoint level
-                model_used,
-                provider,
-                task_type,
-                input_tokens,
-                output_tokens,
-                latency_seconds,
-                complexity_score,
-                1 if success else 0,
-                1 if escalated else 0,
-                error_type,
-            ),
-        )
-        db.commit()
-        db.close()
+        db = _get_db_connection()
+        with _sqlite_lock:
+            db.execute(
+                """INSERT INTO router_logs (
+                    timestamp, session_id, model_used, provider, task_type,
+                    input_tokens, output_tokens, latency_seconds, complexity_score,
+                    success, escalated, error_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    "",  # session_id — not available at endpoint level
+                    model_used,
+                    provider,
+                    task_type,
+                    input_tokens,
+                    output_tokens,
+                    latency_seconds,
+                    complexity_score,
+                    1 if success else 0,
+                    1 if escalated else 0,
+                    error_type,
+                ),
+            )
+            db.commit()
     except Exception as e:
         logger.warning("Failed to log request to DB: %s", e)
 
@@ -519,49 +566,49 @@ async def proxy_to_backend(
         url = f"{base_url.rstrip('/')}/responses"
 
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream("POST", url, json=body, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        error_text = await resp.aread()
-                        detail = f"Backend error: {error_text[:500].decode()}"
-                        logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
-                        if resp.status_code == 429:
-                            mark_rate_limited(backend_model)
-                        raise HTTPException(status_code=502, detail=detail)
+            client = _get_httpx_client()
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    error_text = await resp.aread()
+                    detail = f"Backend error: {error_text[:500].decode()}"
+                    logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
+                    if resp.status_code == 429:
+                        mark_rate_limited(backend_model)
+                    raise HTTPException(status_code=502, detail=detail)
 
-                    # Collect SSE events — assemble the response from stream events
-                    responses_data = None
-                    collected_output = []
-                    current_event = None
-                    async for line in resp.aiter_lines():
-                        line = line.strip()
-                        if line.startswith("event: "):
-                            current_event = line[7:]
-                        elif line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
+                # Collect SSE events — assemble the response from stream events
+                responses_data = None
+                collected_output = []
+                current_event = None
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("event: "):
+                        current_event = line[7:]
+                    elif line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                            if current_event == "response.completed":
+                                responses_data = event.get("response") or event
+                                if collected_output:
+                                    responses_data["output"] = collected_output
                                 break
-                            try:
-                                event = json.loads(data)
-                                if current_event == "response.completed":
-                                    responses_data = event.get("response") or event
-                                    if collected_output:
-                                        responses_data["output"] = collected_output
-                                    break
-                                elif current_event == "response.output_item.added":
-                                    item = event.get("item") or event
-                                    if isinstance(item, dict) and item.get("type") == "message":
-                                        collected_output.append(item)
-                                elif current_event == "response.content_part.done":
-                                    part = event.get("part", {})
-                                    item_id = event.get("item_id", "")
-                                    if part.get("type") == "output_text":
-                                        for msg in collected_output:
-                                            if msg.get("id") == item_id:
-                                                msg["content"] = [part]
-                                                break
-                            except json.JSONDecodeError:
-                                continue
+                            elif current_event == "response.output_item.added":
+                                item = event.get("item") or event
+                                if isinstance(item, dict) and item.get("type") == "message":
+                                    collected_output.append(item)
+                            elif current_event == "response.content_part.done":
+                                part = event.get("part", {})
+                                item_id = event.get("item_id", "")
+                                if part.get("type") == "output_text":
+                                    for msg in collected_output:
+                                        if msg.get("id") == item_id:
+                                            msg["content"] = [part]
+                                            break
+                        except json.JSONDecodeError:
+                            continue
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -635,28 +682,28 @@ async def proxy_to_backend(
         url = f"{base_url.rstrip('/')}/api/chat"
 
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                ollama_data = resp.json()
-                # Convert Ollama format to OpenAI Chat Completions format
-                import time
-                return {
-                    "id": f"chatcmpl-{int(time.time())}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": ollama_data.get("model", backend_model),
-                    "choices": [{
-                        "index": 0,
-                        "message": ollama_data.get("message", {"role": "assistant", "content": ""}),
-                        "finish_reason": ollama_data.get("done_reason", "stop"),
-                    }],
-                    "usage": {
-                        "prompt_tokens": ollama_data.get("prompt_eval_count", 0),
-                        "completion_tokens": ollama_data.get("eval_count", 0),
-                        "total_tokens": (ollama_data.get("prompt_eval_count", 0) or 0) + (ollama_data.get("eval_count", 0) or 0),
-                    },
-                }
+            client = _get_httpx_client()
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+            ollama_data = resp.json()
+            # Convert Ollama format to OpenAI Chat Completions format
+            import time
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": ollama_data.get("model", backend_model),
+                "choices": [{
+                    "index": 0,
+                    "message": ollama_data.get("message", {"role": "assistant", "content": ""}),
+                    "finish_reason": ollama_data.get("done_reason", "stop"),
+                }],
+                "usage": {
+                    "prompt_tokens": ollama_data.get("prompt_eval_count", 0),
+                    "completion_tokens": ollama_data.get("eval_count", 0),
+                    "total_tokens": (ollama_data.get("prompt_eval_count", 0) or 0) + (ollama_data.get("eval_count", 0) or 0),
+                },
+            }
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
@@ -681,10 +728,10 @@ async def proxy_to_backend(
     url = f"{base_url.rstrip('/')}/chat/completions"
 
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_httpx_client()
+        resp = await client.post(url, json=body, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
         detail = f"Backend error: {e.response.text[:500]}"
