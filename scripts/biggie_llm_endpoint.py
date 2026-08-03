@@ -65,6 +65,7 @@ from feature_extractor import (
     has_niche_references,
     contains_code_blocks,
 )
+from compression import compress_messages
 
 logger = logging.getLogger("biggie-llm-endpoint")
 
@@ -134,6 +135,11 @@ BUILTIN_PROVIDER_KEYS = {
 
 # Routing profile: cheap, goldilocks, expensive
 ROUTING_PROFILE = os.environ.get("BIGGIE_ROUTING_PROFILE", "goldilocks").lower()
+
+# Compression settings
+COMPRESSION_LEVEL = os.environ.get("BIGGIE_COMPRESSION", "standard").lower()
+if COMPRESSION_LEVEL not in ("off", "lite", "standard", "aggressive"):
+    COMPRESSION_LEVEL = "standard"
 
 # Path to Hermes config
 HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
@@ -465,6 +471,9 @@ def _log_request_to_db(
     success: bool = True,
     escalated: bool = False,
     error_type: str = "",
+    compression_level: str = "off",
+    compression_savings_pct: float = 0.0,
+    compression_time_ms: float = 0.0,
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -479,8 +488,9 @@ def _log_request_to_db(
                 """INSERT INTO router_logs (
                     timestamp, session_id, model_used, provider, task_type,
                     input_tokens, output_tokens, latency_seconds, complexity_score,
-                    success, escalated, error_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    success, escalated, error_type,
+                    compression_level, compression_savings_pct, compression_time_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -494,6 +504,9 @@ def _log_request_to_db(
                     1 if success else 0,
                     1 if escalated else 0,
                     error_type,
+                    compression_level,
+                    compression_savings_pct,
+                    compression_time_ms,
                 ),
             )
             db.commit()
@@ -761,6 +774,7 @@ async def health():
         "status": "ok",
         "limp_home": info["active"],
         "routing_profile": ROUTING_PROFILE,
+        "compression": COMPRESSION_LEVEL,
         "version": "1.0.0",
     }
 
@@ -897,9 +911,39 @@ async def chat_completions(request: Request):
         " LIMP" if decision.limp_home else "",
     )
 
+    # ── Compression ─────────────────────────────────────────────────────────
+    # Determine compression level: request header > env var > default
+    compression_level = request.headers.get(
+        "X-Compression-Level", COMPRESSION_LEVEL
+    )
+    if compression_level not in ("off", "lite", "standard", "aggressive"):
+        compression_level = COMPRESSION_LEVEL
+
+    if compression_level != "off":
+        compressed_messages, compression_stats = compress_messages(
+            messages, compression_level
+        )
+        logger.info(
+            "Compression: %s — %s chars → %s chars (%.1f%%) in %.2fms",
+            compression_level,
+            compression_stats["input_chars"],
+            compression_stats["output_chars"],
+            compression_stats["savings_pct"],
+            compression_stats["compression_time_ms"],
+        )
+    else:
+        compressed_messages = messages
+        compression_stats = {
+            "level": "off",
+            "input_chars": 0,
+            "output_chars": 0,
+            "savings_pct": 0.0,
+            "compression_time_ms": 0.0,
+        }
+
     # Proxy to the backend
     try:
-        result = await proxy_to_backend(backend, messages, body)
+        result = await proxy_to_backend(backend, compressed_messages, body)
         total_time = time.time() - t0
         llm_time = total_time - routing_time
         # Log the request to DB
@@ -914,6 +958,9 @@ async def chat_completions(request: Request):
             routing_time_ms=round(routing_time * 1000),
             success=True,
             escalated=False,
+            compression_level=compression_stats["level"],
+            compression_savings_pct=compression_stats["savings_pct"],
+            compression_time_ms=compression_stats["compression_time_ms"],
         )
         return result
     except HTTPException:
@@ -961,7 +1008,7 @@ async def chat_completions(request: Request):
             )
 
         logger.info("Escalated to: %s/%s", backend.get("provider"), escalation.selected_model)
-        result = await proxy_to_backend(backend, messages, body)
+        result = await proxy_to_backend(backend, compressed_messages, body)
         total_time = time.time() - t0
         _log_request_to_db(
             model_used=escalation.selected_model,
@@ -974,6 +1021,9 @@ async def chat_completions(request: Request):
             routing_time_ms=round(routing_time * 1000),
             success=True,
             escalated=True,
+            compression_level=compression_stats["level"],
+            compression_savings_pct=compression_stats["savings_pct"],
+            compression_time_ms=compression_stats["compression_time_ms"],
         )
         return result
 
@@ -986,9 +1036,45 @@ async def status():
         "limp_home": is_limp_home(),
         "limp_home_message": get_limp_home_message(),
         "routing_profile": ROUTING_PROFILE,
+        "compression": COMPRESSION_LEVEL,
         "model_health": get_recovery_summary(),
         "discovered_backends": list(backends.keys()),
     }
+
+
+@app.get("/compression")
+async def compression_report():
+    """Get compression effectiveness report from recent requests."""
+    try:
+        import sqlite3
+        db = sqlite3.connect(str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"))
+        rows = db.execute("""
+            SELECT compression_level, COUNT(*) as calls,
+                   ROUND(AVG(compression_savings_pct), 1) as avg_savings,
+                   ROUND(AVG(compression_time_ms), 2) as avg_time_ms,
+                   ROUND(AVG(input_tokens), 0) as avg_input_tokens
+            FROM router_logs
+            WHERE compression_level != ''
+              AND timestamp > datetime('now', '-24 hours')
+            GROUP BY compression_level
+            ORDER BY compression_level
+        """).fetchall()
+        db.close()
+        return {
+            "period": "last_24h",
+            "levels": [
+                {
+                    "level": r[0],
+                    "calls": r[1],
+                    "avg_savings_pct": r[2],
+                    "avg_compression_time_ms": r[3],
+                    "avg_input_tokens": r[4],
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

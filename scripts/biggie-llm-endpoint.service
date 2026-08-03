@@ -15,6 +15,7 @@ RestartSec=5
 Environment=BIGGIE_LLM_HOST=127.0.0.1
 Environment=BIGGIE_LLM_PORT=8080
 Environment=BIGGIE_ROUTING_PROFILE=goldilocks
+Environment=BIGGIE_COMPRESSION=standard
 EnvironmentFile=/home/hermes/.hermes/.env
 
 # Security
