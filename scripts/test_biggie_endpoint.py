@@ -296,13 +296,73 @@ check("Expensive profile picks higher tier than cheap",
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════════
 
-print(f"\n{'═' * 50}")
+# 
+# 7. Streaming support (SSE)
+# 
+
+print("\n 7. Streaming support (SSE) ")
+
+def http_post_stream(path: str, body: dict, timeout: int = 60) -> str:
+    """POST and read the raw response body (for SSE streaming)."""
+    url = f"{BASE_URL}{path}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.read().decode()
+    except Exception as e:
+        return f"ERROR: {e}"
+
+# 7a. Streaming request returns SSE events, not a single JSON body
+raw = http_post_stream("/v1/chat/completions", {
+    "model": "deepseek-v4-flash:cloud",
+    "stream": True,
+    "messages": [{"role": "user", "content": "Say hello in one word."}],
+    "max_tokens": 20,
+})
+check("Streaming returns SSE data: events", "data: " in raw, raw[:200])
+check("Streaming ends with [DONE]", "data: [DONE]" in raw, raw[-200:])
+check("Streaming returns chat.completion.chunk objects", "chat.completion.chunk" in raw, raw[:200])
+check("Streaming does NOT return a single JSON body", not raw.strip().startswith("{"), raw[:200])
+
+# 7b. Non-streaming still returns a single JSON body (regression)
+resp = http_post("/v1/chat/completions", {
+    "model": "deepseek-v4-flash:cloud",
+    "stream": False,
+    "messages": [{"role": "user", "content": "Say hello in one word."}],
+    "max_tokens": 200,
+})
+check("Non-streaming returns JSON body", "choices" in resp, str(resp)[:200])
+check("Non-streaming has message content", resp.get("choices", [{}])[0].get("message", {}).get("content", "") != "", str(resp)[:200])
+
+# 7c. Streaming with a local model falls back to non-streaming (no crash)
+raw_local = http_post_stream("/v1/chat/completions", {
+    "model": "dolphin3",
+    "stream": True,
+    "messages": [{"role": "user", "content": "Say hi"}],
+    "max_tokens": 10,
+})
+check("Streaming local model does not crash", "ERROR" not in raw_local, raw_local[:200])
+
+# 7d. Streaming with an invalid model returns a clean error, not a hang
+raw_bad = http_post_stream("/v1/chat/completions", {
+    "model": "nonexistent-model-xyz",
+    "stream": True,
+    "messages": [{"role": "user", "content": "hi"}],
+    "max_tokens": 10,
+})
+check("Streaming invalid model returns error (no hang)", "ERROR" not in raw_bad, raw_bad[:200])
+
+
+print(f"\n{'' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
-print(f"{'═' * 50}")
+print(f"{'' * 50}")
 
 if FAIL > 0:
-    print("\n⚠️  Some tests failed — review above for details")
-    sys.exit(1)
+ print("\n⚠️ Some tests failed — review above for details")
+ sys.exit(1)
 else:
-    print("\n✅ All tests passed — endpoint is routing correctly")
-    sys.exit(0)
+ print("\n✅ All tests passed — endpoint is routing correctly")
+ sys.exit(0)
