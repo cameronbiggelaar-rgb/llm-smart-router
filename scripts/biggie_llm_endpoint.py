@@ -459,6 +459,41 @@ def _get_usage_tokens(response: dict, direction: str) -> int:
     return usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
 
 
+def _response_has_empty_content(response: Any) -> bool:
+    """Return True if a chat-completion response has empty assistant content.
+
+    A backend that returns HTTP 200 with an empty assistant message is a
+    degenerate success — the model produced no output. Treating it as a
+    success lets empty turns flow through to the client, which then wastes
+    its turn budget self-healing them. This helper lets the router escalate
+    on empty content exactly as it does on HTTPException.
+    """
+    if not isinstance(response, dict):
+        return False
+    choices = response.get("choices") or []
+    if not choices:
+        return False
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return False
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    # Content can be a list of parts (e.g. Codex normalization)
+    if isinstance(content, list):
+        return all(
+            (part.get("text") or "").strip() == ""
+            for part in content
+            if isinstance(part, dict)
+        )
+    return False
+
+
 def _log_request_to_db(
     model_used: str,
     provider: str,
@@ -812,14 +847,35 @@ async def proxy_to_backend_streaming(
                     yield "data: [DONE]\n\n"
                     return
 
+                saw_content = False
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
+                            # A stream that produced no content is a degenerate
+                            # success — the model returned an empty turn. Emit an
+                            # error so the client escalates instead of self-healing.
+                            if not saw_content:
+                                logger.warning(
+                                    "Backend %s streamed empty content for %s, emitting error",
+                                    provider,
+                                    backend_model,
+                                )
+                                yield f"data: {json.dumps({'error': {'message': f'Backend {backend_model} returned empty content', 'type': 'backend_error', 'code': 'empty_content'}})}\n\n"
                             yield "data: [DONE]\n\n"
                             return
+                        # Track whether any content delta was produced
+                        try:
+                            evt = json.loads(data)
+                            for ch in evt.get("choices", []):
+                                delta = ch.get("delta", {}) or {}
+                                c = delta.get("content")
+                                if isinstance(c, str) and c.strip():
+                                    saw_content = True
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
                         # Pass through the SSE event unchanged
                         yield f"data: {data}\n\n"
         except httpx.RequestError as e:
@@ -1025,6 +1081,20 @@ async def chat_completions(request: Request):
             result = await proxy_to_backend_streaming(backend, compressed_messages, body)
         else:
             result = await proxy_to_backend(backend, compressed_messages, body)
+            # A 200 with empty assistant content is a degenerate success —
+            # the model produced no output. Escalate exactly as on HTTPException
+            # so the client never receives an empty turn that would waste its
+            # turn budget self-healing.
+            if _response_has_empty_content(result):
+                logger.warning(
+                    "Backend %s returned empty content for %s, escalating...",
+                    backend.get("provider"),
+                    decision.selected_model,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Backend {decision.selected_model} returned empty content",
+                )
         total_time = time.time() - t0
         llm_time = total_time - routing_time
         # Log the request to DB (skip for streaming — usage comes from stream)

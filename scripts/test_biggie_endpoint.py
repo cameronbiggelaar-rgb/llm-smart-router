@@ -348,12 +348,57 @@ check("Streaming local model does not crash", "ERROR" not in raw_local, raw_loca
 
 # 7d. Streaming with an invalid model returns a clean error, not a hang
 raw_bad = http_post_stream("/v1/chat/completions", {
-    "model": "nonexistent-model-xyz",
-    "stream": True,
-    "messages": [{"role": "user", "content": "hi"}],
-    "max_tokens": 10,
+ "model": "nonexistent-model-xyz",
+ "stream": True,
+ "messages": [{"role": "user", "content": "hi"}],
+ "max_tokens": 10,
 })
 check("Streaming invalid model returns error (no hang)", "ERROR" not in raw_bad, raw_bad[:200])
+
+
+# 
+# 8. Empty-content detection (degenerate 200s)
+# 
+
+print("\n 8. Empty-content detection ")
+
+from biggie_llm_endpoint import _response_has_empty_content
+
+# Empty string content → degenerate success
+check("Empty string content detected",
+ _response_has_empty_content({"choices": [{"message": {"content": ""}}]}) is True)
+
+# Whitespace-only content → degenerate success
+check("Whitespace-only content detected",
+ _response_has_empty_content({"choices": [{"message": {"content": "   "}}]}) is True)
+
+# None content → degenerate success
+check("None content detected",
+ _response_has_empty_content({"choices": [{"message": {"content": None}}]}) is True)
+
+# Real content → not empty
+check("Real content not flagged",
+ _response_has_empty_content({"choices": [{"message": {"content": "hello world"}}]}) is False)
+
+# Missing message → treated as empty (no crash)
+check("Missing message treated as empty",
+ _response_has_empty_content({"choices": [{}]}) is True)
+
+# No choices → not flagged (no crash)
+check("No choices not flagged",
+ _response_has_empty_content({}) is False)
+
+# Non-dict → not flagged (no crash)
+check("Non-dict not flagged",
+ _response_has_empty_content("garbage") is False)
+
+# List-of-parts content (Codex normalization) — all empty → degenerate
+check("Empty list-of-parts content detected",
+ _response_has_empty_content({"choices": [{"message": {"content": [{"text": ""}, {"text": "  "}]}}]}) is True)
+
+# List-of-parts with real text → not empty
+check("Non-empty list-of-parts not flagged",
+ _response_has_empty_content({"choices": [{"message": {"content": [{"text": "real"}]}}]}) is False)
 
 
 print(f"\n{'' * 50}")
