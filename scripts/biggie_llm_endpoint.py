@@ -29,7 +29,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # Load .env file for API keys (systemd EnvironmentFile may not work with ProtectHome)
 _env_path = Path.home() / ".hermes" / ".env"
@@ -757,6 +757,83 @@ async def proxy_to_backend(
         raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
 
 
+async def proxy_to_backend_streaming(
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    request_body: Dict[str, Any],
+) -> Any:
+    """Proxy a chat completion request to the chosen backend with SSE streaming.
+
+    Honors the incoming ``stream`` flag. For OpenAI-compatible backends
+    (Ollama Cloud, etc.) this streams SSE ``data:`` events back to the client
+    so that streaming clients (e.g. the code-editing agent) receive tokens as
+    they are generated instead of a single JSON body.
+    """
+    base_url = backend.get("base_url", "")
+    api_key = backend.get("api_key", "")
+    backend_model = backend.get("backend_model", "")
+    provider = backend.get("provider", "")
+
+    if not base_url:
+        raise HTTPException(status_code=502, detail=f"No base_url for backend")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Only OpenAI-compatible backends support SSE streaming here.
+    # Local Ollama and Codex use their own paths (non-streaming is fine).
+    if provider in ("local", "openai-codex"):
+        # Fall back to non-streaming for these providers.
+        return await proxy_to_backend(backend, messages, request_body)
+
+    body = {
+        "model": backend_model,
+        "messages": messages,
+        "stream": True,
+    }
+    for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
+        if param in request_body:
+            body[param] = request_body[param]
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    async def event_generator():
+        try:
+            client = _get_httpx_client()
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    error_text = await resp.aread()
+                    detail = f"Backend error: {error_text[:500].decode()}"
+                    logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
+                    if resp.status_code == 429:
+                        mark_rate_limited(backend_model)
+                    yield f"data: {json.dumps({'error': {'message': detail, 'type': 'backend_error', 'code': 'backend_error'}})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            return
+                        # Pass through the SSE event unchanged
+                        yield f"data: {data}\n\n"
+        except httpx.RequestError as e:
+            logger.error("Backend %s stream request failed: %s", provider, e)
+            yield f"data: {json.dumps({'error': {'message': f'Backend request failed: {e}', 'type': 'backend_error', 'code': 'backend_error'}})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -822,6 +899,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
     force_model = body.get("model", "")
+    want_stream = bool(body.get("stream", False))
 
     # Track timing
     t0 = time.time()
@@ -943,25 +1021,29 @@ async def chat_completions(request: Request):
 
     # Proxy to the backend
     try:
-        result = await proxy_to_backend(backend, compressed_messages, body)
+        if want_stream:
+            result = await proxy_to_backend_streaming(backend, compressed_messages, body)
+        else:
+            result = await proxy_to_backend(backend, compressed_messages, body)
         total_time = time.time() - t0
         llm_time = total_time - routing_time
-        # Log the request to DB
-        _log_request_to_db(
-            model_used=decision.selected_model,
-            provider=backend.get("provider", ""),
-            task_type=features["task_type"],
-            complexity_score=features["complexity_score"],
-            input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
-            output_tokens=_get_usage_tokens(result, "output") or 0,
-            latency_seconds=total_time,
-            routing_time_ms=round(routing_time * 1000),
-            success=True,
-            escalated=False,
-            compression_level=compression_stats["level"],
-            compression_savings_pct=compression_stats["savings_pct"],
-            compression_time_ms=compression_stats["compression_time_ms"],
-        )
+        # Log the request to DB (skip for streaming — usage comes from stream)
+        if not want_stream:
+            _log_request_to_db(
+                model_used=decision.selected_model,
+                provider=backend.get("provider", ""),
+                task_type=features["task_type"],
+                complexity_score=features["complexity_score"],
+                input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
+                output_tokens=_get_usage_tokens(result, "output") or 0,
+                latency_seconds=total_time,
+                routing_time_ms=round(routing_time * 1000),
+                success=True,
+                escalated=False,
+                compression_level=compression_stats["level"],
+                compression_savings_pct=compression_stats["savings_pct"],
+                compression_time_ms=compression_stats["compression_time_ms"],
+            )
         return result
     except HTTPException:
         # Backend failed — try escalation
@@ -1008,23 +1090,27 @@ async def chat_completions(request: Request):
             )
 
         logger.info("Escalated to: %s/%s", backend.get("provider"), escalation.selected_model)
-        result = await proxy_to_backend(backend, compressed_messages, body)
+        if want_stream:
+            result = await proxy_to_backend_streaming(backend, compressed_messages, body)
+        else:
+            result = await proxy_to_backend(backend, compressed_messages, body)
         total_time = time.time() - t0
-        _log_request_to_db(
-            model_used=escalation.selected_model,
-            provider=backend.get("provider", ""),
-            task_type=features["task_type"],
-            complexity_score=features["complexity_score"],
-            input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
-            output_tokens=_get_usage_tokens(result, "output") or 0,
-            latency_seconds=total_time,
-            routing_time_ms=round(routing_time * 1000),
-            success=True,
-            escalated=True,
-            compression_level=compression_stats["level"],
-            compression_savings_pct=compression_stats["savings_pct"],
-            compression_time_ms=compression_stats["compression_time_ms"],
-        )
+        if not want_stream:
+            _log_request_to_db(
+                model_used=escalation.selected_model,
+                provider=backend.get("provider", ""),
+                task_type=features["task_type"],
+                complexity_score=features["complexity_score"],
+                input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
+                output_tokens=_get_usage_tokens(result, "output") or 0,
+                latency_seconds=total_time,
+                routing_time_ms=round(routing_time * 1000),
+                success=True,
+                escalated=True,
+                compression_level=compression_stats["level"],
+                compression_savings_pct=compression_stats["savings_pct"],
+                compression_time_ms=compression_stats["compression_time_ms"],
+            )
         return result
 
 
