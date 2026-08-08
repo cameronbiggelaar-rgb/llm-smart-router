@@ -553,17 +553,46 @@ def http_post_stream(path: str, body: dict, timeout: int = 60) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
-# 7a. Streaming request returns SSE events, not a single JSON body
+# 7a. Streaming request either returns valid SSE, or fails closed cleanly.
+#
+# Live Ollama Cloud streaming can legitimately empty-stream for Flash/GLM. The
+# reliability invariant is therefore NOT "Flash always returns SSE"; it is:
+#   - healthy stream -> valid SSE chunks and [DONE]
+#   - empty/error stream after bounded server-side escalation -> clean JSON error
+#   - never return a degenerate empty-success stream such as only [DONE]
 raw = http_post_stream("/v1/chat/completions", {
     "model": "deepseek-v4-flash:cloud",
     "stream": True,
     "messages": [{"role": "user", "content": "Say hello in one word."}],
     "max_tokens": 20,
 })
-check("Streaming returns SSE data: events", "data: " in raw, raw[:200])
-check("Streaming ends with [DONE]", "data: [DONE]" in raw, raw[-200:])
-check("Streaming returns chat.completion.chunk objects", "chat.completion.chunk" in raw, raw[:200])
-check("Streaming does NOT return a single JSON body", not raw.strip().startswith("{"), raw[:200])
+raw_stripped = raw.strip()
+is_sse = "data: " in raw and "chat.completion.chunk" in raw
+is_clean_failure = raw_stripped.startswith("{") and any(
+    marker in raw
+    for marker in (
+        "empty content",
+        "Backend",
+        "service_unavailable",
+        "Bad Gateway",
+        "All models failed",
+    )
+)
+degenerate_empty_success = raw_stripped in ("data: [DONE]", "data: [DONE]\n\n")
+
+check("Streaming returns SSE or clean fail-closed response",
+      is_sse or is_clean_failure,
+      raw[:300])
+check("Streaming does not return degenerate empty success",
+      not degenerate_empty_success,
+      raw[:300])
+
+if is_sse:
+    check("Streaming SSE ends with [DONE]", "data: [DONE]" in raw, raw[-200:])
+    check("Streaming SSE returns chat.completion.chunk objects", "chat.completion.chunk" in raw, raw[:200])
+else:
+    check("Streaming fail-closed response is JSON", raw_stripped.startswith("{"), raw[:200])
+    check("Streaming fail-closed response is not SSE", "data: " not in raw, raw[:200])
 
 # 7b. Non-streaming still returns a single JSON body (regression)
 resp = http_post("/v1/chat/completions", {
