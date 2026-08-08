@@ -134,14 +134,13 @@ class FitSummary:
 #   glm-5                  2.0x  — mid-size
 #   glm-5.1                2.5x  — slightly larger
 #   glm-5.2                3.0x  — larger context, more compute
-#   deepseek-v4-pro        4.0x  — premium tier
+#   qwen3.5                3.5x  — Medium tier, SWE-bench 80
 #   deepseek-v3.1:671b    10.0x  — massive 671B MoE, most expensive cloud
 #   gpt-5.5               30.0x  — ChatGPT $20/mo, rate-limited, most capable
 
 DEFAULT_MODEL_COSTS: List[ModelCost] = [
     # ── Local (free, unlimited) ──
     ModelCost("llama3.1:8b", "local", 0.00, 0.00, "2026-07-01"),
-    ModelCost("qwen3:14b", "local", 0.00, 0.00, "2026-07-01"),
 
     # ── Ollama Cloud ($100/mo flat — relative compute units) ──
     ModelCost("deepseek-v4-flash", "ollama-cloud", 0.50, 1.50, "2026-07-01"),
@@ -149,7 +148,7 @@ DEFAULT_MODEL_COSTS: List[ModelCost] = [
     ModelCost("glm-5", "ollama-cloud", 1.00, 3.00, "2026-07-01"),
     ModelCost("glm-5.1", "ollama-cloud", 1.25, 3.75, "2026-07-01"),
     ModelCost("glm-5.2", "ollama-cloud", 1.50, 4.50, "2026-07-01"),
-    ModelCost("deepseek-v4-pro", "ollama-cloud", 2.00, 6.00, "2026-07-01"),
+    ModelCost("qwen3.5", "ollama-cloud", 1.75, 5.25, "2026-08-08"),
     ModelCost("deepseek-v3.1:671b", "ollama-cloud", 5.00, 15.00, "2026-07-01"),
 
     # ── ChatGPT OAuth ($20/mo flat — rate-limited, most capable) ──
@@ -159,13 +158,12 @@ DEFAULT_MODEL_COSTS: List[ModelCost] = [
 # Models ordered by cost (cheapest first) for escalation chain
 MODEL_COST_ORDER = [
     "llama3.1:8b",          # 0.0 — local, free
-    "qwen3:14b",            # 0.0 — local, free
     "deepseek-v4-flash",    # 1.0x — Ollama Cloud baseline
     "minimax-m2.7:cloud",   # 2.0x — Ollama Cloud
     "glm-5",                # 2.0x — Ollama Cloud
     "glm-5.1",              # 2.5x — Ollama Cloud
     "glm-5.2",              # 3.0x — Ollama Cloud
-    "deepseek-v4-pro",      # 4.0x — Ollama Cloud
+    "qwen3.5",              # 3.5x — Ollama Cloud (Medium tier, SWE-bench 80)
     "deepseek-v3.1:671b",   # 10.0x — Ollama Cloud (most expensive cloud)
     "gpt-5.5",              # 30.0x — ChatGPT $20/mo (most capable, rate-limited)
 ]
@@ -173,13 +171,12 @@ MODEL_COST_ORDER = [
 # Model capability tiers (for fit scoring)
 MODEL_CAPABILITY_TIERS = {
     "llama3.1:8b": 1,
-    "qwen3:14b": 2,
     "deepseek-v4-flash": 3,
     "minimax-m2.7:cloud": 4,
     "glm-5": 4,
     "glm-5.1": 5,
     "glm-5.2": 6,
-    "deepseek-v4-pro": 7,
+    "qwen3.5": 7,
     "deepseek-v3.1:671b": 8,
     "gpt-5.5": 10,
 }

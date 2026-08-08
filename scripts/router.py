@@ -379,7 +379,7 @@ def probe_recovery(model: str) -> bool:
         return False
 
     # For local models, do a real health check
-    if model in ("llama3.1:8b", "qwen3:14b", "dolphin3"):
+    if model in ("llama3.1:8b", "dolphin3"):
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -572,11 +572,11 @@ def _check_limp_home() -> None:
 
     # Check if any cloud model is available
     cloud_models = [m for m in MODEL_COST_ORDER
-                    if m not in ("llama3.1:8b", "qwen3:14b", "dolphin3")]
+                    if m not in ("llama3.1:8b", "dolphin3")]
     any_cloud_available = any(is_model_available(m) for m in cloud_models)
 
     # Check if any local model is available
-    local_available = is_model_available("qwen3:14b") or is_model_available("llama3.1:8b")
+    local_available = is_model_available("llama3.1:8b")
 
     if not any_cloud_available and local_available and not _LIMP_HOME_ACTIVE:
         # Entering limp-home mode
@@ -626,8 +626,6 @@ def get_limp_home_message() -> str:
 
 def _best_local_model() -> str:
     """Get the best available local model."""
-    if is_model_available("qwen3:14b"):
-        return "qwen3:14b"
     if is_model_available("llama3.1:8b"):
         return "llama3.1:8b"
     return "none"
@@ -637,11 +635,8 @@ def _select_limp_home_model(task_type: str, complexity_score: float) -> str:
     """Select the best local model for a task in limp-home mode.
 
     In limp-home mode, we only use local models. The routing is simpler:
-    - qwen3:14b (better) for anything non-trivial
-    - llama3.1:8b (basic) for simple Q&A
+    - llama3.1:8b (basic) for everything local
     """
-    if is_model_available("qwen3:14b"):
-        return "qwen3:14b"
     if is_model_available("llama3.1:8b"):
         return "llama3.1:8b"
     return ""

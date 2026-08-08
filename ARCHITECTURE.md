@@ -196,7 +196,6 @@ Relative compute ratios (deepseek-v4-flash = 1.0x baseline):
 | Model | Provider | Ratio | Input units/1M | Output units/1M |
 |---|---|---|---|---|
 | llama3.1:8b | local | 0.0x | 0.00 | 0.00 |
-| qwen3:14b | local | 0.0x | 0.00 | 0.00 |
 | deepseek-v4-flash | ollama-cloud | 1.0x | 0.50 | 1.50 |
 | minimax-m2.7:cloud | ollama-cloud | 2.0x | 1.00 | 3.00 |
 | glm-5 | ollama-cloud | 2.0x | 1.00 | 3.00 |

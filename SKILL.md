@@ -106,7 +106,6 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | Model | Ratio | Notes |
 |---|---|---|
 | llama3.1:8b | 0.0x | Local, free |
-| qwen3:14b | 0.0x | Local, free |
 | deepseek-v4-flash | **1.0x** | Baseline — small, fast |
 | minimax-m2.7:cloud | **2.0x** | Mid-size |
 | glm-5 | **2.0x** | Mid-size |
@@ -120,7 +119,6 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | Model | Provider | Input units/1M | Output units/1M |
 |---|---|---|---|
 | llama3.1:8b | local | 0.00 | 0.00 |
-| qwen3:14b | local | 0.00 | 0.00 |
 | deepseek-v4-flash | ollama-cloud | 0.50 | 1.50 |
 | minimax-m2.7:cloud | ollama-cloud | 1.00 | 3.00 |
 | glm-5 | ollama-cloud | 1.00 | 3.00 |

@@ -89,7 +89,6 @@ model_ids = [m["id"] for m in models.get("data", [])]
 check("deepseek-v4-flash:cloud in models", "deepseek-v4-flash:cloud" in model_ids)
 check("glm-5.2:cloud in models", "glm-5.2:cloud" in model_ids)
 check("llama3.1:8b in models", "llama3.1:8b" in model_ids)
-check("qwen3:14b in models", "qwen3:14b" in model_ids)
 check("dolphin3 in models", "dolphin3" in model_ids)
 check("biggie-router NOT in models (self-skip)", "biggie-router" not in model_ids)
 
@@ -116,7 +115,7 @@ for m in MODEL_COST_ORDER:
 
 # Simple Q&A — should route to cheapest
 d = route_task(complexity_score=0.0, task_type="qa")
-check("Simple Q&A → local (tier 1)", d.selected_model in ("llama3.1:8b", "qwen3:14b"),
+check("Simple Q&A → local (tier 1)", d.selected_model == "llama3.1:8b",
       f"got {d.selected_model}")
 
 # Basic coding — should route to at least tier 4 (routing table default)
@@ -407,13 +406,13 @@ for m in MODEL_COST_ORDER:
 
 # Exhaust all cloud models
 for m in MODEL_COST_ORDER:
-    if m not in ("llama3.1:8b", "qwen3:14b", "dolphin3"):
+    if m not in ("llama3.1:8b", "dolphin3"):
         mark_rate_limited(m)
 
 # Route — should trigger limp-home
 d = route_task(complexity_score=0.5, task_type="coding")
 check("Limp-home activates", d.limp_home, f"got limp_home={d.limp_home}")
-check("Limp-home uses local model", d.selected_model in ("qwen3:14b", "llama3.1:8b"),
+check("Limp-home uses local model", d.selected_model == "llama3.1:8b",
       f"got {d.selected_model}")
 check("Limp-home reason set", bool(d.limp_home_reason), d.limp_home_reason)
 
@@ -478,10 +477,9 @@ check("Routing skips circuit-broken model", d.selected_model != "gpt-5.5",
 
 # Exhaust everything
 for m in MODEL_COST_ORDER:
-    if m not in ("llama3.1:8b", "qwen3:14b", "dolphin3"):
+    if m not in ("llama3.1:8b", "dolphin3"):
         mark_rate_limited(m)
 mark_rate_limited("llama3.1:8b")
-mark_rate_limited("qwen3:14b")
 
 d = route_task(complexity_score=0.5, task_type="coding")
 check("All exhausted returns empty model", d.selected_model == "",

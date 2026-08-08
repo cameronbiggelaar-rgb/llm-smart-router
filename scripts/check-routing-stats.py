@@ -32,7 +32,6 @@ SWITCH_TS = datetime(2026, 7, 31, 4, 31, 0, tzinfo=timezone.utc).timestamp()
 # Tier reference
 TIERS = {
     "llama3.1:8b": 1,
-    "qwen3:14b": 2,
     "deepseek-v4-flash": 3,
     "deepseek-v4-flash:cloud": 3,
     "minimax-m2.7:cloud": 4,
@@ -47,7 +46,6 @@ TIERS = {
 # Compute units (relative to deepseek-v4-flash = 1.0)
 COMPUTE_UNITS = {
     "llama3.1:8b": 0.0,
-    "qwen3:14b": 0.0,
     "deepseek-v4-flash": 1.0,
     "deepseek-v4-flash:cloud": 1.0,
     "minimax-m2.7:cloud": 2.0,

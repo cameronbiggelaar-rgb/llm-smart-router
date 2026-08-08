@@ -15,7 +15,6 @@
 #
 # Tier reference:
 #   1  = llama3.1:8b         (local, free)
-#   2  = qwen3:14b           (local, free)
 #   3  = deepseek-v4-flash   (ollama-cloud, cheapest cloud)
 #   4  = minimax-m2.7:cloud  (ollama-cloud)
 #      = glm-5               (ollama-cloud)
