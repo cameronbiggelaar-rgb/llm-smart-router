@@ -615,6 +615,19 @@ async def proxy_to_backend(
             if param in request_body:
                 body[param] = request_body[param]
 
+        # Forward tool schemas so the model can call terminal/file tools.
+        # Convert chat-completions tool schemas to Responses function-tool
+        # schemas using Hermes' own adapter (mirrors the codex transport).
+        tools = request_body.get("tools")
+        if tools:
+            try:
+                from agent.codex_responses_adapter import _responses_tools
+                converted = _responses_tools(tools)
+                if converted:
+                    body["tools"] = converted
+            except Exception as e:
+                logger.warning("Failed to convert tools for codex backend: %s", e)
+
         url = f"{base_url.rstrip('/')}/responses"
 
         try:
