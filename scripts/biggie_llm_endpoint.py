@@ -821,10 +821,59 @@ async def proxy_to_backend_streaming(
         headers["Authorization"] = f"Bearer {api_key}"
 
     # Only OpenAI-compatible backends support SSE streaming here.
-    # Local Ollama and Codex use their own paths (non-streaming is fine).
+    # Local Ollama and Codex use their own paths (non-streaming is fine),
+    # but the client sent stream=True and expects SSE — so wrap the
+    # non-streaming result into a valid SSE stream (one content chunk,
+    # then [DONE]) instead of returning a bare JSON dict that a streaming
+    # client would misparse as an empty stream.
     if provider in ("local", "openai-codex"):
-        # Fall back to non-streaming for these providers.
-        return await proxy_to_backend(backend, messages, request_body)
+        result = await proxy_to_backend(backend, messages, request_body)
+
+        async def wrap_non_streaming():
+            content = ""
+            if isinstance(result, dict):
+                choices = result.get("choices", [])
+                if choices:
+                    content = (choices[0].get("message", {}) or {}).get("content", "") or ""
+            if not content:
+                logger.warning(
+                    "Backend %s returned empty content for %s, emitting error",
+                    provider,
+                    backend_model,
+                )
+                yield f"data: {json.dumps({'error': {'message': f'Backend {backend_model} returned empty content', 'type': 'backend_error', 'code': 'empty_content'}})}\n\n"
+            else:
+                chunk = {
+                    "id": result.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": result.get("created", 0),
+                    "model": result.get("model", backend_model),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                finish = {
+                    "id": result.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": result.get("created", 0),
+                    "model": result.get("model", backend_model),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(finish)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            wrap_non_streaming(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     body = {
         "model": backend_model,
