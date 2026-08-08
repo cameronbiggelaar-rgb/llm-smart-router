@@ -662,8 +662,20 @@ async def proxy_to_backend(
                                 break
                             elif current_event == "response.output_item.added":
                                 item = event.get("item") or event
-                                if isinstance(item, dict) and item.get("type") == "message":
+                                if isinstance(item, dict) and item.get("type") in ("message", "function_call"):
                                     collected_output.append(item)
+                            elif current_event == "response.output_item.done":
+                                # The completed item carries the final arguments
+                                # for a function_call (the .added event has empty
+                                # arguments). Replace the placeholder with it.
+                                item = event.get("item") or event
+                                if isinstance(item, dict) and item.get("type") == "function_call":
+                                    for i, existing in enumerate(collected_output):
+                                        if existing.get("id") == item.get("id"):
+                                            collected_output[i] = item
+                                            break
+                                    else:
+                                        collected_output.append(item)
                             elif current_event == "response.content_part.done":
                                 part = event.get("part", {})
                                 item_id = event.get("item_id", "")
@@ -709,10 +721,31 @@ async def proxy_to_backend(
                 msg, reason = normalized, "stop"
 
             content = ""
+            tool_calls = None
             if isinstance(msg, dict):
                 content = msg.get("content", "")
+                tool_calls = msg.get("tool_calls")
             elif hasattr(msg, "content"):
                 content = msg.content
+                tool_calls = getattr(msg, "tool_calls", None)
+
+            message = {
+                "role": "assistant",
+                "content": content or "",
+            }
+            if tool_calls:
+                # Normalize SimpleNamespace tool_calls to plain dicts for JSON
+                message["tool_calls"] = [
+                    {
+                        "id": getattr(tc, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc.function, "name", "") if hasattr(tc, "function") else "",
+                            "arguments": getattr(tc.function, "arguments", "") if hasattr(tc, "function") else "",
+                        },
+                    }
+                    for tc in tool_calls
+                ]
 
             return {
                 "id": responses_data.get("id", ""),
@@ -721,10 +754,7 @@ async def proxy_to_backend(
                 "model": responses_data.get("model", backend_model),
                 "choices": [{
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content or "",
-                    },
+                    "message": message,
                     "finish_reason": reason or "stop",
                 }],
                 "usage": responses_data.get("usage", {}),
@@ -844,11 +874,14 @@ async def proxy_to_backend_streaming(
 
         async def wrap_non_streaming():
             content = ""
+            tool_calls = None
             if isinstance(result, dict):
                 choices = result.get("choices", [])
                 if choices:
-                    content = (choices[0].get("message", {}) or {}).get("content", "") or ""
-            if not content:
+                    msg = (choices[0].get("message", {}) or {})
+                    content = msg.get("content", "") or ""
+                    tool_calls = msg.get("tool_calls")
+            if not content and not tool_calls:
                 logger.warning(
                     "Backend %s returned empty content for %s, emitting error",
                     provider,
@@ -856,6 +889,11 @@ async def proxy_to_backend_streaming(
                 )
                 yield f"data: {json.dumps({'error': {'message': f'Backend {backend_model} returned empty content', 'type': 'backend_error', 'code': 'empty_content'}})}\n\n"
             else:
+                delta = {"role": "assistant"}
+                if content:
+                    delta["content"] = content
+                if tool_calls:
+                    delta["tool_calls"] = tool_calls
                 chunk = {
                     "id": result.get("id", ""),
                     "object": "chat.completion.chunk",
@@ -863,7 +901,7 @@ async def proxy_to_backend_streaming(
                     "model": result.get("model", backend_model),
                     "choices": [{
                         "index": 0,
-                        "delta": {"role": "assistant", "content": content},
+                        "delta": delta,
                         "finish_reason": None,
                     }],
                 }
