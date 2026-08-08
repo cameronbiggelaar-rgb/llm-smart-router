@@ -446,7 +446,100 @@ def extract_features_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, 
         "prompt_text": combined_prompt,
         "tool_call_count": tool_call_count,
         "message_count": message_count,
+        "context_tokens": _estimate_context_tokens(messages),
     }
+
+
+def _message_text(content: Any) -> str:
+    """Return text from OpenAI-style message content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content") or part.get("input_text") or part.get("output_text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _estimate_context_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Cheap token estimate for routing policy decisions."""
+    chars = 0
+    for msg in messages:
+        chars += len(_message_text(msg.get("content", "")))
+        # Account for OpenAI message framing and tool-call metadata roughly.
+        chars += 16
+        if msg.get("tool_calls"):
+            chars += len(json.dumps(msg.get("tool_calls"), ensure_ascii=False))
+    return max(1, chars // 4)
+
+
+def detect_workload_type(
+    messages: List[Dict[str, Any]],
+    body: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """Detect first-class Biggie workload type.
+
+    Hermes auxiliary session compression should be routed natively, not treated
+    as arbitrary high-complexity chat. Prefer explicit metadata/headers when
+    present; fall back to stable Hermes compaction prompt/status phrases.
+    """
+    headers_l = {str(k).lower(): str(v).strip().lower() for k, v in (headers or {}).items()}
+    explicit = (
+        headers_l.get("x-hermes-auxiliary-task")
+        or headers_l.get("x-biggie-workload")
+        or headers_l.get("x-hermes-task")
+    )
+    raw_metadata = body.get("metadata")
+    metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    explicit = explicit or str(
+        metadata.get("hermes_task")
+        or metadata.get("auxiliary_task")
+        or metadata.get("workload_type")
+        or metadata.get("task")
+        or ""
+    ).strip().lower()
+
+    if explicit in {"compression", "context_compression", "session_compression", "compaction"}:
+        return "session_compression"
+
+    prompt = "\n".join(_message_text(m.get("content", "")) for m in messages).lower()
+    compression_markers = (
+        "context compaction",
+        "context compression",
+        "compacting context",
+        "summarizing earlier conversation",
+        "summarising earlier conversation",
+        "summarize earlier conversation",
+        "summarise earlier conversation",
+        "conversation summary",
+        "compressed summary",
+        "compress the conversation",
+        "summarize the conversation so i can continue",
+        "summarise the conversation so i can continue",
+        "preserve facts, decisions",
+        "preserve key facts",
+    )
+    if any(marker in prompt for marker in compression_markers):
+        return "session_compression"
+
+    return "normal_chat"
+
+
+def compression_level_for_workload(request: Request, workload_type: str) -> str:
+    """Choose Biggie request-compression level for the detected workload."""
+    header_level = request.headers.get("X-Compression-Level")
+    if header_level in ("off", "lite", "standard", "aggressive"):
+        return header_level
+    if workload_type == "session_compression":
+        # Hermes is already doing semantic summarisation. Keep Biggie's request
+        # compression conservative so it does not strip details before summary.
+        return "lite" if COMPRESSION_LEVEL != "off" else "off"
+    return COMPRESSION_LEVEL
 
 
 # ── Request logging ────────────────────────────────────────────────────────────
@@ -551,6 +644,42 @@ def _log_request_to_db(
 
 # ── Backend proxy ─────────────────────────────────────────────────────────────
 
+def _codex_input_from_responses_items(responses_input: list) -> list:
+    """Convert Hermes' Responses input items into the Codex /responses body.
+
+    ``_chat_messages_to_responses_input`` returns a MIX of item types for a
+    tool conversation:
+      - {"role": "user"/"assistant", "content": ...}  -> message items
+      - {"type": "function_call", "call_id", "name", "arguments"}
+      - {"type": "function_call_output", "call_id", "output"}
+
+    Only the plain message dicts must be wrapped as "message" items. The
+    function_call / function_call_output items MUST be passed through verbatim
+    — wrapping them as empty user messages (role defaults to "user", content
+    "") drops the tool result and the assistant's function_call from the
+    upstream request, so gpt-5.5 never sees the tool output and repeats the
+    same call every turn (the repeated tool-call loop).
+    """
+    codex_input = []
+    for item in responses_input:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("function_call", "function_call_output"):
+            # Pass through verbatim — preserves call_id pairing and tool
+            # result binding across turns.
+            codex_input.append(item)
+            continue
+        role = item.get("role", "user")
+        content = item.get("content", "")
+        text_type = "output_text" if role == "assistant" else "input_text"
+        codex_input.append({
+            "type": "message",
+            "role": role,
+            "content": [{"type": text_type, "text": content}],
+        })
+    return codex_input
+
+
 async def proxy_to_backend(
     backend: Dict[str, Any],
     messages: List[Dict[str, Any]],
@@ -589,20 +718,7 @@ async def proxy_to_backend(
         )
 
         responses_input = _chat_messages_to_responses_input(messages)
-        # Codex backend uses "message" type items. The Responses API rejects
-        # "input_text" inside assistant messages and "output_text" inside user
-        # messages, so the text type MUST follow the role (mirrors Hermes'
-        # own adapter: output_text for assistant, input_text otherwise).
-        codex_input = []
-        for item in responses_input:
-            role = item.get("role", "user")
-            content = item.get("content", "")
-            text_type = "output_text" if role == "assistant" else "input_text"
-            codex_input.append({
-                "type": "message",
-                "role": role,
-                "content": [{"type": text_type, "text": content}],
-            })
+        codex_input = _codex_input_from_responses_items(responses_input)
 
         body = {
             "model": backend_model,
@@ -1073,8 +1189,10 @@ async def chat_completions(request: Request):
     # Discover available backends from Hermes config
     backends = discover_backends()
 
-    # Extract features from the prompt
+    # Extract features from the prompt and classify first-class workload.
     features = extract_features_from_messages(messages)
+    workload_type = detect_workload_type(messages, body, dict(request.headers))
+    routed_task_type = "session_compression" if workload_type == "session_compression" else features["task_type"]
 
     # Check limp-home
     if is_limp_home():
@@ -1083,16 +1201,20 @@ async def chat_completions(request: Request):
     # Route the task
     decision = route_task(
         complexity_score=features["complexity_score"],
-        task_type=features["task_type"],
+        task_type=routed_task_type,
         has_niche_references=features["has_niche_references"],
         has_format_constraint=features["has_format_constraint"],
         instruction_count=features["instruction_count"],
         force_model=force_model if force_model else "",
         prompt=features["prompt_text"],
+        workload_type=workload_type,
+        context_tokens=features.get("context_tokens", 0),
     )
 
-    # Apply routing profile
-    decision = apply_routing_profile(decision, features)
+    # Apply routing profile (normal workloads only; session_compression has its
+    # own native summarisation policy so profile boosting doesn't overroute it).
+    if workload_type != "session_compression":
+        decision = apply_routing_profile(decision, features)
 
     # Record routing time
     routing_time = time.time() - t0
@@ -1165,21 +1287,19 @@ async def chat_completions(request: Request):
         )
 
     logger.info(
-        "Routing: %s → %s/%s (profile=%s, cpx=%.2f, task=%s%s)",
+        "Routing: %s → %s/%s (profile=%s, cpx=%.2f, task=%s, workload=%s%s)",
         features["prompt_text"][:60],
         backend.get("provider", "?"),
         decision.selected_model,
         ROUTING_PROFILE,
         features["complexity_score"],
-        features["task_type"],
+        routed_task_type,
+        workload_type,
         " LIMP" if decision.limp_home else "",
     )
 
     # ── Compression ─────────────────────────────────────────────────────────
-    # Determine compression level: request header > env var > default
-    compression_level = request.headers.get(
-        "X-Compression-Level", COMPRESSION_LEVEL
-    )
+    compression_level = compression_level_for_workload(request, workload_type)
     if compression_level not in ("off", "lite", "standard", "aggressive"):
         compression_level = COMPRESSION_LEVEL
 
@@ -1232,7 +1352,7 @@ async def chat_completions(request: Request):
             _log_request_to_db(
                 model_used=decision.selected_model,
                 provider=backend.get("provider", ""),
-                task_type=features["task_type"],
+                task_type=routed_task_type,
                 complexity_score=features["complexity_score"],
                 input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
                 output_tokens=_get_usage_tokens(result, "output") or 0,
@@ -1324,7 +1444,7 @@ async def chat_completions(request: Request):
             _log_request_to_db(
                 model_used=escalation.selected_model,
                 provider=backend.get("provider", ""),
-                task_type=features["task_type"],
+                task_type=routed_task_type,
                 complexity_score=features["complexity_score"],
                 input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
                 output_tokens=_get_usage_tokens(result, "output") or 0,

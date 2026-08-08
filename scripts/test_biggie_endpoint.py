@@ -29,6 +29,11 @@ from router import (
     MODEL_CAPABILITY_TIERS,
     MODEL_COST_ORDER,
 )
+from biggie_llm_endpoint import (
+    detect_workload_type,
+    compression_level_for_workload,
+    COMPRESSION_LEVEL,
+)
 
 BASE_URL = "http://127.0.0.1:8080"
 PASS = 0
@@ -153,6 +158,61 @@ check("Private mode → dolphin3", d.selected_model == "dolphin3" and d.is_priva
 d = route_task(force_model="gpt-5.5")
 check("Force model → gpt-5.5", d.selected_model == "gpt-5.5",
       f"got {d.selected_model}")
+
+# Native Hermes session compression — huge context should be routed as a
+# summarisation workload, not over-escalated to the biggest reasoning model.
+for m in MODEL_COST_ORDER:
+    mark_available(m)
+d = route_task(
+    complexity_score=0.99,
+    task_type="session_compression",
+    workload_type="session_compression",
+    context_tokens=240_000,
+    prompt="Context compaction: summarize earlier conversation and preserve key facts.",
+)
+check("Session compression → cheap cloud summariser",
+      d.selected_model == "deepseek-v4-flash",
+      f"got {d.selected_model} ({d.reason})")
+check("Session compression does not default to gpt-5.5",
+      d.selected_model != "gpt-5.5",
+      f"got {d.selected_model}")
+
+# If flash is unavailable, native compression escalates within the router policy.
+mark_rate_limited("deepseek-v4-flash")
+d = route_task(
+    complexity_score=0.99,
+    task_type="session_compression",
+    workload_type="session_compression",
+    context_tokens=240_000,
+)
+check("Session compression falls back to next summariser",
+      d.selected_model in ("glm-5.2", "deepseek-v4-pro", "deepseek-v3.1:671b", "gpt-5.5"),
+      f"got {d.selected_model}")
+mark_available("deepseek-v4-flash")
+
+# Workload detection — explicit metadata/header is preferred; Hermes prompt
+# markers are a fallback for current auxiliary clients that do not send headers.
+compression_messages = [{
+    "role": "user",
+    "content": "Context compaction: summarize earlier conversation so I can continue. Preserve key facts, decisions, and open tasks.",
+}]
+check("Detect session compression from metadata",
+      detect_workload_type(compression_messages, {"metadata": {"hermes_task": "compression"}}, {}) == "session_compression")
+check("Detect session compression from prompt markers",
+      detect_workload_type(compression_messages, {}, {}) == "session_compression")
+check("Normal prompt is normal_chat workload",
+      detect_workload_type([{"role": "user", "content": "Say hi"}], {}, {}) == "normal_chat")
+
+class _FakeRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+check("Session compression uses conservative Biggie compression by default",
+      compression_level_for_workload(_FakeRequest(), "session_compression") in ("lite", "off"))
+check("Header overrides workload compression level",
+      compression_level_for_workload(_FakeRequest({"X-Compression-Level": "off"}), "session_compression") == "off")
+check("Normal workload uses configured Biggie compression",
+      compression_level_for_workload(_FakeRequest(), "normal_chat") == COMPRESSION_LEVEL)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,6 +459,70 @@ check("Empty list-of-parts content detected",
 # List-of-parts with real text → not empty
 check("Non-empty list-of-parts not flagged",
  _response_has_empty_content({"choices": [{"message": {"content": [{"text": "real"}]}}]}) is False)
+
+
+# ── Codex tool-conversation state preservation (repeated tool-call loop fix) ──
+from biggie_llm_endpoint import _codex_input_from_responses_items
+
+def _codex_items(messages):
+    """Run the full Hermes adapter + router conversion on a message list."""
+    import sys as _sys
+    _hermes = str(Path.home() / ".hermes" / "hermes-agent")
+    if _hermes not in _sys.path:
+        _sys.path.insert(0, _hermes)
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+    return _codex_input_from_responses_items(_chat_messages_to_responses_input(messages))
+
+# TEST 1 — sequential commands: tool result must be present upstream after FIRST
+_seq = [
+    {"role": "user", "content": "Run echo FIRST then echo SECOND."},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{\"command\": \"echo FIRST\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "FIRST"},
+]
+_seq_items = _codex_items(_seq)
+check("TEST1: function_call item preserved upstream",
+ any(i.get("type") == "function_call" and i.get("call_id") == "call_1" for i in _seq_items))
+check("TEST1: function_call_output (tool result) preserved upstream",
+ any(i.get("type") == "function_call_output" and i.get("call_id") == "call_1" and i.get("output") == "FIRST" for i in _seq_items))
+check("TEST1: no empty user message wrapping tool items",
+ not any(i.get("type") == "message" and i.get("role") == "user" and i.get("content") == [{"type": "input_text", "text": ""}] for i in _seq_items))
+
+# TEST 2 — no duplicate loop: next request must NOT reconstruct pre-tool state.
+# The tool result must be present; the original user prompt must remain once.
+_user_msgs = [i for i in _seq_items if i.get("type") == "message" and i.get("role") == "user"]
+check("TEST2: user prompt present exactly once",
+ len(_user_msgs) == 1 and "echo FIRST" in _user_msgs[0]["content"][0]["text"])
+check("TEST2: tool result present (not dropped to pre-tool state)",
+ any(i.get("type") == "function_call_output" for i in _seq_items))
+
+# TEST 3 — call identity: function_call call_id and function_call_output call_id paired
+_fc = [i for i in _seq_items if i.get("type") == "function_call"]
+_fco = [i for i in _seq_items if i.get("type") == "function_call_output"]
+check("TEST3: function_call and output call_ids paired",
+ len(_fc) == 1 and len(_fco) == 1 and _fc[0]["call_id"] == _fco[0]["call_id"] == "call_1")
+
+# TEST 4 — multi-turn tool sequence: three distinct calls all preserved
+_multi = [{"role": "user", "content": "Run FIRST, SECOND, THIRD in order."}]
+for i, cmd in enumerate(["FIRST", "SECOND", "THIRD"]):
+    _multi.append({"role": "assistant", "content": "", "tool_calls": [
+        {"id": f"call_{i}", "type": "function", "function": {"name": "terminal", "arguments": f'{{"command": "echo {cmd}"}}'}}
+    ]})
+    _multi.append({"role": "tool", "tool_call_id": f"call_{i}", "content": cmd})
+_multi_items = _codex_items(_multi)
+_fcos = [i for i in _multi_items if i.get("type") == "function_call_output"]
+check("TEST4: three distinct tool results preserved",
+ len(_fcos) == 3 and [i["output"] for i in _fcos] == ["FIRST", "SECOND", "THIRD"])
+check("TEST4: three distinct function_calls preserved",
+ len([i for i in _multi_items if i.get("type") == "function_call"]) == 3)
+
+# TEST 5 — existing routes unchanged: plain (non-tool) conversation still wraps as messages
+_plain = _codex_items([{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}])
+check("TEST5: plain user message wrapped correctly",
+ _plain[0] == {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]})
+check("TEST5: plain assistant message wrapped correctly",
+ _plain[1] == {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]})
 
 
 print(f"\n{'' * 50}")
