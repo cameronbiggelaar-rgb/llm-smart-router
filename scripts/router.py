@@ -643,6 +643,8 @@ def route_task(
     is_private: bool = False,
     force_model: str = "",
     prompt: str = "",
+    workload_type: str = "normal_chat",
+    context_tokens: int = 0,
 ) -> RoutingDecision:
     """Select the best model for a task based on its features.
 
@@ -656,6 +658,8 @@ def route_task(
         parent_model: The model used by the parent session (if subagent).
         is_private: Whether to use private mode (local only).
         force_model: Override to use a specific model.
+        workload_type: First-class workload class (e.g. session_compression).
+        context_tokens: Approximate prompt/context size for context-sensitive policies.
 
     Returns:
         RoutingDecision with the selected model and fallback chain.
@@ -722,6 +726,34 @@ def route_task(
             fallback_chain=_build_fallback_chain(force_model),
         )
 
+    # ── Native Hermes session-compression workload ─────────────────────
+    # A context-compaction prompt is often huge, but that size is a context
+    # requirement, not proof that the task needs the most expensive reasoning
+    # model. Keep it inside the router (health, circuit breakers, fallbacks,
+    # logging), but apply a summarisation-specific policy: prefer the cheapest
+    # cloud summariser at/above tier 3 and escalate through the normal chain on
+    # failure. Avoid local limp-home models unless limp-home is already active.
+    if workload_type == "session_compression" or task_type == "session_compression":
+        selected = _select_session_compression_model()
+        if not selected:
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason="session_compression workload but no summariser model available",
+                fallback_chain=[],
+                all_exhausted=True,
+            )
+        return RoutingDecision(
+            selected_model=selected,
+            selected_provider=_get_provider(selected),
+            reason=(
+                "native session_compression workload — selected cheapest "
+                f"available summariser {selected} (tier {MODEL_CAPABILITY_TIERS.get(selected, 0)}, "
+                f"context≈{context_tokens} tokens)"
+            ),
+            fallback_chain=_build_fallback_chain(selected),
+        )
+
     # ── Capability-based routing ──
     # Find the cheapest available model that meets the minimum tier
     selected = _select_model(min_tier)
@@ -747,6 +779,14 @@ def route_task(
     )
 
 
+def _normalize_model_name(model: str) -> str:
+    """Normalize Hermes provider-suffixed model IDs for router tables/state."""
+    for suffix in (":cloud", ":local", ":ollama"):
+        if model.endswith(suffix):
+            return model[: -len(suffix)]
+    return model
+
+
 def escalate_on_failure(
     failed_model: str,
     complexity_score: float = 0.0,
@@ -765,10 +805,11 @@ def escalate_on_failure(
     Returns:
         RoutingDecision for the next model in the chain.
     """
-    status = _MODEL_STATUSES.get(failed_model)
+    failed_model_key = _normalize_model_name(failed_model)
+    status = _MODEL_STATUSES.get(failed_model_key)
 
     if error_type == "rate_limit":
-        mark_rate_limited(failed_model)
+        mark_rate_limited(failed_model_key)
     else:
         if status:
             status.consecutive_failures += 1
@@ -777,7 +818,7 @@ def escalate_on_failure(
 
     # Check circuit breaker threshold
     if status and status.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
-        open_circuit(failed_model, error_type)
+        open_circuit(failed_model_key, error_type)
 
     # Check if we should enter limp-home mode
     _check_limp_home()
@@ -797,7 +838,7 @@ def escalate_on_failure(
             )
 
     # Find the next available model with higher capability
-    failed_tier = MODEL_CAPABILITY_TIERS.get(failed_model, 0)
+    failed_tier = MODEL_CAPABILITY_TIERS.get(failed_model_key, 0)
     available = get_available_models()
 
     for model in available:
@@ -1046,6 +1087,32 @@ def _estimate_min_tier(
 
     # Clamp to valid range
     return max(1, min(min_tier, 10))
+
+
+def _select_session_compression_model() -> str:
+    """Select a native Hermes session-compression summariser.
+
+    Session compression is latency/reliability-sensitive maintenance work.
+    Prefer cloud summariser models in cost order, starting at flash, while still
+    respecting router availability/circuit-breaker state.
+    """
+    preferred = [
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "qwen3.5",
+        "deepseek-v3.1:671b",
+        "gpt-5.5",
+    ]
+    for model in preferred:
+        if is_model_available(model):
+            return model
+
+    # If all preferred summariser models are unavailable, fall back to the
+    # cheapest available tier-3+ model before declaring exhaustion.
+    for model in get_available_models():
+        if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
+            return model
+    return ""
 
 
 def _select_model(min_tier: int) -> str:

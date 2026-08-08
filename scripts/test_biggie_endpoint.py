@@ -186,7 +186,7 @@ d = route_task(
     context_tokens=240_000,
 )
 check("Session compression falls back to next summariser",
-      d.selected_model in ("glm-5.2", "deepseek-v4-pro", "deepseek-v3.1:671b", "gpt-5.5"),
+      d.selected_model in ("glm-5.2", "qwen3.5", "deepseek-v3.1:671b", "gpt-5.5"),
       f"got {d.selected_model}")
 mark_available("deepseek-v4-flash")
 
