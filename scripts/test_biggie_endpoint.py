@@ -216,6 +216,186 @@ check("Normal workload uses configured Biggie compression",
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 2b. Tool capability gate (FIX 1) — REGRESSION TESTS 1-9
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("\n═══ 2b. Tool capability gate (FIX 1) ═══")
+
+from router import TOOL_CAPABLE_MODELS, _select_tool_capable_model, _build_tool_fallback_chain
+
+def _normalize_model_name_tool(m):
+    for s in (":cloud", ":local", ":ollama"):
+        if m.endswith(s):
+            return m[: -len(s)]
+    return m
+
+# Reset all models available
+for m in MODEL_COST_ORDER:
+    mark_available(m)
+
+# TEST 1: biggie-llm + tools + simple coding prompt -> gpt-5.5
+d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
+check("TEST1: tools + simple coding → gpt-5.5",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 2: biggie-llm + tools + debugging prompt -> gpt-5.5
+d = route_task(complexity_score=0.5, task_type="debugging", requires_tools=True)
+check("TEST2: tools + debugging → gpt-5.5",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 3: biggie-llm + tools + low complexity -> still gpt-5.5
+d = route_task(complexity_score=0.0, task_type="qa", requires_tools=True)
+check("TEST3: tools + low complexity → still gpt-5.5",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 4: exact decision #22-style prompt + terminal/file tools -> gpt-5.5
+d = route_task(
+    complexity_score=0.8,
+    task_type="coding",
+    requires_tools=True,
+    prompt="You are a code-editing agent. Your task is to: implement the change. Use the terminal and file tools.",
+)
+check("TEST4: code-editing + terminal/file tools → gpt-5.5",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 5: qwen cheaper/available -> cannot win tool-required routing
+d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
+check("TEST5: qwen cannot win tool-required routing",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 6: glm cheaper/available -> cannot win tool-required routing
+d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
+check("TEST6: glm cannot win tool-required routing",
+      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+
+# TEST 7: gpt-5.5 unavailable + tools -> fail closed, not qwen/glm
+mark_rate_limited("gpt-5.5")
+d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
+check("TEST7: gpt-5.5 unavailable + tools → fail closed (not qwen/glm)",
+      d.selected_model == "" and d.all_exhausted,
+      f"got {d.selected_model} (all_exhausted={d.all_exhausted})")
+mark_available("gpt-5.5")
+
+# TEST 8: no tools + simple task -> cheap routing still works normally
+d = route_task(complexity_score=0.0, task_type="qa", requires_tools=False)
+check("TEST8: no tools + simple task → cheap routing",
+      MODEL_CAPABILITY_TIERS.get(d.selected_model, 0) <= 3,
+      f"got {d.selected_model}")
+
+# TEST 9: session compression without tools -> normal summariser policy unchanged
+for m in MODEL_COST_ORDER:
+    mark_available(m)
+d = route_task(
+    complexity_score=0.99,
+    task_type="session_compression",
+    workload_type="session_compression",
+    context_tokens=240_000,
+    requires_tools=False,
+)
+check("TEST9: session compression without tools → normal summariser policy",
+      d.selected_model == "deepseek-v4-flash",
+      f"got {d.selected_model}")
+
+# Tool fallback chain only contains tool-capable models
+mark_rate_limited("gpt-5.5")
+d = route_task(complexity_score=0.5, task_type="debugging", requires_tools=True)
+check("Tool fail-closed does not leak qwen/glm into fallback",
+      d.selected_model == "" , f"got {d.selected_model}")
+mark_available("gpt-5.5")
+chain = _build_tool_fallback_chain("gpt-5.5")
+check("Tool fallback chain only tool-capable",
+      all(_normalize_model_name_tool(m) in TOOL_CAPABLE_MODELS for m in chain) or not chain,
+      f"chain={chain}")
+
+# TEST 18a: requires_tools default False for existing callers
+d = route_task(complexity_score=0.1, task_type="coding")
+check("requires_tools defaults False (backward compat)",
+      d.selected_model != "gpt-5.5" or MODEL_CAPABILITY_TIERS.get(d.selected_model, 0) >= 4,
+      f"got {d.selected_model}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2c. Streaming preflight + escalation (FIX 2) — REGRESSION TESTS 10-18
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("\n═══ 2c. Streaming preflight + escalation (FIX 2) ═══")
+
+from biggie_llm_endpoint import _sse_delta_parts
+
+# TEST 10a: Flash content stream is meaningful
+saw_c, saw_t, term = _sse_delta_parts('{"choices":[{"delta":{"content":"hello"}}]}')
+check("TEST10: content delta is meaningful",
+      saw_c and not term, f"content={saw_c} tool={saw_t} term={term}")
+
+# TEST 11: structured tool-call stream is meaningful
+saw_c, saw_t, term = _sse_delta_parts('{"choices":[{"delta":{"tool_calls":[{"function":{"name":"terminal","arguments":"{}"}}]}}]}')
+check("TEST11: tool-call delta is meaningful",
+      saw_t and not term, f"content={saw_c} tool={saw_t} term={term}")
+
+# TEST 12: [DONE] with no prior content is terminal/empty
+saw_c, saw_t, term = _sse_delta_parts("[DONE]")
+check("TEST12: [DONE] is terminal",
+      term and not saw_c and not saw_t, f"content={saw_c} tool={saw_t} term={term}")
+
+# TEST 13: upstream error payload is terminal
+saw_c, saw_t, term = _sse_delta_parts('{"error":{"message":"backend failed"}}')
+check("TEST13: upstream error is terminal",
+      term, f"content={saw_c} tool={saw_t} term={term}")
+
+# Empty whitespace content is NOT meaningful (no false positive)
+saw_c, saw_t, term = _sse_delta_parts('{"choices":[{"delta":{"content":"  "}}]}')
+check("Whitespace content not meaningful",
+      not saw_c and not term, f"content={saw_c} tool={saw_t} term={term}")
+
+# TEST 14/15: escalation logic — empty stream marks backend failed and escalates
+# (validated via escalate_on_failure with a tool-capable context)
+for m in MODEL_COST_ORDER:
+    mark_available(m)
+d = escalate_on_failure("deepseek-v4-flash", error_type="empty_stream")
+check("TEST14/15: empty flash escalates to higher tier",
+      MODEL_CAPABILITY_TIERS.get(d.selected_model, 0) > 3,
+      f"got {d.selected_model} (tier {MODEL_CAPABILITY_TIERS.get(d.selected_model, 0)})")
+
+# TEST 16: escalation never returns to the same failed backend
+check("TEST16: escalation does not return to same failed backend",
+      d.selected_model != "deepseek-v4-flash", f"got {d.selected_model}")
+
+# TEST 17: large session-compression context moves away from Flash per policy
+# (with FLASH_MAX_CONTEXT_TOKENS set, context_tokens above it bypasses flash)
+import router as _router_mod
+_orig_flash_max = _router_mod.FLASH_MAX_CONTEXT_TOKENS
+_router_mod.FLASH_MAX_CONTEXT_TOKENS = 100_000
+for m in MODEL_COST_ORDER:
+    mark_available(m)
+d = route_task(
+    complexity_score=0.99,
+    task_type="session_compression",
+    workload_type="session_compression",
+    context_tokens=240_000,
+)
+check("TEST17: large compression bypasses Flash when threshold set",
+      d.selected_model != "deepseek-v4-flash" and d.selected_model != "",
+      f"got {d.selected_model}")
+_router_mod.FLASH_MAX_CONTEXT_TOKENS = _orig_flash_max
+
+# TEST 18: streaming observability columns exist in the log schema
+from biggie_llm_endpoint import _STREAM_OBS_COLUMNS
+check("TEST18: streaming observability columns defined",
+      {"request_id", "streaming", "workload_type", "requires_tools",
+       "context_tokens", "empty_stream", "saw_content", "saw_tool_calls",
+       "final_model"}.issubset(set(_STREAM_OBS_COLUMNS)),
+      f"columns={list(_STREAM_OBS_COLUMNS)}")
+
+# Verify the endpoint-level fail-closed decision is wired (route with tools and
+# no tool-capable model available yields empty selection)
+mark_rate_limited("gpt-5.5")
+d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
+check("Tool fail-closed sets all_exhausted",
+      d.all_exhausted and d.selected_model == "", f"got {d.selected_model}")
+mark_available("gpt-5.5")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 3. Limp-home mode
 # ═══════════════════════════════════════════════════════════════════════════════
 

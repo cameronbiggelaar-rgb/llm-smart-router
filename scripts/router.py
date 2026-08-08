@@ -54,11 +54,28 @@ PROBE_INTERVAL = 120  # 2 minutes
 # Escalation delay (seconds) — brief pause before retrying on a better model
 ESCALATION_DELAY = 1.0
 
+# Optional conservative optimisation for session compression: for very large
+# contexts, known to trigger the Flash empty-stream problem, bypass Flash and
+# start at the next qualified summariser. This does NOT hide the empty-stream
+# bug — stream escalation remains mandatory for the normal path. 0 = disabled.
+FLASH_MAX_CONTEXT_TOKENS = int(os.environ.get("BIGGIE_FLASH_MAX_CONTEXT_TOKENS", "0"))
+
 # Path to router state DB
 ROUTER_STATE_DB = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_state.db")
 
 # Path to private chat script
 PRIVATE_CHAT_SCRIPT = str(Path.home() / ".hermes" / "skills" / "security" / "private-mode" / "scripts" / "private_chat.py")
+
+# Models positively qualified end-to-end with Hermes structured function/tool
+# calling. This is a SEPARATE capability dimension from reasoning tier/cost.
+# Do NOT add a model here merely because its provider API accepts a `tools`
+# field — it must have been verified to emit real structured tool_calls that
+# Hermes can execute (not prose like "Tool call: terminal"). Only gpt-5.5 has
+# been qualified to date. qwen/glm/flash/minimax etc. remain fully available
+# for normal non-tool work.
+TOOL_CAPABLE_MODELS = {
+    "gpt-5.5",
+}
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -645,6 +662,7 @@ def route_task(
     prompt: str = "",
     workload_type: str = "normal_chat",
     context_tokens: int = 0,
+    requires_tools: bool = False,
 ) -> RoutingDecision:
     """Select the best model for a task based on its features.
 
@@ -660,6 +678,10 @@ def route_task(
         force_model: Override to use a specific model.
         workload_type: First-class workload class (e.g. session_compression).
         context_tokens: Approximate prompt/context size for context-sensitive policies.
+        requires_tools: True when the incoming request carries OpenAI tool schemas.
+            Tool-bearing requests MUST route to a proven tool-capable model; if
+            none is available the router fails closed rather than silently
+            routing to a model that would fake tool calls as prose.
 
     Returns:
         RoutingDecision with the selected model and fallback chain.
@@ -669,6 +691,42 @@ def route_task(
 
     # Check limp-home status
     _check_limp_home()
+
+    # ── Tool capability gate (dominates all other routing) ──────────────
+    # A request carrying tool schemas must go to a model proven to emit real
+    # structured tool_calls. Reasoning tier / cost classification may pick among
+    # eligible tool-capable models but may never downgrade below this capability.
+    # If no tool-capable backend is available we FAIL CLOSED — we never route a
+    # tool request to a model that would answer with "Tool call: ..." prose.
+    if requires_tools:
+        tool_model = _select_tool_capable_model()
+        if not tool_model:
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason=(
+                    "request requires structured tool calling but no proven "
+                    "tool-capable model is available (TOOL_CAPABLE_MODELS = "
+                    f"{sorted(TOOL_CAPABLE_MODELS)}) — failing closed"
+                ),
+                fallback_chain=[],
+                all_exhausted=True,
+                limp_home=_LIMP_HOME_ACTIVE,
+                limp_home_reason=(
+                    _LIMP_HOME_REASON
+                    if _LIMP_HOME_ACTIVE
+                    else "tool capability unavailable on local/limb-home models"
+                ),
+            )
+        return RoutingDecision(
+            selected_model=tool_model,
+            selected_provider=_get_provider(tool_model),
+            reason=(
+                f"tool-bearing request — selected proven tool-capable model "
+                f"{tool_model} (tier {MODEL_CAPABILITY_TIERS.get(tool_model, 0)})"
+            ),
+            fallback_chain=_build_tool_fallback_chain(tool_model),
+        )
 
     # Compute capability tier needed (used by both limp-home and normal routing)
     min_tier = _estimate_min_tier(
@@ -734,7 +792,7 @@ def route_task(
     # cloud summariser at/above tier 3 and escalate through the normal chain on
     # failure. Avoid local limp-home models unless limp-home is already active.
     if workload_type == "session_compression" or task_type == "session_compression":
-        selected = _select_session_compression_model()
+        selected = _select_session_compression_model(context_tokens=context_tokens)
         if not selected:
             return RoutingDecision(
                 selected_model="",
@@ -787,10 +845,42 @@ def _normalize_model_name(model: str) -> str:
     return model
 
 
+def _select_tool_capable_model() -> str:
+    """Select the cheapest available model proven to support Hermes tools.
+
+    Tool capability is a hard gate: only models in TOOL_CAPABLE_MODELS qualify,
+    and among those we prefer the cheapest available (respecting router
+    availability / circuit-breaker state). Returns \"\" when none is available.
+    """
+    available = get_available_models()
+    for model in available:
+        if _normalize_model_name(model) in TOOL_CAPABLE_MODELS:
+            return model
+    return ""
+
+
+def _build_tool_fallback_chain(current_model: str) -> List[str]:
+    """Build the escalation chain for a tool-capable model.
+
+    Only includes other models that are ALSO proven tool-capable — escalation
+    must never downgrade below the tool-capability gate.
+    """
+    current_tier = MODEL_CAPABILITY_TIERS.get(current_model, 0)
+    chain = []
+    for model in get_available_models():
+        if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+        if tier > current_tier:
+            chain.append(model)
+    return chain
+
+
 def escalate_on_failure(
     failed_model: str,
     complexity_score: float = 0.0,
     error_type: str = "",
+    requires_tools: bool = False,
 ) -> RoutingDecision:
     """Escalate to the next available model after a failure.
 
@@ -801,6 +891,8 @@ def escalate_on_failure(
         failed_model: The model that failed.
         complexity_score: The task's complexity score.
         error_type: The type of error (e.g., 'rate_limit', 'timeout', 'error').
+        requires_tools: When True, escalation must stay within proven
+            tool-capable models and fail closed if none are available.
 
     Returns:
         RoutingDecision for the next model in the chain.
@@ -824,6 +916,23 @@ def escalate_on_failure(
     _check_limp_home()
 
     if _LIMP_HOME_ACTIVE:
+        # Tool-required work must NOT fall to a local chat model that cannot
+        # execute tools. Report capability unavailable instead.
+        if requires_tools:
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason=(
+                    "limp-home mode active and request requires structured tool "
+                    "calling — no local/limp-home model is tool-capable; failing closed"
+                ),
+                fallback_chain=[],
+                is_fallback=True,
+                original_model=failed_model,
+                all_exhausted=True,
+                limp_home=True,
+                limp_home_reason=_LIMP_HOME_REASON,
+            )
         local_model = _select_limp_home_model("other", 0.5)
         if local_model:
             return RoutingDecision(
@@ -843,6 +952,9 @@ def escalate_on_failure(
 
     for model in available:
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+        # Tool-required escalation must never downgrade below the capability gate
+        if requires_tools and _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+            continue
         if tier > failed_tier:
             return RoutingDecision(
                 selected_model=model,
@@ -853,8 +965,8 @@ def escalate_on_failure(
                 original_model=failed_model,
             )
 
-    # Nothing available — try local as last resort
-    if is_model_available("llama3.1:8b"):
+    # Nothing available — try local as last resort (only for non-tool work)
+    if not requires_tools and is_model_available("llama3.1:8b"):
         return RoutingDecision(
             selected_model="llama3.1:8b",
             selected_provider="local",
@@ -864,11 +976,14 @@ def escalate_on_failure(
             original_model=failed_model,
         )
 
-    # Truly nothing available
+    # Truly nothing available (or tool-capable models exhausted)
     return RoutingDecision(
         selected_model="",
         selected_provider="",
-        reason="no models available — all rate-limited or circuit-broken",
+        reason=(
+            "no tool-capable models available" if requires_tools
+            else "no models available — all rate-limited or circuit-broken"
+        ),
         fallback_chain=[],
         is_fallback=True,
         original_model=failed_model,
@@ -1089,12 +1204,17 @@ def _estimate_min_tier(
     return max(1, min(min_tier, 10))
 
 
-def _select_session_compression_model() -> str:
+def _select_session_compression_model(context_tokens: int = 0) -> str:
     """Select a native Hermes session-compression summariser.
 
     Session compression is latency/reliability-sensitive maintenance work.
     Prefer cloud summariser models in cost order, starting at flash, while still
     respecting router availability/circuit-breaker state.
+
+    If ``context_tokens`` exceeds ``FLASH_MAX_CONTEXT_TOKENS`` (when enabled),
+    Flash is skipped — known-large contexts bypass Flash and start at the next
+    qualified summariser, because Flash is prone to the empty-stream problem on
+    very large contexts. Stream escalation remains mandatory regardless.
     """
     preferred = [
         "deepseek-v4-flash",
@@ -1103,6 +1223,8 @@ def _select_session_compression_model() -> str:
         "deepseek-v3.1:671b",
         "gpt-5.5",
     ]
+    if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
+        preferred = [m for m in preferred if m != "deepseek-v4-flash"]
     for model in preferred:
         if is_model_available(model):
             return model

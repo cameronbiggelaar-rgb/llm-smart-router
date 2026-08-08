@@ -22,8 +22,10 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import httpx
 import uvicorn
@@ -83,6 +85,34 @@ _httpx_client: Optional[httpx.AsyncClient] = None
 _sqlite_conn: Optional[Any] = None
 _sqlite_lock: Any = None  # will be threading.Lock
 
+# Extra observability columns for streaming requests (FIX 3). Added at runtime
+# via ALTER TABLE so existing databases migrate without dropping data.
+_STREAM_OBS_COLUMNS = {
+    "request_id": "TEXT NOT NULL DEFAULT ''",
+    "requested_model": "TEXT NOT NULL DEFAULT ''",
+    "streaming": "INTEGER NOT NULL DEFAULT 0",
+    "workload_type": "TEXT NOT NULL DEFAULT ''",
+    "requires_tools": "INTEGER NOT NULL DEFAULT 0",
+    "context_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "empty_stream": "INTEGER NOT NULL DEFAULT 0",
+    "saw_content": "INTEGER NOT NULL DEFAULT 0",
+    "saw_tool_calls": "INTEGER NOT NULL DEFAULT 0",
+    "final_model": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _ensure_log_columns(db: Any) -> None:
+    """Add streaming-observability columns to router_logs if missing."""
+    try:
+        existing = {r[1] for r in db.execute("PRAGMA table_info(router_logs)").fetchall()}
+        for col, ddl in _STREAM_OBS_COLUMNS.items():
+            if col not in existing:
+                db.execute(f"ALTER TABLE router_logs ADD COLUMN {col} {ddl}")
+        db.commit()
+    except Exception as e:
+        logger.warning("Failed to migrate router_logs columns: %s", e)
+
+
 def _get_httpx_client() -> httpx.AsyncClient:
     """Get or create a shared httpx client with connection pooling."""
     global _httpx_client
@@ -100,6 +130,7 @@ def _get_db_connection() -> Any:
         _sqlite_lock = threading.Lock()
         db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
         _sqlite_conn = sqlite3.connect(str(db_path))
+        _ensure_log_columns(_sqlite_conn)
     return _sqlite_conn
 
 
@@ -560,6 +591,10 @@ def _response_has_empty_content(response: Any) -> bool:
     success lets empty turns flow through to the client, which then wastes
     its turn budget self-healing them. This helper lets the router escalate
     on empty content exactly as it does on HTTPException.
+
+    A response that carries structured ``tool_calls`` is NOT empty even when
+    ``content`` is blank — the model produced a real action for the client to
+    execute. Such responses must not be escalated.
     """
     if not isinstance(response, dict):
         return False
@@ -571,6 +606,9 @@ def _response_has_empty_content(response: Any) -> bool:
         return False
     message = choice.get("message") or {}
     if not isinstance(message, dict):
+        return False
+    # Structured tool calls = meaningful action, never "empty".
+    if message.get("tool_calls"):
         return False
     content = message.get("content")
     if content is None:
@@ -602,10 +640,23 @@ def _log_request_to_db(
     compression_level: str = "off",
     compression_savings_pct: float = 0.0,
     compression_time_ms: float = 0.0,
+    request_id: str = "",
+    requested_model: str = "",
+    streaming: bool = False,
+    workload_type: str = "normal_chat",
+    requires_tools: bool = False,
+    context_tokens: int = 0,
+    empty_stream: bool = False,
+    saw_content: bool = True,
+    saw_tool_calls: bool = False,
+    final_model: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
     Uses a persistent SQLite connection to avoid open/close overhead.
+    Streaming requests are logged at both route-start and completion so the
+    router's behaviour on streaming is observable (FIX 3). No prompt bodies or
+    secrets are stored.
     """
     try:
         from datetime import datetime, timezone
@@ -617,8 +668,11 @@ def _log_request_to_db(
                     timestamp, session_id, model_used, provider, task_type,
                     input_tokens, output_tokens, latency_seconds, complexity_score,
                     success, escalated, error_type,
-                    compression_level, compression_savings_pct, compression_time_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    compression_level, compression_savings_pct, compression_time_ms,
+                    request_id, requested_model, streaming, workload_type,
+                    requires_tools, context_tokens, empty_stream, saw_content,
+                    saw_tool_calls, final_model
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -635,6 +689,16 @@ def _log_request_to_db(
                     compression_level,
                     compression_savings_pct,
                     compression_time_ms,
+                    request_id,
+                    requested_model,
+                    1 if streaming else 0,
+                    workload_type,
+                    1 if requires_tools else 0,
+                    context_tokens,
+                    1 if empty_stream else 0,
+                    1 if saw_content else 0,
+                    1 if saw_tool_calls else 0,
+                    final_model or model_used,
                 ),
             )
             db.commit()
@@ -955,156 +1019,375 @@ async def proxy_to_backend(
         raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
 
 
-async def proxy_to_backend_streaming(
+@dataclass
+class _StreamPreflight:
+    """Result of a bounded stream preflight, before committing a downstream response.
+
+    The endpoint must not return a StreamingResponse until it knows whether the
+    upstream will produce meaningful content. This lets server-side escalation
+    happen for empty/error streams instead of surfacing a degenerate success to
+    the client (which would then retry the SAME failing backend).
+
+    NOTE: the probe connection used for preflight is CLOSED after first content.
+    The actual downstream stream issues a FRESH request (httpx responses can only
+    be consumed once, so the probe stream cannot be resumed in place).
+    """
+
+    status: str                          # "ok" | "empty" | "error"
+    backend_model: str = ""
+    provider: str = ""
+    error: str = ""
+    buffered: List[str] = field(default_factory=list)  # raw SSE data lines to replay
+    saw_content: bool = False
+    saw_tool_calls: bool = False
+
+
+def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
+    """Inspect one SSE ``data:`` payload.
+
+    Returns (saw_content, saw_tool_call, is_terminal) where is_terminal is True
+    for ``[DONE]`` or an upstream error payload.
+    """
+    if data == "[DONE]":
+        return (False, False, True)
+    try:
+        evt = json.loads(data)
+    except (json.JSONDecodeError, AttributeError):
+        return (False, False, False)
+    if isinstance(evt, dict) and evt.get("error"):
+        return (False, False, True)
+    choices = evt.get("choices") or []
+    saw_content = False
+    saw_tool = False
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta") or {}
+        if not isinstance(delta, dict):
+            continue
+        c = delta.get("content")
+        if isinstance(c, str) and c.strip():
+            saw_content = True
+        if delta.get("tool_calls"):
+            saw_tool = True
+    return (saw_content, saw_tool, False)
+
+
+async def _preflight_openai_stream(
     backend: Dict[str, Any],
     messages: List[Dict[str, Any]],
-    request_body: Dict[str, Any],
-) -> Any:
-    """Proxy a chat completion request to the chosen backend with SSE streaming.
+    body: Dict[str, Any],
+) -> _StreamPreflight:
+    """Probe a streaming backend connection and buffer until a decision.
 
-    Honors the incoming ``stream`` flag. For OpenAI-compatible backends
-    (Ollama Cloud, etc.) this streams SSE ``data:`` events back to the client
-    so that streaming clients (e.g. the code-editing agent) receive tokens as
-    they are generated instead of a single JSON body.
+    Buffers upstream SSE events until one of:
+      A. first meaningful content delta      -> status "ok"
+      B. first structured tool-call delta    -> status "ok"
+      C. upstream error                      -> status "error"
+      D. [DONE] with no prior content        -> status "empty"
+
+    The probe connection is CLOSED in all cases. For a healthy stream (A/B) the
+    caller re-opens a FRESH connection for the actual downstream stream (httpx
+    responses can only be consumed once). For C/D the caller escalates
+    server-side.
     """
     base_url = backend.get("base_url", "")
     api_key = backend.get("api_key", "")
     backend_model = backend.get("backend_model", "")
     provider = backend.get("provider", "")
-
     if not base_url:
-        raise HTTPException(status_code=502, detail=f"No base_url for backend")
-
+        return _StreamPreflight(
+            status="error", backend_model=backend_model, provider=provider,
+            error="no base_url for backend",
+        )
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-
-    # Only OpenAI-compatible backends support SSE streaming here.
-    # Local Ollama and Codex use their own paths (non-streaming is fine),
-    # but the client sent stream=True and expects SSE — so wrap the
-    # non-streaming result into a valid SSE stream (one content chunk,
-    # then [DONE]) instead of returning a bare JSON dict that a streaming
-    # client would misparse as an empty stream.
-    if provider in ("local", "openai-codex"):
-        result = await proxy_to_backend(backend, messages, request_body)
-
-        async def wrap_non_streaming():
-            content = ""
-            tool_calls = None
-            if isinstance(result, dict):
-                choices = result.get("choices", [])
-                if choices:
-                    msg = (choices[0].get("message", {}) or {})
-                    content = msg.get("content", "") or ""
-                    tool_calls = msg.get("tool_calls")
-            if not content and not tool_calls:
-                logger.warning(
-                    "Backend %s returned empty content for %s, emitting error",
-                    provider,
-                    backend_model,
-                )
-                yield f"data: {json.dumps({'error': {'message': f'Backend {backend_model} returned empty content', 'type': 'backend_error', 'code': 'empty_content'}})}\n\n"
-            else:
-                delta = {"role": "assistant"}
-                if content:
-                    delta["content"] = content
-                if tool_calls:
-                    delta["tool_calls"] = tool_calls
-                chunk = {
-                    "id": result.get("id", ""),
-                    "object": "chat.completion.chunk",
-                    "created": result.get("created", 0),
-                    "model": result.get("model", backend_model),
-                    "choices": [{
-                        "index": 0,
-                        "delta": delta,
-                        "finish_reason": None,
-                    }],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                finish = {
-                    "id": result.get("id", ""),
-                    "object": "chat.completion.chunk",
-                    "created": result.get("created", 0),
-                    "model": result.get("model", backend_model),
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }],
-                }
-                yield f"data: {json.dumps(finish)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            wrap_non_streaming(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    out = {
+        "model": backend_model,
+        "messages": messages,
+        "stream": True,
+    }
+    for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
+        if param in body:
+            out[param] = body[param]
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    client = _get_httpx_client()
+    try:
+        req = client.build_request("POST", url, json=out, headers=headers)
+        resp = await client.send(req, stream=True)
+    except httpx.RequestError as e:
+        logger.error("Backend %s stream request failed during preflight: %s", provider, e)
+        return _StreamPreflight(
+            status="error", backend_model=backend_model, provider=provider,
+            error=f"Backend request failed: {e}",
         )
+    if resp.status_code != 200:
+        try:
+            error_text = (await resp.aread()).decode()
+        except Exception:
+            error_text = ""
+        await resp.aclose()
+        if resp.status_code == 429:
+            mark_rate_limited(backend_model)
+        logger.error("Backend %s returned %d during preflight: %s", provider, resp.status_code, error_text[:500])
+        return _StreamPreflight(
+            status="error", backend_model=backend_model, provider=provider,
+            error=f"Backend error: {error_text[:500]}",
+        )
+    buffered: List[str] = []
+    pf = _StreamPreflight(
+        status="empty", backend_model=backend_model, provider=provider,
+    )
+    try:
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if line.startswith("data: "):
+                data = line[6:]
+                buffered.append(f"data: {data}")
+                saw_content, saw_tool, is_terminal = _sse_delta_parts(data)
+                if saw_content:
+                    pf.saw_content = True
+                if saw_tool:
+                    pf.saw_tool_calls = True
+                if saw_content or saw_tool:
+                    pf.status = "ok"
+                    pf.buffered = buffered
+                    await resp.aclose()
+                    return pf
+                if is_terminal:
+                    if data == "[DONE]":
+                        pf.status = "empty"
+                    else:
+                        pf.status = "error"
+                        try:
+                            pf.error = json.loads(data).get("error", {}).get("message", "upstream error")
+                        except Exception:
+                            pf.error = "upstream error"
+                    pf.buffered = buffered
+                    await resp.aclose()
+                    return pf
+    except httpx.RequestError as e:
+        await resp.aclose()
+        return _StreamPreflight(
+            status="error", backend_model=backend_model, provider=provider,
+            error=f"Backend request failed: {e}",
+        )
+    # Stream ended without content — treat as empty.
+    await resp.aclose()
+    pf.status = "empty"
+    pf.buffered = buffered
+    return pf
 
-    body = {
+
+async def _open_fresh_stream(
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    request_body: Dict[str, Any],
+) -> Tuple[Any, str]:
+    """Open a fresh streaming backend connection for the downstream stream.
+
+    Returns (httpx response, url). Raises HTTPException on non-200/request error.
+    The response must be closed by the caller.
+    """
+    base_url = backend.get("base_url", "")
+    api_key = backend.get("api_key", "")
+    backend_model = backend.get("backend_model", "")
+    provider = backend.get("provider", "")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    out = {
         "model": backend_model,
         "messages": messages,
         "stream": True,
     }
     for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
         if param in request_body:
-            body[param] = request_body[param]
-
+            out[param] = request_body[param]
     url = f"{base_url.rstrip('/')}/chat/completions"
-
-    async def event_generator():
+    client = _get_httpx_client()
+    try:
+        req = client.build_request("POST", url, json=out, headers=headers)
+        resp = await client.send(req, stream=True)
+    except httpx.RequestError as e:
+        logger.error("Backend %s stream request failed: %s", provider, e)
+        raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+    if resp.status_code != 200:
         try:
-            client = _get_httpx_client()
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    error_text = await resp.aread()
-                    detail = f"Backend error: {error_text[:500].decode()}"
-                    logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
-                    if resp.status_code == 429:
-                        mark_rate_limited(backend_model)
-                    yield f"data: {json.dumps({'error': {'message': detail, 'type': 'backend_error', 'code': 'backend_error'}})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+            error_text = (await resp.aread()).decode()
+        except Exception:
+            error_text = ""
+        await resp.aclose()
+        if resp.status_code == 429:
+            mark_rate_limited(backend_model)
+        logger.error("Backend %s returned %d: %s", provider, resp.status_code, error_text[:500])
+        raise HTTPException(status_code=502, detail=f"Backend error: {error_text[:500]}")
+    return resp, url
 
-                saw_content = False
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            # A stream that produced no content is a degenerate
-                            # success — the model returned an empty turn. Emit an
-                            # error so the client escalates instead of self-healing.
-                            if not saw_content:
-                                logger.warning(
-                                    "Backend %s streamed empty content for %s, emitting error",
-                                    provider,
-                                    backend_model,
-                                )
-                                yield f"data: {json.dumps({'error': {'message': f'Backend {backend_model} returned empty content', 'type': 'backend_error', 'code': 'empty_content'}})}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                        # Track whether any content delta was produced
-                        try:
-                            evt = json.loads(data)
-                            for ch in evt.get("choices", []):
-                                delta = ch.get("delta", {}) or {}
-                                c = delta.get("content")
-                                if isinstance(c, str) and c.strip():
-                                    saw_content = True
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-                        # Pass through the SSE event unchanged
-                        yield f"data: {data}\n\n"
-        except httpx.RequestError as e:
-            logger.error("Backend %s stream request failed: %s", provider, e)
-            yield f"data: {json.dumps({'error': {'message': f'Backend request failed: {e}', 'type': 'backend_error', 'code': 'backend_error'}})}\n\n"
-            yield "data: [DONE]\n\n"
 
+async def _resume_stream(
+    pf: _StreamPreflight,
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    request_body: Dict[str, Any],
+    on_complete: Optional[Callable[[], None]] = None,
+) -> AsyncIterator[str]:
+    """Replay preflighted events, then stream a FRESH backend connection.
+
+    The preflight probe is closed; this opens a new connection and replays the
+    buffered events (so no content is lost) before continuing live. Never emits
+    a clean ``[DONE]`` for an empty preflight — empty streams are escalated by
+    the caller, not returned as degenerate success.
+    """
+    try:
+        for evt in pf.buffered:
+            yield f"{evt}\n\n"
+        if pf.buffered and pf.buffered[-1] == "data: [DONE]":
+            return
+        resp, _url = await _open_fresh_stream(backend, messages, request_body)
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if line.startswith("data: "):
+                data = line[6:]
+                yield f"data: {data}\n\n"
+                if data == "[DONE]":
+                    break
+        await resp.aclose()
+    finally:
+        if on_complete:
+            on_complete()
+
+
+def _wrap_non_streaming(provider: str, backend_model: str, result: Any):
+    """Build an async generator wrapping a non-streaming backend result as SSE.
+
+    Content must be non-empty — empty results are escalated by the caller before
+    this is reached.
+    """
+    content = ""
+    tool_calls = None
+    if isinstance(result, dict):
+        choices = result.get("choices", [])
+        if choices:
+            msg = (choices[0].get("message", {}) or {})
+            content = msg.get("content", "") or ""
+            tool_calls = msg.get("tool_calls")
+
+    async def wrap():
+        delta = {"role": "assistant"}
+        if content:
+            delta["content"] = content
+        if tool_calls:
+            delta["tool_calls"] = tool_calls
+        chunk = {
+            "id": result.get("id", ""),
+            "object": "chat.completion.chunk",
+            "created": result.get("created", 0),
+            "model": result.get("model", backend_model),
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        finish = {
+            "id": result.get("id", ""),
+            "object": "chat.completion.chunk",
+            "created": result.get("created", 0),
+            "model": result.get("model", backend_model),
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        }
+        yield f"data: {json.dumps(finish)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return wrap()
+
+
+async def proxy_to_backend_streaming(
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    request_body: Dict[str, Any],
+    on_complete: Optional[Callable[[], None]] = None,
+    stats: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Proxy a chat completion request to the chosen backend with SSE streaming.
+
+    Honors the incoming ``stream`` flag. For OpenAI-compatible backends
+    (Ollama Cloud, etc.) this performs a bounded preflight before committing the
+    downstream response: if the upstream produces no content or errors, an
+    HTTPException(502) is raised so the caller escalates server-side instead of
+    returning a degenerate empty-success to the client.
+
+    ``on_complete`` is invoked (once) after the downstream stream has finished or
+    been closed, so the caller can persist a completion observability record.
+    If ``stats`` is provided it is filled with saw_content/saw_tool_calls from
+    the preflight so the caller can log stream observability.
+
+    Raises:
+        HTTPException(502): when the backend stream is empty or errors.
+    """
+    base_url = backend.get("base_url", "")
+    backend_model = backend.get("backend_model", "")
+    provider = backend.get("provider", "")
+
+    if not base_url:
+        raise HTTPException(status_code=502, detail=f"No base_url for backend")
+
+    # Local Ollama and Codex do not support true SSE streaming here — call the
+    # non-streaming path and wrap. Empty results escalate (no degenerate success).
+    if provider in ("local", "openai-codex"):
+        result = await proxy_to_backend(backend, messages, request_body)
+        if _response_has_empty_content(result):
+            logger.warning(
+                "Backend %s returned empty content for %s, escalating",
+                provider,
+                backend_model,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {backend_model} returned empty content",
+            )
+        return StreamingResponse(
+            _wrap_non_streaming(provider, backend_model, result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # OpenAI-compatible streaming path: bounded preflight, then commit.
+    pf = await _preflight_openai_stream(backend, messages, request_body)
+
+    if pf.status == "error":
+        logger.error(
+            "Backend %s stream error during preflight for %s: %s",
+            pf.provider, pf.backend_model, pf.error,
+        )
+        raise HTTPException(status_code=502, detail=pf.error)
+
+    if pf.status == "empty":
+        logger.warning(
+            "Backend %s streamed empty content for %s (preflight), escalating",
+            pf.provider,
+            pf.backend_model,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Backend {pf.backend_model} returned empty content",
+        )
+
+    # Healthy — commit the downstream streaming response.
+    if stats is not None:
+        stats["saw_content"] = pf.saw_content
+        stats["saw_tool_calls"] = pf.saw_tool_calls
     return StreamingResponse(
-        event_generator(),
+        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1182,9 +1465,13 @@ async def chat_completions(request: Request):
     requested_model = body.get("model", "")
     force_model = "" if requested_model in ("", "biggie-router", "biggie-llm") else requested_model
     want_stream = bool(body.get("stream", False))
+    # A request that carries OpenAI tool schemas requires a proven tool-capable
+    # backend — this must dominate prompt classification / complexity routing.
+    requires_tools = bool(body.get("tools"))
 
     # Track timing
     t0 = time.time()
+    request_id = uuid.uuid4().hex[:12]
 
     # Discover available backends from Hermes config
     backends = discover_backends()
@@ -1209,11 +1496,15 @@ async def chat_completions(request: Request):
         prompt=features["prompt_text"],
         workload_type=workload_type,
         context_tokens=features.get("context_tokens", 0),
+        requires_tools=requires_tools,
     )
 
     # Apply routing profile (normal workloads only; session_compression has its
     # own native summarisation policy so profile boosting doesn't overroute it).
-    if workload_type != "session_compression":
+    # Also skip profile boosting for tool-required requests — they have already
+    # been routed to a proven tool-capable model and profile re-routing must not
+    # bypass the tool-capability gate.
+    if workload_type != "session_compression" and not requires_tools:
         decision = apply_routing_profile(decision, features)
 
     # Record routing time
@@ -1251,8 +1542,12 @@ async def chat_completions(request: Request):
         # a model not in the config's fallback chain). Fall back to the CHEAPEST
         # reachable backend that still meets the needed tier; if none does, use the
         # most capable reachable. Otherwise heavy work silently drops to flash.
+        #
+        # For tool-required requests, the reachable-backend fallback must NOT
+        # downgrade below the tool-capability gate — only proven tool-capable
+        # backends may serve them.
         logger.warning("Selected model %s not in discovered backends, falling back to best reachable", decision.selected_model)
-        from router import MODEL_CAPABILITY_TIERS
+        from router import MODEL_CAPABILITY_TIERS, TOOL_CAPABLE_MODELS
         needed_tier = MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0)
         best_name = None
         best_tier = -1
@@ -1260,6 +1555,8 @@ async def chat_completions(request: Request):
         cheapest_meeting_tier = 99
         for model_name, bk in backends.items():
             base = re.sub(r":(cloud|local|ollama)$", "", model_name)
+            if requires_tools and base not in TOOL_CAPABLE_MODELS:
+                continue
             tier = MODEL_CAPABILITY_TIERS.get(base, 0)
             if tier >= needed_tier and tier < cheapest_meeting_tier:
                 cheapest_meeting = model_name
@@ -1273,6 +1570,22 @@ async def chat_completions(request: Request):
             backend = backends[chosen]
             decision.selected_model = chosen
             logger.info("Fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
+        elif requires_tools:
+            # No reachable tool-capable backend — fail closed.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": (
+                            "Request requires structured tool calling, but no "
+                            "proven tool-capable backend is reachable. "
+                            "Tool-capable models: " + ", ".join(sorted(TOOL_CAPABLE_MODELS))
+                        ),
+                        "type": "service_unavailable",
+                        "code": "tool_capability_unavailable",
+                    }
+                },
+            )
 
     if not backend:
         return JSONResponse(
@@ -1326,9 +1639,67 @@ async def chat_completions(request: Request):
         }
 
     # Proxy to the backend
+    _obs = {
+        "request_id": request_id,
+        "requested_model": requested_model,
+        "streaming": want_stream,
+        "workload_type": workload_type,
+        "requires_tools": requires_tools,
+        "context_tokens": features.get("context_tokens", 0),
+    }
     try:
         if want_stream:
-            result = await proxy_to_backend_streaming(backend, compressed_messages, body)
+            # Streaming requests are observable too: record the route at start,
+            # then the outcome is logged once the stream completes (FIX 3).
+            _log_request_to_db(
+                model_used=decision.selected_model,
+                provider=backend.get("provider", ""),
+                task_type=routed_task_type,
+                complexity_score=features["complexity_score"],
+                input_tokens=features.get("context_tokens", 0),
+                output_tokens=0,
+                latency_seconds=0.0,
+                routing_time_ms=round(routing_time * 1000),
+                success=False,
+                escalated=False,
+                error_type="streaming_in_progress",
+                compression_level=compression_stats["level"],
+                compression_savings_pct=compression_stats["savings_pct"],
+                compression_time_ms=compression_stats["compression_time_ms"],
+                **_obs,
+            )
+            _stream_stats: Dict[str, Any] = {"saw_content": False, "saw_tool_calls": False}
+            started = {"t": time.time()}
+
+            def _log_stream_complete():
+                elapsed = time.time() - started["t"]
+                _log_request_to_db(
+                    model_used=decision.selected_model,
+                    provider=backend.get("provider", ""),
+                    task_type=routed_task_type,
+                    complexity_score=features["complexity_score"],
+                    input_tokens=features.get("context_tokens", 0),
+                    output_tokens=0,
+                    latency_seconds=elapsed,
+                    routing_time_ms=round(routing_time * 1000),
+                    success=True,
+                    escalated=False,
+                    error_type="",
+                    compression_level=compression_stats["level"],
+                    compression_savings_pct=compression_stats["savings_pct"],
+                    compression_time_ms=compression_stats["compression_time_ms"],
+                    saw_content=_stream_stats.get("saw_content", False),
+                    saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
+                    **_obs,
+                )
+
+            result = await proxy_to_backend_streaming(
+                backend,
+                compressed_messages,
+                body,
+                on_complete=_log_stream_complete,
+                stats=_stream_stats,
+            )
         else:
             result = await proxy_to_backend(backend, compressed_messages, body)
             # A 200 with empty assistant content is a degenerate success —
@@ -1363,6 +1734,7 @@ async def chat_completions(request: Request):
                 compression_level=compression_stats["level"],
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
+                **_obs,
             )
         return result
     except HTTPException:
@@ -1372,6 +1744,7 @@ async def chat_completions(request: Request):
             failed_model=decision.selected_model,
             complexity_score=features["complexity_score"],
             error_type="error",
+            requires_tools=requires_tools,
         )
 
         if not escalation.selected_model:
@@ -1400,8 +1773,9 @@ async def chat_completions(request: Request):
         if not backend:
             # Escalated model isn't a discovered backend — fall back to the cheapest
             # reachable backend that meets the needed tier, else the most capable.
+            # For tool-required work, only proven tool-capable backends may serve.
             logger.warning("Escalated model %s not in discovered backends, falling back to best reachable", escalation.selected_model)
-            from router import MODEL_CAPABILITY_TIERS
+            from router import MODEL_CAPABILITY_TIERS, TOOL_CAPABLE_MODELS
             needed_tier = MODEL_CAPABILITY_TIERS.get(escalation.selected_model, 0)
             best_name = None
             best_tier = -1
@@ -1409,6 +1783,8 @@ async def chat_completions(request: Request):
             cheapest_meeting_tier = 99
             for model_name, bk in backends.items():
                 base = re.sub(r":(cloud|local|ollama)$", "", model_name)
+                if requires_tools and base not in TOOL_CAPABLE_MODELS:
+                    continue
                 tier = MODEL_CAPABILITY_TIERS.get(base, 0)
                 if tier >= needed_tier and tier < cheapest_meeting_tier:
                     cheapest_meeting = model_name
@@ -1421,6 +1797,21 @@ async def chat_completions(request: Request):
                 backend = backends[chosen]
                 escalation.selected_model = chosen
                 logger.info("Escalation fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
+            elif requires_tools:
+                # No reachable tool-capable backend — fail closed.
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "message": (
+                                "Escalation: request requires structured tool calling, "
+                                "but no proven tool-capable backend is reachable."
+                            ),
+                            "type": "service_unavailable",
+                            "code": "tool_capability_unavailable",
+                        }
+                    },
+                )
 
         if not backend:
             return JSONResponse(
