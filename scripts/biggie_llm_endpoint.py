@@ -589,15 +589,19 @@ async def proxy_to_backend(
         )
 
         responses_input = _chat_messages_to_responses_input(messages)
-        # Codex backend uses "message" type items, not "input_text"/"output_text"
+        # Codex backend uses "message" type items. The Responses API rejects
+        # "input_text" inside assistant messages and "output_text" inside user
+        # messages, so the text type MUST follow the role (mirrors Hermes'
+        # own adapter: output_text for assistant, input_text otherwise).
         codex_input = []
         for item in responses_input:
             role = item.get("role", "user")
             content = item.get("content", "")
+            text_type = "output_text" if role == "assistant" else "input_text"
             codex_input.append({
                 "type": "message",
                 "role": role,
-                "content": [{"type": "input_text", "text": content}],
+                "content": [{"type": text_type, "text": content}],
             })
 
         body = {
