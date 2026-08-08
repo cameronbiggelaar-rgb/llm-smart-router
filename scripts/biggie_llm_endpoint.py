@@ -954,7 +954,13 @@ async def chat_completions(request: Request):
     """
     body = await request.json()
     messages = body.get("messages", [])
-    force_model = body.get("model", "")
+    # Hermes sends its configured default model (e.g. "biggie-router") on every
+    # request. That is the router's own sentinel — it must NOT be treated as a
+    # force_model override, or capability-based routing is always short-circuited.
+    # Only honor an explicit model override for genuine specialist requests
+    # (e.g. force_model="gpt-5.5").
+    requested_model = body.get("model", "")
+    force_model = "" if requested_model in ("", "biggie-router", "biggie-llm") else requested_model
     want_stream = bool(body.get("stream", False))
 
     # Track timing
@@ -1015,12 +1021,32 @@ async def chat_completions(request: Request):
                 break
 
     if not backend:
-        # Try to find a fallback — any model on any provider
-        logger.warning("Selected model %s not in discovered backends, trying fallbacks", decision.selected_model)
+        # Selected model isn't a discovered backend (e.g. routing table references
+        # a model not in the config's fallback chain). Fall back to the CHEAPEST
+        # reachable backend that still meets the needed tier; if none does, use the
+        # most capable reachable. Otherwise heavy work silently drops to flash.
+        logger.warning("Selected model %s not in discovered backends, falling back to best reachable", decision.selected_model)
+        from router import MODEL_CAPABILITY_TIERS
+        needed_tier = MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0)
+        best_name = None
+        best_tier = -1
+        cheapest_meeting = None
+        cheapest_meeting_tier = 99
         for model_name, bk in backends.items():
-            backend = bk
-            decision.selected_model = model_name
-            break
+            base = re.sub(r":(cloud|local|ollama)$", "", model_name)
+            tier = MODEL_CAPABILITY_TIERS.get(base, 0)
+            if tier >= needed_tier and tier < cheapest_meeting_tier:
+                cheapest_meeting = model_name
+                cheapest_meeting_tier = tier
+            if tier > best_tier:
+                best_tier = tier
+                best_name = model_name
+        # Prefer cheapest that meets the tier; else most capable
+        chosen = cheapest_meeting or best_name
+        if chosen:
+            backend = backends[chosen]
+            decision.selected_model = chosen
+            logger.info("Fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
 
     if not backend:
         return JSONResponse(
@@ -1146,6 +1172,31 @@ async def chat_completions(request: Request):
                     backend = backends[with_suffix]
                     escalation.selected_model = with_suffix
                     break
+
+        if not backend:
+            # Escalated model isn't a discovered backend — fall back to the cheapest
+            # reachable backend that meets the needed tier, else the most capable.
+            logger.warning("Escalated model %s not in discovered backends, falling back to best reachable", escalation.selected_model)
+            from router import MODEL_CAPABILITY_TIERS
+            needed_tier = MODEL_CAPABILITY_TIERS.get(escalation.selected_model, 0)
+            best_name = None
+            best_tier = -1
+            cheapest_meeting = None
+            cheapest_meeting_tier = 99
+            for model_name, bk in backends.items():
+                base = re.sub(r":(cloud|local|ollama)$", "", model_name)
+                tier = MODEL_CAPABILITY_TIERS.get(base, 0)
+                if tier >= needed_tier and tier < cheapest_meeting_tier:
+                    cheapest_meeting = model_name
+                    cheapest_meeting_tier = tier
+                if tier > best_tier:
+                    best_tier = tier
+                    best_name = model_name
+            chosen = cheapest_meeting or best_name
+            if chosen:
+                backend = backends[chosen]
+                escalation.selected_model = chosen
+                logger.info("Escalation fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
 
         if not backend:
             return JSONResponse(
