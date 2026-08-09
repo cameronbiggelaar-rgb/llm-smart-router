@@ -114,6 +114,43 @@ def _ensure_log_columns(db: Any) -> None:
         logger.warning("Failed to migrate router_logs columns: %s", e)
 
 
+def _find_abandoned_streams(db: Any, older_than_seconds: int = 300) -> List[str]:
+    """Return request_ids whose streaming start row has no completion row.
+
+    Streaming requests are logged twice: a ``streaming_in_progress`` start row,
+    then a completion/failure row with the same request_id. This helper makes
+    observability actionable by separating genuinely unpaired/abandoned streams
+    from normal in-flight rows. It does not mutate history.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+    try:
+        rows = db.execute(
+            """
+            SELECT s.request_id
+            FROM router_logs s
+            WHERE s.streaming = 1
+              AND s.error_type = 'streaming_in_progress'
+              AND s.request_id != ''
+              AND s.timestamp < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM router_logs c
+                  WHERE c.request_id = s.request_id
+                    AND c.id != s.id
+                    AND c.error_type != 'streaming_in_progress'
+              )
+            ORDER BY s.timestamp ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        logger.warning("Failed to query abandoned streams: %s", e)
+        return []
+
+
 def _get_httpx_client() -> httpx.AsyncClient:
     """Get or create a shared httpx client with connection pooling."""
     global _httpx_client
@@ -562,15 +599,21 @@ def detect_workload_type(
     return "normal_chat"
 
 
-def compression_level_for_workload(request: Request, workload_type: str) -> str:
+def compression_level_for_workload(
+    request: Request,
+    workload_type: str,
+    context_tokens: int = 0,
+) -> str:
     """Choose Biggie request-compression level for the detected workload."""
     header_level = request.headers.get("X-Compression-Level")
     if header_level in ("off", "lite", "standard", "aggressive"):
         return header_level
     if workload_type == "session_compression":
-        # Hermes is already doing semantic summarisation. Keep Biggie's request
-        # compression conservative so it does not strip details before summary.
-        return "lite" if COMPRESSION_LEVEL != "off" else "off"
+        if COMPRESSION_LEVEL == "off":
+            return "off"
+        # Small/normal compactions stay conservative, but giant session payloads
+        # need structural compression before spending paid model context.
+        return "aggressive" if context_tokens >= 50_000 else "lite"
     return COMPRESSION_LEVEL
 
 
@@ -1722,13 +1765,20 @@ async def chat_completions(request: Request):
     )
 
     # ── Compression ─────────────────────────────────────────────────────────
-    compression_level = compression_level_for_workload(request, workload_type)
+    compression_level = compression_level_for_workload(
+        request,
+        workload_type,
+        context_tokens=features.get("context_tokens", 0),
+    )
     if compression_level not in ("off", "lite", "standard", "aggressive"):
         compression_level = COMPRESSION_LEVEL
 
     if compression_level != "off":
         compressed_messages, compression_stats = compress_messages(
-            messages, compression_level
+            messages,
+            compression_level,
+            workload_type=workload_type,
+            context_tokens=features.get("context_tokens", 0),
         )
         logger.info(
             "Compression: %s — %s chars → %s chars (%.1f%%) in %.2fms",

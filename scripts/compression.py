@@ -116,6 +116,38 @@ def deduplicate_lines(text: str) -> str:
     return "\n".join(result)
 
 
+def collapse_repetitive_lines(text: str, max_per_pattern: int = 3) -> str:
+    """Collapse noisy repeated log/tool lines by normalized pattern.
+
+    Large Hermes compaction payloads often contain thousands of near-identical
+    heartbeats/progress rows that differ only by shard IDs, timestamps, counters,
+    or hex IDs. Preserve representative examples and summarize the rest.
+    """
+    lines = text.split("\n")
+    result = []
+    counts = {}
+    suppressed = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            result.append(line)
+            continue
+        key = re.sub(r"\b\d+\b", "#", stripped)
+        key = re.sub(r"\b[0-9a-f]{8,}\b", "#hex", key, flags=re.IGNORECASE)
+        key = re.sub(r"\s+", " ", key)
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] <= max_per_pattern:
+            result.append(line)
+        else:
+            suppressed[key] = suppressed.get(key, 0) + 1
+    if suppressed:
+        result.append("")
+        result.append("[Biggie compression: repetitive lines collapsed]")
+        for key, n in sorted(suppressed.items(), key=lambda kv: kv[1], reverse=True)[:20]:
+            result.append(f"  ... {n} similar lines omitted: {key[:160]}")
+    return "\n".join(result)
+
+
 def filter_tool_output(text: str) -> str:
     """Filter verbose tool output — keep errors, warnings, summaries.
 
@@ -182,16 +214,27 @@ def filter_tool_output(text: str) -> str:
 def compress_messages(
     messages: List[Dict],
     level: str = DEFAULT_LEVEL,
+    workload_type: str = "normal_chat",
+    context_tokens: int = 0,
 ) -> Tuple[List[Dict], Dict]:
     """Compress a list of chat messages.
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
         level: Compression level ('off', 'lite', 'standard', 'aggressive')
+        workload_type: First-class workload class (e.g. session_compression).
+        context_tokens: Approximate prompt/context tokens for context-sensitive
+            compression policy.
 
     Returns:
         Tuple of (compressed_messages, stats_dict)
     """
+    if workload_type == "session_compression" and context_tokens >= 50_000 and level != "off":
+        # Very large Hermes compaction payloads are dominated by repeated tool
+        # output/log noise. Lite whitespace cleanup barely moves the needle;
+        # upgrade to structural compression before spending paid model context.
+        level = "aggressive"
+
     if level == "off":
         return messages, {
             "level": "off",
@@ -227,6 +270,7 @@ def compress_messages(
         # Aggressive: add tool output filtering and dedup
         if level == "aggressive":
             text = filter_tool_output(text)
+            text = collapse_repetitive_lines(text)
             text = deduplicate_lines(text)
 
         new_msg = dict(msg)

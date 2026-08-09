@@ -57,6 +57,75 @@ from feature_extractor import (
 from collector import RouterCollector
 from report import get_cost_summary, generate_report
 
+from compression import compress_messages
+from router import route_task, mark_available
+
+
+class TestSessionCompressionCostControl:
+    def setup_method(self):
+        for model in (
+            "deepseek-v4-flash",
+            "glm-5.2",
+            "qwen3.5",
+            "deepseek-v4-pro",
+            "deepseek-v3.1:671b",
+            "gpt-5.5",
+            "llama3.1:8b",
+            "dolphin3",
+        ):
+            mark_available(model)
+
+    def test_session_compression_uses_cheaper_summariser_before_gpt55(self):
+        decision = route_task(
+            complexity_score=0.65,
+            task_type="session_compression",
+            workload_type="session_compression",
+            context_tokens=120_000,
+            requires_tools=False,
+        )
+        assert decision.selected_model != "gpt-5.5"
+        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}
+        assert "gpt-5.5" in decision.fallback_chain
+
+    def test_large_session_compression_skips_flash_without_jumping_to_gpt55(self, monkeypatch):
+        import router
+
+        monkeypatch.setattr(router, "FLASH_MAX_CONTEXT_TOKENS", 50_000)
+        decision = route_task(
+            complexity_score=0.65,
+            task_type="session_compression",
+            workload_type="session_compression",
+            context_tokens=180_000,
+            requires_tools=False,
+        )
+        assert decision.selected_model != "deepseek-v4-flash"
+        assert decision.selected_model != "gpt-5.5"
+        assert decision.selected_model in {"glm-5.2", "qwen3.5", "deepseek-v4-pro"}
+
+
+class TestLargeContextCompression:
+    def test_large_session_payload_gets_structural_compression(self):
+        repetitive_tool_output = "\n".join(
+            f"INFO polling worker shard={i % 7} unchanged heartbeat ok"
+            for i in range(6000)
+        )
+        messages = [
+            {"role": "system", "content": "You are compacting a Hermes session."},
+            {"role": "tool", "content": repetitive_tool_output},
+            {"role": "user", "content": "Summarise the session state and preserve decisions."},
+        ]
+
+        compressed, stats = compress_messages(
+            messages,
+            "lite",
+            workload_type="session_compression",
+            context_tokens=120_000,
+        )
+
+        assert stats["level"] == "aggressive"
+        assert stats["savings_pct"] >= 40.0
+        assert sum(len(m.get("content", "")) for m in compressed) < stats["input_chars"] * 0.7
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unit tests — classify_task

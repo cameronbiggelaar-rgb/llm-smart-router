@@ -9,6 +9,8 @@ Run: python3 test_biggie_endpoint.py
 
 import asyncio
 import json
+import os
+import sqlite3
 import sys
 import time
 import urllib.request
@@ -36,9 +38,11 @@ from biggie_llm_endpoint import (
     COMPRESSION_LEVEL,
     _wrap_non_streaming,
     _response_delta_parts,
+    _ensure_log_columns,
+    _find_abandoned_streams,
 )
 
-BASE_URL = "http://127.0.0.1:8080"
+BASE_URL = os.environ.get("BIGGIE_TEST_BASE_URL", "http://127.0.0.1:8080")
 PASS = 0
 FAIL = 0
 
@@ -209,8 +213,10 @@ class _FakeRequest:
     def __init__(self, headers=None):
         self.headers = headers or {}
 
-check("Session compression uses conservative Biggie compression by default",
-      compression_level_for_workload(_FakeRequest(), "session_compression") in ("lite", "off"))
+check("Session compression uses aggressive structural compression for giant contexts",
+      compression_level_for_workload(_FakeRequest(), "session_compression", context_tokens=120_000) == "aggressive")
+check("Small session compression remains conservative by default",
+      compression_level_for_workload(_FakeRequest(), "session_compression", context_tokens=2_000) in ("lite", "off"))
 check("Header overrides workload compression level",
       compression_level_for_workload(_FakeRequest({"X-Compression-Level": "off"}), "session_compression") == "off")
 check("Normal workload uses configured Biggie compression",
@@ -644,6 +650,63 @@ check("Synthesized SSE fallback emits data events", "data: " in fallback_raw, fa
 check("Synthesized SSE fallback emits chunk object", "chat.completion.chunk" in fallback_raw, fallback_raw[:200])
 check("Synthesized SSE fallback ends with DONE", "data: [DONE]" in fallback_raw, fallback_raw[-200:])
 check("Response delta detects fallback content", _response_delta_parts(fallback_result) == (True, False))
+
+
+# 7f. Streaming observability can identify abandoned starts by request_id
+conn = sqlite3.connect(":memory:")
+conn.execute("""
+CREATE TABLE router_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    session_id TEXT,
+    model_used TEXT,
+    provider TEXT,
+    task_type TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    latency_seconds REAL,
+    complexity_score REAL,
+    success INTEGER,
+    escalated INTEGER,
+    error_type TEXT,
+    compression_level TEXT,
+    compression_savings_pct REAL,
+    compression_time_ms REAL
+)
+""")
+_ensure_log_columns(conn)
+old_ts = "2000-01-01T00:00:00+00:00"
+new_ts = "2999-01-01T00:00:00+00:00"
+base_vals = ("", "gpt-5.5", "openai-codex", "session_compression", 10, 0, 0.0, 0.5, 0, 0,
+             "lite", 0.0, 0.0, "biggie-router", 1, "session_compression", 0, 10, 0, 1, 0, "gpt-5.5")
+conn.execute("""
+INSERT INTO router_logs (timestamp, session_id, model_used, provider, task_type, input_tokens,
+ output_tokens, latency_seconds, complexity_score, success, escalated, error_type,
+ compression_level, compression_savings_pct, compression_time_ms, request_id, requested_model,
+ streaming, workload_type, requires_tools, context_tokens, empty_stream, saw_content,
+ saw_tool_calls, final_model)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'streaming_in_progress', ?, ?, ?, 'abandoned-1', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (old_ts,) + base_vals)
+conn.execute("""
+INSERT INTO router_logs (timestamp, session_id, model_used, provider, task_type, input_tokens,
+ output_tokens, latency_seconds, complexity_score, success, escalated, error_type,
+ compression_level, compression_savings_pct, compression_time_ms, request_id, requested_model,
+ streaming, workload_type, requires_tools, context_tokens, empty_stream, saw_content,
+ saw_tool_calls, final_model)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'streaming_in_progress', ?, ?, ?, 'completed-1', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (old_ts,) + base_vals)
+conn.execute("""
+INSERT INTO router_logs (timestamp, session_id, model_used, provider, task_type, input_tokens,
+ output_tokens, latency_seconds, complexity_score, success, escalated, error_type,
+ compression_level, compression_savings_pct, compression_time_ms, request_id, requested_model,
+ streaming, workload_type, requires_tools, context_tokens, empty_stream, saw_content,
+ saw_tool_calls, final_model)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, '', ?, ?, ?, 'completed-1', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (new_ts,) + base_vals[0:9] + base_vals[10:])
+abandoned = _find_abandoned_streams(conn, older_than_seconds=60)
+check("Abandoned stream finder reports only unpaired in-progress request_ids",
+      abandoned == ["abandoned-1"], str(abandoned))
+conn.close()
 
 
 # 
