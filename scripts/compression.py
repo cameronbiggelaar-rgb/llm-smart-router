@@ -7,7 +7,8 @@ Compression levels:
   - off:      No compression
   - lite:     Whitespace cleanup, ANSI removal (~15% savings)
   - standard: Lite + filler removal, phrase condensing (~30% savings)
-  - aggressive: Standard + tool output filtering, dedup (~50% savings)
+  - structural: Standard + repetitive-line collapse + dedup (~ savings)
+  - aggressive: Structural + tool output filtering (~ savings)
 
 All levels preserve semantic meaning — only remove noise.
 """
@@ -221,7 +222,7 @@ def compress_messages(
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
-        level: Compression level ('off', 'lite', 'standard', 'aggressive')
+        level: Compression level ('off', 'lite', 'standard', 'structural', 'aggressive')
         workload_type: First-class workload class (e.g. session_compression).
         context_tokens: Approximate prompt/context tokens for context-sensitive
             compression policy.
@@ -232,8 +233,9 @@ def compress_messages(
     if workload_type == "session_compression" and context_tokens >= 50_000 and level != "off":
         # Very large Hermes compaction payloads are dominated by repeated tool
         # output/log noise. Lite whitespace cleanup barely moves the needle;
-        # upgrade to structural compression before spending paid model context.
-        level = "aggressive"
+        # upgrade to structural compression before spending paid model context
+        # without broad tool-output block filtering.
+        level = "structural"
 
     if level == "off":
         return messages, {
@@ -264,12 +266,16 @@ def compress_messages(
         text = remove_progress_bars(text)
 
         # Standard: add filler removal
-        if level in ("standard", "aggressive"):
+        if level in ("standard", "structural", "aggressive"):
             text = remove_filler(text)
 
-        # Aggressive: add tool output filtering and dedup
+        # Aggressive: filter verbose tool output blocks before structural pass.
         if level == "aggressive":
             text = filter_tool_output(text)
+
+        # Structural: collapse near-duplicate log/tool lines and exact adjacent
+        # duplicates. This is the default for giant session compactions.
+        if level in ("structural", "aggressive"):
             text = collapse_repetitive_lines(text)
             text = deduplicate_lines(text)
 

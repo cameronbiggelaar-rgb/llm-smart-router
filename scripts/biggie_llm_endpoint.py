@@ -207,7 +207,7 @@ ROUTING_PROFILE = os.environ.get("BIGGIE_ROUTING_PROFILE", "goldilocks").lower()
 
 # Compression settings
 COMPRESSION_LEVEL = os.environ.get("BIGGIE_COMPRESSION", "standard").lower()
-if COMPRESSION_LEVEL not in ("off", "lite", "standard", "aggressive"):
+if COMPRESSION_LEVEL not in ("off", "lite", "standard", "structural", "aggressive"):
     COMPRESSION_LEVEL = "standard"
 
 # Path to Hermes config
@@ -606,14 +606,14 @@ def compression_level_for_workload(
 ) -> str:
     """Choose Biggie request-compression level for the detected workload."""
     header_level = request.headers.get("X-Compression-Level")
-    if header_level in ("off", "lite", "standard", "aggressive"):
+    if header_level in ("off", "lite", "standard", "structural", "aggressive"):
         return header_level
     if workload_type == "session_compression":
         if COMPRESSION_LEVEL == "off":
             return "off"
         # Small/normal compactions stay conservative, but giant session payloads
-        # need structural compression before spending paid model context.
-        return "aggressive" if context_tokens >= 50_000 else "lite"
+        # need structural repetition collapse before spending paid model context.
+        return "structural" if context_tokens >= 50_000 else "lite"
     return COMPRESSION_LEVEL
 
 
@@ -1770,7 +1770,7 @@ async def chat_completions(request: Request):
         workload_type,
         context_tokens=features.get("context_tokens", 0),
     )
-    if compression_level not in ("off", "lite", "standard", "aggressive"):
+    if compression_level not in ("off", "lite", "standard", "structural", "aggressive"):
         compression_level = COMPRESSION_LEVEL
 
     if compression_level != "off":

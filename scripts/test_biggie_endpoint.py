@@ -213,8 +213,8 @@ class _FakeRequest:
     def __init__(self, headers=None):
         self.headers = headers or {}
 
-check("Session compression uses aggressive structural compression for giant contexts",
-      compression_level_for_workload(_FakeRequest(), "session_compression", context_tokens=120_000) == "aggressive")
+check("Session compression uses structural compression for giant contexts",
+      compression_level_for_workload(_FakeRequest(), "session_compression", context_tokens=120_000) == "structural")
 check("Small session compression remains conservative by default",
       compression_level_for_workload(_FakeRequest(), "session_compression", context_tokens=2_000) in ("lite", "off"))
 check("Header overrides workload compression level",

@@ -122,7 +122,7 @@ class TestLargeContextCompression:
             context_tokens=120_000,
         )
 
-        assert stats["level"] == "aggressive"
+        assert stats["level"] == "structural"
         assert stats["savings_pct"] >= 40.0
         assert sum(len(m.get("content", "")) for m in compressed) < stats["input_chars"] * 0.7
 
