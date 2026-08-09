@@ -230,11 +230,15 @@ def compress_messages(
     Returns:
         Tuple of (compressed_messages, stats_dict)
     """
-    if workload_type == "session_compression" and context_tokens >= 50_000 and level != "off":
+    if (
+        workload_type == "session_compression"
+        and context_tokens >= 50_000
+        and level in ("lite", "standard")
+    ):
         # Very large Hermes compaction payloads are dominated by repeated tool
-        # output/log noise. Lite whitespace cleanup barely moves the needle;
-        # upgrade to structural compression before spending paid model context
-        # without broad tool-output block filtering.
+        # output/log noise. Lite/standard cleanup barely moves the needle;
+        # upgrade those defaults to structural before spending paid model context
+        # without overriding explicit off/structural/aggressive choices.
         level = "structural"
 
     if level == "off":

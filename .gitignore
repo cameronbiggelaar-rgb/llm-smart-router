@@ -12,6 +12,8 @@ data/*.db
 # SQLite runtime artifacts (created by tests/production)
 data/*.db-shm
 data/*.db-wal
+# Captured raw compression samples for local/offline analysis
+data/compression_samples/
 
 # IDE
 .vscode/

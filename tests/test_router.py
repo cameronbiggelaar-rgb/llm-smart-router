@@ -58,6 +58,7 @@ from collector import RouterCollector
 from report import get_cost_summary, generate_report
 
 from compression import compress_messages
+from compression_sampler import capture_compression_sample, should_capture_sample
 from router import route_task, mark_available
 
 
@@ -125,6 +126,52 @@ class TestLargeContextCompression:
         assert stats["level"] == "structural"
         assert stats["savings_pct"] >= 40.0
         assert sum(len(m.get("content", "")) for m in compressed) < stats["input_chars"] * 0.7
+
+
+class TestCompressionSampler:
+    def test_sampler_is_opt_in_and_large_session_only(self, monkeypatch):
+        messages = [{"role": "user", "content": "x" * 1000}]
+        monkeypatch.delenv("BIGGIE_COMPRESSION_SAMPLE", raising=False)
+        assert not should_capture_sample(messages, "session_compression", 100_000)
+
+        monkeypatch.setenv("BIGGIE_COMPRESSION_SAMPLE", "1")
+        assert should_capture_sample(messages, "session_compression", 100_000)
+        assert not should_capture_sample(messages, "normal_chat", 100_000)
+        assert not should_capture_sample([{"role": "user", "content": "small"}], "session_compression", 100)
+
+    def test_capture_writes_raw_sample_under_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIGGIE_COMPRESSION_SAMPLE", "1")
+        monkeypatch.setenv("BIGGIE_COMPRESSION_SAMPLE_DIR", str(tmp_path))
+        monkeypatch.setenv("BIGGIE_COMPRESSION_SAMPLE_MAX", "1")
+        monkeypatch.setenv("BIGGIE_COMPRESSION_SAMPLE_MIN_CHARS", "10")
+        messages = [{"role": "user", "content": "secret raw payload kept intentionally"}]
+
+        path = capture_compression_sample(
+            request_id="req/test",
+            messages=messages,
+            workload_type="session_compression",
+            context_tokens=1,
+            requested_model="biggie-router",
+            selected_model="qwen3.5",
+            compression_level="structural",
+            compression_stats={"level": "structural", "input_chars": 37, "output_chars": 20},
+        )
+        assert path is not None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["messages"] == messages
+        assert data["compression_level"] == "structural"
+
+        second = capture_compression_sample(
+            request_id="req2",
+            messages=messages,
+            workload_type="session_compression",
+            context_tokens=1,
+            requested_model="biggie-router",
+            selected_model="qwen3.5",
+            compression_level="structural",
+            compression_stats={},
+        )
+        assert second is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

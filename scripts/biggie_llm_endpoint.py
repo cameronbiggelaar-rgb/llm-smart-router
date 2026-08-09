@@ -69,6 +69,7 @@ from feature_extractor import (
     contains_code_blocks,
 )
 from compression import compress_messages
+from compression_sampler import capture_compression_sample
 
 logger = logging.getLogger("biggie-llm-endpoint")
 
@@ -1788,6 +1789,25 @@ async def chat_completions(request: Request):
             compression_stats["savings_pct"],
             compression_stats["compression_time_ms"],
         )
+        sample_path = capture_compression_sample(
+            request_id=request_id,
+            messages=messages,
+            workload_type=workload_type,
+            context_tokens=features.get("context_tokens", 0),
+            requested_model=requested_model,
+            selected_model=decision.selected_model,
+            compression_level=compression_level,
+            compression_stats=compression_stats,
+            route_metadata={
+                "provider": backend.get("provider", ""),
+                "routed_task_type": routed_task_type,
+                "routing_profile": ROUTING_PROFILE,
+                "complexity_score": features["complexity_score"],
+            },
+            headers=dict(request.headers),
+        )
+        if sample_path:
+            logger.info("Captured compression sample: %s", sample_path)
     else:
         compressed_messages = messages
         compression_stats = {
