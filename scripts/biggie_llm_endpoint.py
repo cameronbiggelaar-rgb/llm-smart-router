@@ -58,6 +58,7 @@ from router import (
     mark_available,
     RoutingDecision,
     MODEL_CAPABILITY_TIERS,
+    TOOL_CAPABLE_MODELS,
 )
 from feature_extractor import (
     classify_task,
@@ -1261,11 +1262,34 @@ async def _resume_stream(
             on_complete()
 
 
-def _wrap_non_streaming(provider: str, backend_model: str, result: Any):
+def _response_delta_parts(response: Any) -> Tuple[bool, bool]:
+    """Return (has_content, has_tool_calls) for a chat completion response."""
+    if not isinstance(response, dict):
+        return (False, False)
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return (False, False)
+    msg = choices[0].get("message") or {}
+    if not isinstance(msg, dict):
+        return (False, False)
+    content = msg.get("content")
+    has_content = isinstance(content, str) and bool(content.strip())
+    has_tool_calls = bool(msg.get("tool_calls"))
+    return (has_content, has_tool_calls)
+
+
+def _wrap_non_streaming(
+    provider: str,
+    backend_model: str,
+    result: Any,
+    on_complete: Optional[Callable[[], None]] = None,
+):
     """Build an async generator wrapping a non-streaming backend result as SSE.
 
     Content must be non-empty — empty results are escalated by the caller before
-    this is reached.
+    this is reached. This is also used as the final degradation fallback for
+    flaky upstream streaming: stream preflight failure -> one server-side
+    escalation -> non-streaming retry -> synthesized SSE.
     """
     content = ""
     tool_calls = None
@@ -1277,38 +1301,121 @@ def _wrap_non_streaming(provider: str, backend_model: str, result: Any):
             tool_calls = msg.get("tool_calls")
 
     async def wrap():
-        delta = {"role": "assistant"}
-        if content:
-            delta["content"] = content
-        if tool_calls:
-            delta["tool_calls"] = tool_calls
-        chunk = {
-            "id": result.get("id", ""),
-            "object": "chat.completion.chunk",
-            "created": result.get("created", 0),
-            "model": result.get("model", backend_model),
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        finish = {
-            "id": result.get("id", ""),
-            "object": "chat.completion.chunk",
-            "created": result.get("created", 0),
-            "model": result.get("model", backend_model),
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
-        }
-        yield f"data: {json.dumps(finish)}\n\n"
-        yield "data: [DONE]\n\n"
+        try:
+            delta = {"role": "assistant"}
+            if content:
+                delta["content"] = content
+            if tool_calls:
+                delta["tool_calls"] = tool_calls
+            chunk = {
+                "id": result.get("id", ""),
+                "object": "chat.completion.chunk",
+                "created": result.get("created", 0),
+                "model": result.get("model", backend_model),
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            finish = {
+                "id": result.get("id", ""),
+                "object": "chat.completion.chunk",
+                "created": result.get("created", 0),
+                "model": result.get("model", backend_model),
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(finish)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if on_complete:
+                on_complete()
 
     return wrap()
+
+
+async def _non_streaming_fallback_to_sse(
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    request_body: Dict[str, Any],
+    on_complete: Optional[Callable[[], None]] = None,
+    stats: Optional[Dict[str, Any]] = None,
+    reason: str = "stream_preflight_failed",
+    alternative_backends: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
+) -> StreamingResponse:
+    """Retry without streaming and synthesize SSE from the first useful result.
+
+    This is the final degradation fallback after the streaming preflight path has
+    failed for the initial backend and the one allowed server-side escalation.
+    It first tries the escalated backend non-streaming, then a bounded list of
+    reachable alternatives. This keeps client semantics streaming-shaped while
+    avoiding user-visible 502s when a cloud model can answer non-streaming but
+    emits empty SSE.
+    """
+    fallback_body = dict(request_body)
+    fallback_body["stream"] = False
+    candidates: List[Tuple[str, Dict[str, Any]]] = [(backend.get("backend_model", ""), backend)]
+    if alternative_backends:
+        candidates.extend(alternative_backends)
+
+    seen = set()
+    last_detail = "streaming fallback exhausted"
+    for candidate_name, candidate_backend in candidates:
+        backend_model = candidate_backend.get("backend_model", "") or candidate_name
+        provider = candidate_backend.get("provider", "")
+        dedupe_key = (provider, backend_model)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        logger.warning(
+            "Streaming fallback: retrying %s/%s non-streaming and synthesizing SSE (%s)",
+            provider,
+            backend_model,
+            reason,
+        )
+        try:
+            result = await proxy_to_backend(candidate_backend, messages, fallback_body)
+        except HTTPException as e:
+            last_detail = str(e.detail)
+            logger.warning(
+                "Streaming fallback non-streaming retry failed for %s/%s: %s",
+                provider,
+                backend_model,
+                e.detail,
+            )
+            continue
+        if _response_has_empty_content(result):
+            last_detail = f"Backend {backend_model} returned empty content after streaming fallback"
+            logger.warning(
+                "Streaming fallback non-streaming retry returned empty content for %s/%s",
+                provider,
+                backend_model,
+            )
+            continue
+
+        saw_content, saw_tool_calls = _response_delta_parts(result)
+        if stats is not None:
+            stats["saw_content"] = saw_content
+            stats["saw_tool_calls"] = saw_tool_calls
+            stats["degraded_to_non_streaming"] = True
+            stats["final_model"] = candidate_name or backend_model
+            stats["final_provider"] = provider
+        return StreamingResponse(
+            _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Biggie-Stream-Fallback": "non-streaming-sse",
+            },
+        )
+
+    raise HTTPException(status_code=502, detail=last_detail)
 
 
 async def proxy_to_backend_streaming(
@@ -1355,8 +1462,12 @@ async def proxy_to_backend_streaming(
                 status_code=502,
                 detail=f"Backend {backend_model} returned empty content",
             )
+        saw_content, saw_tool_calls = _response_delta_parts(result)
+        if stats is not None:
+            stats["saw_content"] = saw_content
+            stats["saw_tool_calls"] = saw_tool_calls
         return StreamingResponse(
-            _wrap_non_streaming(provider, backend_model, result),
+            _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1547,7 +1658,6 @@ async def chat_completions(request: Request):
         # downgrade below the tool-capability gate — only proven tool-capable
         # backends may serve them.
         logger.warning("Selected model %s not in discovered backends, falling back to best reachable", decision.selected_model)
-        from router import MODEL_CAPABILITY_TIERS, TOOL_CAPABLE_MODELS
         needed_tier = MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0)
         best_name = None
         best_tier = -1
@@ -1775,7 +1885,6 @@ async def chat_completions(request: Request):
             # reachable backend that meets the needed tier, else the most capable.
             # For tool-required work, only proven tool-capable backends may serve.
             logger.warning("Escalated model %s not in discovered backends, falling back to best reachable", escalation.selected_model)
-            from router import MODEL_CAPABILITY_TIERS, TOOL_CAPABLE_MODELS
             needed_tier = MODEL_CAPABILITY_TIERS.get(escalation.selected_model, 0)
             best_name = None
             best_tier = -1
@@ -1827,7 +1936,75 @@ async def chat_completions(request: Request):
 
         logger.info("Escalated to: %s/%s", backend.get("provider"), escalation.selected_model)
         if want_stream:
-            result = await proxy_to_backend_streaming(backend, compressed_messages, body)
+            _stream_stats: Dict[str, Any] = {"saw_content": False, "saw_tool_calls": False}
+            started = {"t": time.time()}
+
+            def _log_escalated_stream_complete():
+                elapsed = time.time() - started["t"]
+                _log_request_to_db(
+                    model_used=_stream_stats.get("final_model", escalation.selected_model),
+                    provider=_stream_stats.get("final_provider", backend.get("provider", "")),
+                    task_type=routed_task_type,
+                    complexity_score=features["complexity_score"],
+                    input_tokens=features.get("context_tokens", 0),
+                    output_tokens=0,
+                    latency_seconds=elapsed,
+                    routing_time_ms=round(routing_time * 1000),
+                    success=True,
+                    escalated=True,
+                    error_type="streaming_degraded_to_non_streaming" if _stream_stats.get("degraded_to_non_streaming") else "",
+                    compression_level=compression_stats["level"],
+                    compression_savings_pct=compression_stats["savings_pct"],
+                    compression_time_ms=compression_stats["compression_time_ms"],
+                    saw_content=_stream_stats.get("saw_content", False),
+                    saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
+                    final_model=_stream_stats.get("final_model", escalation.selected_model),
+                    **_obs,
+                )
+
+            try:
+                result = await proxy_to_backend_streaming(
+                    backend,
+                    compressed_messages,
+                    body,
+                    on_complete=_log_escalated_stream_complete,
+                    stats=_stream_stats,
+                )
+            except HTTPException as stream_exc:
+                # The initial streaming backend already failed, and the one allowed
+                # server-side stream escalation also failed. As a final graceful
+                # degradation, retry the final backend once without streaming and
+                # synthesize SSE from the non-streaming response. If that also
+                # returns empty/error, fail closed as before.
+                logger.warning(
+                    "Escalated streaming backend %s failed (%s); trying non-streaming SSE fallback",
+                    escalation.selected_model,
+                    stream_exc.detail,
+                )
+                alternative_backends: List[Tuple[str, Dict[str, Any]]] = []
+                for alt_name, alt_backend in sorted(
+                    backends.items(),
+                    key=lambda item: MODEL_CAPABILITY_TIERS.get(
+                        re.sub(r":(cloud|local|ollama)$", "", item[0]),
+                        0,
+                    ),
+                ):
+                    alt_base = re.sub(r":(cloud|local|ollama)$", "", alt_name)
+                    if alt_name == escalation.selected_model or alt_name == decision.selected_model:
+                        continue
+                    if requires_tools and alt_base not in TOOL_CAPABLE_MODELS:
+                        continue
+                    alternative_backends.append((alt_name, alt_backend))
+
+                result = await _non_streaming_fallback_to_sse(
+                    backend,
+                    compressed_messages,
+                    body,
+                    on_complete=_log_escalated_stream_complete,
+                    stats=_stream_stats,
+                    reason=str(stream_exc.detail),
+                    alternative_backends=alternative_backends,
+                )
         else:
             result = await proxy_to_backend(backend, compressed_messages, body)
         total_time = time.time() - t0

@@ -7,6 +7,7 @@ endpoint's HTTP interface for health/config/status.
 Run: python3 test_biggie_endpoint.py
 """
 
+import asyncio
 import json
 import sys
 import time
@@ -33,6 +34,8 @@ from biggie_llm_endpoint import (
     detect_workload_type,
     compression_level_for_workload,
     COMPRESSION_LEVEL,
+    _wrap_non_streaming,
+    _response_delta_parts,
 )
 
 BASE_URL = "http://127.0.0.1:8080"
@@ -621,6 +624,26 @@ raw_bad = http_post_stream("/v1/chat/completions", {
  "max_tokens": 10,
 })
 check("Streaming invalid model returns error (no hang)", "ERROR" not in raw_bad, raw_bad[:200])
+
+# 7e. Synthesized SSE from a non-streaming fallback has normal SSE shape
+async def _collect_async(gen):
+    parts = []
+    async for part in gen:
+        parts.append(part)
+    return "".join(parts)
+
+fallback_result = {
+    "id": "fallback-test",
+    "object": "chat.completion",
+    "created": 123,
+    "model": "glm-5.2",
+    "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+}
+fallback_raw = asyncio.run(_collect_async(_wrap_non_streaming("ollama-cloud", "glm-5.2", fallback_result)))
+check("Synthesized SSE fallback emits data events", "data: " in fallback_raw, fallback_raw[:200])
+check("Synthesized SSE fallback emits chunk object", "chat.completion.chunk" in fallback_raw, fallback_raw[:200])
+check("Synthesized SSE fallback ends with DONE", "data: [DONE]" in fallback_raw, fallback_raw[-200:])
+check("Response delta detects fallback content", _response_delta_parts(fallback_result) == (True, False))
 
 
 # 

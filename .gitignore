@@ -9,6 +9,9 @@ build/
 
 # Database files (auto-created on first run)
 data/*.db
+# SQLite runtime artifacts (created by tests/production)
+data/*.db-shm
+data/*.db-wal
 
 # IDE
 .vscode/
