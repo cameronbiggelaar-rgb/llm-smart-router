@@ -1052,3 +1052,75 @@ class TestCompressionSkippedForToolRequests:
         )
         assert lvl == "structural"
 
+
+class TestStreamingNoDuplicateFirstChunk:
+    """Regression: the streaming preflight/resume path must NOT duplicate the
+    first content chunk and must NOT open a fresh connection.
+
+    The preflight probe is KEPT OPEN. _resume_stream replays the buffered first
+    chunk then continues the SAME response — no fresh connection, no
+    regeneration, no token-split misalignment, no extra latency.
+    """
+
+    def test_resume_stream_continues_preflight_connection(self, monkeypatch):
+        from biggie_llm_endpoint import (
+            _StreamPreflight,
+            _resume_stream,
+        )
+
+        first_chunk = 'data: {"choices":[{"delta":{"content":"Good"}}]}'
+        second_chunk = 'data: {"choices":[{"delta":{"content":" morning"}}]}'
+        done = "data: [DONE]"
+
+        fresh_calls = []
+        async def fake_fresh(*a, **kw):
+            fresh_calls.append(1)
+            raise RuntimeError("_open_fresh_stream should NOT be called")
+        monkeypatch.setattr("biggie_llm_endpoint._open_fresh_stream", fake_fresh)
+
+        class _KeepAliveResp:
+            def __init__(self, lines):
+                self._lines = list(lines)
+                self._closed = False
+            async def aiter_lines(self):
+                # Preflight consumed line 0; yield the rest
+                for line in self._lines[1:]:
+                    yield line
+            async def aclose(self):
+                self._closed = True
+
+        resp = _KeepAliveResp([first_chunk, second_chunk, done])
+
+        pf = _StreamPreflight(
+            status="ok",
+            backend_model="glm-5.2:cloud",
+            provider="ollama-cloud",
+            buffered=[first_chunk],
+            saw_content=True,
+            response=resp,
+        )
+        backend = {
+            "base_url": "http://fake",
+            "api_key": "",
+            "backend_model": "glm-5.2:cloud",
+            "provider": "ollama-cloud",
+        }
+
+        import asyncio
+
+        async def collect():
+            out = []
+            async for evt in _resume_stream(pf, backend, [], {}):
+                out.append(evt)
+            return out
+
+        events = asyncio.run(collect())
+        assert fresh_calls == [], "_open_fresh_stream must not be called"
+
+        content = "".join(
+            json.loads(e[6:])["choices"][0]["delta"].get("content", "")
+            for e in events
+            if e.startswith("data: ") and e[6:].strip() != "[DONE]"
+        )
+        assert content == "Good morning", f"Expected 'Good morning', got {content!r}"
+

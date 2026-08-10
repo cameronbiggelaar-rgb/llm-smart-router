@@ -341,7 +341,7 @@ def get_recovery_summary() -> str:
     lines.append(f"{'Model':<25} {'Status':<15} {'Failures':>9} {'Cooldown':>10}")
     lines.append("-" * 60)
 
-    for model in MODEL_COST_ORDER + ["dolphin3"]:
+    for model in MODEL_COST_ORDER:
         status = _MODEL_STATUSES.get(model)
         if not status:
             continue
@@ -1250,10 +1250,15 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     qualified summariser, because Flash is prone to the empty-stream problem on
     very large contexts. Stream escalation remains mandatory regardless.
     """
+    # Curated summariser ladder (policy subset — deliberately excludes
+    # minimax/glm-5/glm-5.1 as summarisers). Each entry is validated against
+    # MODEL_REGISTRY at import time by _validate_curated_ladder() so it can
+    # never reference an unregistered model.
     preferred = [
         "deepseek-v4-flash",
         "glm-5.2",
         "qwen3.5",
+        "deepseek-v4-pro",
         "deepseek-v3.1:671b",
         "gpt-5.5",
     ]

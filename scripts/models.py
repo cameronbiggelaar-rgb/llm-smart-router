@@ -138,48 +138,52 @@ class FitSummary:
 #   deepseek-v3.1:671b    10.0x  — massive 671B MoE, most expensive cloud
 #   gpt-5.5               30.0x  — ChatGPT $20/mo, rate-limited, most capable
 
-DEFAULT_MODEL_COSTS: List[ModelCost] = [
-    # ── Local (free, unlimited) ──
-    ModelCost("llama3.1:8b", "local", 0.00, 0.00, "2026-07-01"),
 
-    # ── Ollama Cloud ($100/mo flat — relative compute units) ──
-    ModelCost("deepseek-v4-flash", "ollama-cloud", 0.50, 1.50, "2026-07-01"),
-    ModelCost("minimax-m2.7:cloud", "ollama-cloud", 1.00, 3.00, "2026-07-01"),
-    ModelCost("glm-5", "ollama-cloud", 1.00, 3.00, "2026-07-01"),
-    ModelCost("glm-5.1", "ollama-cloud", 1.25, 3.75, "2026-07-01"),
-    ModelCost("glm-5.2", "ollama-cloud", 1.50, 4.50, "2026-07-01"),
-    ModelCost("qwen3.5", "ollama-cloud", 1.75, 5.25, "2026-08-08"),
-    ModelCost("deepseek-v3.1:671b", "ollama-cloud", 5.00, 15.00, "2026-07-01"),
-
-    # ── ChatGPT OAuth ($20/mo flat — rate-limited, most capable) ──
-    ModelCost("gpt-5.5", "openai-codex", 15.00, 60.00, "2026-07-01"),
-]
-
-# Models ordered by cost (cheapest first) for escalation chain
-MODEL_COST_ORDER = [
-    "llama3.1:8b",          # 0.0 — local, free
-    "deepseek-v4-flash",    # 1.0x — Ollama Cloud baseline
-    "minimax-m2.7:cloud",   # 2.0x — Ollama Cloud
-    "glm-5",                # 2.0x — Ollama Cloud
-    "glm-5.1",              # 2.5x — Ollama Cloud
-    "glm-5.2",              # 3.0x — Ollama Cloud
-    "qwen3.5",              # 3.5x — Ollama Cloud (Medium tier, SWE-bench 80)
-    "deepseek-v3.1:671b",   # 10.0x — Ollama Cloud (most expensive cloud)
-    "gpt-5.5",              # 30.0x — ChatGPT $20/mo (most capable, rate-limited)
-]
-
-# Model capability tiers (for fit scoring)
-MODEL_CAPABILITY_TIERS = {
-    "llama3.1:8b": 1,
-    "deepseek-v4-flash": 3,
-    "minimax-m2.7:cloud": 4,
-    "glm-5": 4,
-    "glm-5.1": 5,
-    "glm-5.2": 6,
-    "qwen3.5": 7,
-    "deepseek-v3.1:671b": 8,
-    "gpt-5.5": 10,
+# ── Single source of truth: MODEL_REGISTRY ────────────────────────────────────
+# One dict per model: provider, relative compute ratio, input/output units per
+# 1M tokens, capability tier, and effective date. DEFAULT_MODEL_COSTS,
+# MODEL_COST_ORDER and MODEL_CAPABILITY_TIERS are DERIVED from this so they can
+# never drift apart. Add a model here (and to Hermes config.yaml) to register it.
+MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "llama3.1:8b":        {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 1, "date": "2026-07-01"},
+    "dolphin3":           {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 2, "date": "2026-07-01"},
+    "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.50,  "output": 1.50,  "tier": 3, "date": "2026-07-01"},
+    "minimax-m2.7:cloud": {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
+    "glm-5":              {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
+    "glm-5.1":            {"provider": "ollama-cloud",  "ratio": 2.5,  "input": 1.25,  "output": 3.75,  "tier": 5, "date": "2026-07-01"},
+    "glm-5.2":            {"provider": "ollama-cloud",  "ratio": 3.0,  "input": 1.50,  "output": 4.50,  "tier": 6, "date": "2026-07-01"},
+    "qwen3.5":            {"provider": "ollama-cloud",  "ratio": 3.5,  "input": 1.75,  "output": 5.25,  "tier": 7, "date": "2026-08-08"},
+    "deepseek-v4-pro":    {"provider": "ollama-cloud",  "ratio": 4.0,  "input": 2.00,  "output": 6.00,  "tier": 8, "date": "2026-07-01"},
+    "deepseek-v3.1:671b": {"provider": "ollama-cloud",  "ratio": 10.0, "input": 5.00,  "output": 15.00, "tier": 9, "date": "2026-07-01"},
+    "gpt-5.5":            {"provider": "openai-codex",  "ratio": 30.0, "input": 15.00, "output": 60.00, "tier": 10,"date": "2026-07-01"},
 }
+
+DEFAULT_MODEL_COSTS: List[ModelCost] = [
+    ModelCost(
+        name,
+        cfg["provider"],
+        cfg["input"],
+        cfg["output"],
+        cfg["date"],
+    )
+    for name, cfg in MODEL_REGISTRY.items()
+]
+
+# Models ordered by cost (cheapest first) for escalation chain — derived from
+# MODEL_REGISTRY sorted by ascending input cost per 1M tokens.
+MODEL_COST_ORDER: List[str] = [
+    name
+    for name, _ in sorted(
+        MODEL_REGISTRY.items(),
+        key=lambda kv: (kv[1]["input"], kv[1]["tier"]),
+    )
+]
+
+# Model capability tiers (for fit scoring) — derived from MODEL_REGISTRY.
+MODEL_CAPABILITY_TIERS: Dict[str, int] = {
+    name: cfg["tier"] for name, cfg in MODEL_REGISTRY.items()
+}
+
 
 
 # ── SQLite Schema ─────────────────────────────────────────────────────────────

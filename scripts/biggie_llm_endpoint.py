@@ -1083,9 +1083,9 @@ class _StreamPreflight:
     happen for empty/error streams instead of surfacing a degenerate success to
     the client (which would then retry the SAME failing backend).
 
-    NOTE: the probe connection used for preflight is CLOSED after first content.
-    The actual downstream stream issues a FRESH request (httpx responses can only
-    be consumed once, so the probe stream cannot be resumed in place).
+    The probe connection is KEPT OPEN after first content. The downstream stream
+    continues iterating the same response — no fresh connection is opened. This
+    avoids token-split misalignment and the 10+ second latency of a new round-trip.
     """
 
     status: str                          # "ok" | "empty" | "error"
@@ -1095,6 +1095,7 @@ class _StreamPreflight:
     buffered: List[str] = field(default_factory=list)  # raw SSE data lines to replay
     saw_content: bool = False
     saw_tool_calls: bool = False
+    response: Any = None                 # the still-open httpx streaming response
 
 
 def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
@@ -1209,7 +1210,7 @@ async def _preflight_openai_stream(
                 if saw_content or saw_tool:
                     pf.status = "ok"
                     pf.buffered = buffered
-                    await resp.aclose()
+                    pf.response = resp
                     return pf
                 if is_terminal:
                     if data == "[DONE]":
@@ -1289,29 +1290,39 @@ async def _resume_stream(
     request_body: Dict[str, Any],
     on_complete: Optional[Callable[[], None]] = None,
 ) -> AsyncIterator[str]:
-    """Replay preflighted events, then stream a FRESH backend connection.
+    """Replay buffered preflight events, then continue the SAME backend connection.
 
-    The preflight probe is closed; this opens a new connection and replays the
-    buffered events (so no content is lost) before continuing live. Never emits
-    a clean ``[DONE]`` for an empty preflight — empty streams are escalated by
-    the caller, not returned as degenerate success.
+    The preflight probe is KEPT OPEN. This replays the buffered events (so no
+    content is lost) then continues iterating the same response — no fresh
+    connection, no regeneration, no token-split misalignment, no extra latency.
+    Never emits a clean ``[DONE]`` for an empty preflight — empty streams are
+    escalated by the caller, not returned as degenerate success.
     """
+    resp = pf.response
     try:
+        # Replay buffered events from the preflight
         for evt in pf.buffered:
             yield f"{evt}\n\n"
         if pf.buffered and pf.buffered[-1] == "data: [DONE]":
             return
-        resp, _url = await _open_fresh_stream(backend, messages, request_body)
-        async for line in resp.aiter_lines():
-            if not line:
-                continue
-            if line.startswith("data: "):
-                data = line[6:]
-                yield f"data: {data}\n\n"
-                if data == "[DONE]":
-                    break
-        await resp.aclose()
+        # Continue the SAME response — no fresh connection
+        if resp is not None:
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        yield f"data: {data}\n\n"
+                        break
+                    yield f"data: {data}\n\n"
+            await resp.aclose()
     finally:
+        if resp is not None:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
         if on_complete:
             on_complete()
 

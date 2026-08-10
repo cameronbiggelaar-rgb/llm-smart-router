@@ -488,9 +488,7 @@ check("Routing skips circuit-broken model", d.selected_model != "gpt-5.5",
 
 # Exhaust everything
 for m in MODEL_COST_ORDER:
-    if m not in ("llama3.1:8b", "dolphin3"):
-        mark_rate_limited(m)
-mark_rate_limited("llama3.1:8b")
+    mark_rate_limited(m)
 
 d = route_task(complexity_score=0.5, task_type="coding")
 check("All exhausted returns empty model", d.selected_model == "",
