@@ -34,6 +34,8 @@
 
 ### `models.py` — Data definitions
 
+> **`MODEL_REGISTRY` is the single source of truth.** Each model is one dict entry `{provider, ratio, input, output, tier, date}`. `DEFAULT_MODEL_COSTS`, `MODEL_COST_ORDER` and `MODEL_CAPABILITY_TIERS` are all **derived** from it (see `scripts/models.py`) so they can never drift. Add/change a model in `MODEL_REGISTRY` (and Hermes `config.yaml`) — never edit the derived tables directly.
+
 ```python
 @dataclass
 class RouterLog:
