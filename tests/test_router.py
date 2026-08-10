@@ -915,3 +915,123 @@ class TestEdgeCases:
         cost = estimate_cost("some-unknown-model", 1000, 500, conn)
         assert cost == 0.0
         conn.close()
+
+
+class TestOllamaToolCapableModels:
+    """TDD: deepseek-v4-flash and glm-5.2 are now proven tool-capable via ollama-cloud."""
+
+    def setup_method(self):
+        for model in (
+            "deepseek-v4-flash",
+            "glm-5.2",
+            "qwen3.5",
+            "deepseek-v4-pro",
+            "deepseek-v3.1:671b",
+            "gpt-5.5",
+            "llama3.1:8b",
+        ):
+            mark_available(model)
+
+    def test_flash_is_tool_capable(self):
+        from router import TOOL_CAPABLE_MODELS
+        assert "deepseek-v4-flash" in TOOL_CAPABLE_MODELS
+
+    def test_glm52_is_tool_capable(self):
+        from router import TOOL_CAPABLE_MODELS
+        assert "glm-5.2" in TOOL_CAPABLE_MODELS
+
+    def test_tool_routing_prefers_cheapest_tool_capable(self):
+        """With flash+glm tool-capable, tool work should default to flash (cheapest), not gpt-5.5."""
+        decision = route_task(
+            complexity_score=0.1,
+            task_type="coding",
+            requires_tools=True,
+        )
+        assert decision.selected_model == "deepseek-v4-flash"
+
+    def test_tool_routing_escalates_to_gpt55_when_flash_fails(self):
+        """When flash is rate-limited, tool work should escalate to glm-5.2 then gpt-5.5 — not fail closed."""
+        from router import mark_rate_limited
+        mark_rate_limited("deepseek-v4-flash")
+        decision = route_task(
+            complexity_score=0.5,
+            task_type="debugging",
+            requires_tools=True,
+        )
+        # glm-5.2 (tier 6) is cheaper than gpt-5.5 (tier 10) and now tool-capable
+        assert decision.selected_model in {"glm-5.2", "gpt-5.5"}
+        mark_available("deepseek-v4-flash")
+
+    def test_tool_routing_no_longer_fails_closed_when_gpt55_capped(self):
+        """With flash/glm tool-capable, gpt-5.5 being capped no longer 503s tool work."""
+        from router import mark_rate_limited
+        mark_rate_limited("gpt-5.5")
+        decision = route_task(
+            complexity_score=0.1,
+            task_type="coding",
+            requires_tools=True,
+        )
+        assert decision.selected_model == "deepseek-v4-flash"
+        assert not decision.all_exhausted
+        mark_available("gpt-5.5")
+
+    def test_tool_fallback_chain_contains_new_models(self):
+        from router import _build_tool_fallback_chain
+        chain = _build_tool_fallback_chain("deepseek-v4-flash")
+        # glm-5.2 is now tool-capable, so it should appear in the escalation chain
+        assert any("glm-5.2" in m for m in chain) or any("gpt-5.5" in m for m in chain)
+
+    def test_tool_routing_fails_closed_when_all_tool_capable_down(self):
+        """CRITICAL: if every tool-capable model is unavailable, tool work must
+        STILL fail closed — never leak to a non-tool-capable model like qwen."""
+        from router import mark_rate_limited
+        for m in ("deepseek-v4-flash", "glm-5.2", "gpt-5.5"):
+            mark_rate_limited(m)
+        decision = route_task(
+            complexity_score=0.5,
+            task_type="debugging",
+            requires_tools=True,
+        )
+        assert decision.selected_model == ""
+        assert decision.all_exhausted
+        # restore
+        for m in ("deepseek-v4-flash", "glm-5.2", "gpt-5.5"):
+            mark_available(m)
+
+
+class TestCompressionSkippedForToolRequests:
+    """TDD: when a request carries tool schemas, compression is skipped (off)."""
+
+    def test_tool_request_skips_compression(self, monkeypatch):
+        from biggie_llm_endpoint import compression_level_for_workload
+
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+
+        # Even a large session_compression request must NOT be compressed when
+        # it carries tool schemas — token economics: don't pay to compress
+        # tool-calling traffic before forwarding it.
+        lvl = compression_level_for_workload(
+            _FakeRequest(),
+            "session_compression",
+            context_tokens=120_000,
+            requires_tools=True,
+        )
+        assert lvl == "off"
+
+    def test_non_tool_session_compression_still_structural(self):
+        from biggie_llm_endpoint import compression_level_for_workload
+
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+
+        lvl = compression_level_for_workload(
+            _FakeRequest(),
+            "session_compression",
+            context_tokens=120_000,
+            requires_tools=False,
+        )
+        assert lvl == "structural"
+

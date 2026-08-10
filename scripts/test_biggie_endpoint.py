@@ -241,46 +241,47 @@ def _normalize_model_name_tool(m):
 for m in MODEL_COST_ORDER:
     mark_available(m)
 
-# TEST 1: biggie-llm + tools + simple coding prompt -> gpt-5.5
+# TEST 1: biggie-llm + tools + simple coding prompt -> cheapest tool-capable (flash)
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("TEST1: tools + simple coding → gpt-5.5",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+check("TEST1: tools + simple coding → cheapest tool-capable (flash)",
+      d.selected_model == "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 2: biggie-llm + tools + debugging prompt -> gpt-5.5
+# TEST 2: biggie-llm + tools + debugging prompt -> cheapest tool-capable (flash)
 d = route_task(complexity_score=0.5, task_type="debugging", requires_tools=True)
-check("TEST2: tools + debugging → gpt-5.5",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+check("TEST2: tools + debugging → cheapest tool-capable (flash)",
+      d.selected_model == "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 3: biggie-llm + tools + low complexity -> still gpt-5.5
+# TEST 3: biggie-llm + tools + low complexity -> still cheapest tool-capable
 d = route_task(complexity_score=0.0, task_type="qa", requires_tools=True)
-check("TEST3: tools + low complexity → still gpt-5.5",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+check("TEST3: tools + low complexity → cheapest tool-capable (flash)",
+      d.selected_model == "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 4: exact decision #22-style prompt + terminal/file tools -> gpt-5.5
+# TEST 4: exact decision #22-style prompt + terminal/file tools -> flash (not gpt-5.5)
 d = route_task(
     complexity_score=0.8,
     task_type="coding",
     requires_tools=True,
     prompt="You are a code-editing agent. Your task is to: implement the change. Use the terminal and file tools.",
 )
-check("TEST4: code-editing + terminal/file tools → gpt-5.5",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+check("TEST4: code-editing + terminal/file tools → tool-capable flash",
+      d.selected_model == "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 5: qwen cheaper/available -> cannot win tool-required routing
+# TEST 5: qwen cheaper/available -> still cannot win tool-required routing
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
 check("TEST5: qwen cannot win tool-required routing",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+      _normalize_model_name_tool(d.selected_model) in TOOL_CAPABLE_MODELS,
+      f"got {d.selected_model}")
 
-# TEST 6: glm cheaper/available -> cannot win tool-required routing
+# TEST 6: glm cheaper/available -> still cannot win tool-required routing (must be flash)
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("TEST6: glm cannot win tool-required routing",
-      d.selected_model == "gpt-5.5", f"got {d.selected_model}")
+check("TEST6: glm cheaper/available → still cheapest tool-capable (flash)",
+      d.selected_model == "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 7: gpt-5.5 unavailable + tools -> fail closed, not qwen/glm
+# TEST 7: gpt-5.5 unavailable + tools -> now falls to flash (no longer fail closed)
 mark_rate_limited("gpt-5.5")
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("TEST7: gpt-5.5 unavailable + tools → fail closed (not qwen/glm)",
-      d.selected_model == "" and d.all_exhausted,
+check("TEST7: gpt-5.5 unavailable + tools → flash (not fail closed)",
+      d.selected_model == "deepseek-v4-flash" and not d.all_exhausted,
       f"got {d.selected_model} (all_exhausted={d.all_exhausted})")
 mark_available("gpt-5.5")
 
@@ -307,8 +308,9 @@ check("TEST9: session compression without tools → normal summariser policy",
 # Tool fallback chain only contains tool-capable models
 mark_rate_limited("gpt-5.5")
 d = route_task(complexity_score=0.5, task_type="debugging", requires_tools=True)
-check("Tool fail-closed does not leak qwen/glm into fallback",
-      d.selected_model == "" , f"got {d.selected_model}")
+check("Tool routing stays within tool-capable set (gpt-5.5 capped → flash/glm)",
+      _normalize_model_name_tool(d.selected_model) in TOOL_CAPABLE_MODELS,
+      f"got {d.selected_model}")
 mark_available("gpt-5.5")
 chain = _build_tool_fallback_chain("gpt-5.5")
 check("Tool fallback chain only tool-capable",
@@ -394,12 +396,13 @@ check("TEST18: streaming observability columns defined",
        "final_model"}.issubset(set(_STREAM_OBS_COLUMNS)),
       f"columns={list(_STREAM_OBS_COLUMNS)}")
 
-# Verify the endpoint-level fail-closed decision is wired (route with tools and
-# no tool-capable model available yields empty selection)
+# Verify endpoint-level fail-closed only when NO tool-capable model is available.
+# With gpt-5.5 capped, flash is still tool-capable → routes, does not fail closed.
 mark_rate_limited("gpt-5.5")
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("Tool fail-closed sets all_exhausted",
-      d.all_exhausted and d.selected_model == "", f"got {d.selected_model}")
+check("Tool routing with gpt-5.5 capped → flash (not all_exhausted)",
+      not d.all_exhausted and d.selected_model == "deepseek-v4-flash",
+      f"got {d.selected_model} (all_exhausted={d.all_exhausted})")
 mark_available("gpt-5.5")
 
 

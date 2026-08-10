@@ -604,8 +604,18 @@ def compression_level_for_workload(
     request: Request,
     workload_type: str,
     context_tokens: int = 0,
+    requires_tools: bool = False,
 ) -> str:
-    """Choose Biggie request-compression level for the detected workload."""
+    """Choose Biggie request-compression level for the detected workload.
+
+    When a request carries OpenAI tool schemas (``requires_tools=True``) we
+    SKIP compression entirely ("off"). Compressing tool-calling traffic costs
+    tokens up front (to compress) without benefit — the downstream model still
+    needs the full tool schema + history to execute calls. This keeps tool
+    requests lean and avoids paying to compress before calling.
+    """
+    if requires_tools:
+        return "off"
     header_level = request.headers.get("X-Compression-Level")
     if header_level in ("off", "lite", "standard", "structural", "aggressive"):
         return header_level
@@ -1770,6 +1780,7 @@ async def chat_completions(request: Request):
         request,
         workload_type,
         context_tokens=features.get("context_tokens", 0),
+        requires_tools=requires_tools,
     )
     if compression_level not in ("off", "lite", "standard", "structural", "aggressive"):
         compression_level = COMPRESSION_LEVEL

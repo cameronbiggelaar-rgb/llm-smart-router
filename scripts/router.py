@@ -70,11 +70,19 @@ PRIVATE_CHAT_SCRIPT = str(Path.home() / ".hermes" / "skills" / "security" / "pri
 # calling. This is a SEPARATE capability dimension from reasoning tier/cost.
 # Do NOT add a model here merely because its provider API accepts a `tools`
 # field — it must have been verified to emit real structured tool_calls that
-# Hermes can execute (not prose like "Tool call: terminal"). Only gpt-5.5 has
-# been qualified to date. qwen/glm/flash/minimax etc. remain fully available
-# for normal non-tool work.
+# Hermes can execute (not prose like "Tool call: terminal").
+#
+# Verified 2026-08-10 via direct Ollama Cloud API probe (test_ollama_tools*.py):
+#   - deepseek-v4-flash: emits tool_calls with valid JSON args; continues cleanly
+#   - glm-5.2:            emits tool_calls with valid JSON args; continues cleanly
+#   - qwen3.5:            emits tool_calls but re-invokes (loop tendency) — NOT added
+# gpt-5.5 remains tool-capable (ChatGPT). These let tool work fall to cheaper
+# ollama-cloud models instead of always gpt-5.5, and avoid failing closed when
+# gpt-5.5 hits its ChatGPT usage cap.
 TOOL_CAPABLE_MODELS = {
     "gpt-5.5",
+    "deepseek-v4-flash",
+    "glm-5.2",
 }
 
 
