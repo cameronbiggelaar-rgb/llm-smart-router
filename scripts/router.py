@@ -849,17 +849,25 @@ def _normalize_model_name(model: str) -> str:
 
 
 def _select_tool_capable_model() -> str:
-    """Select the cheapest available model proven to support Hermes tools.
+    """Select the highest-capability available model proven to support Hermes tools.
 
-    Tool capability is a hard gate: only models in TOOL_CAPABLE_MODELS qualify,
-    and among those we prefer the cheapest available (respecting router
-    availability / circuit-breaker state). Returns \"\" when none is available.
+    Tool capability is a hard gate: only models in TOOL_CAPABLE_MODELS qualify.
+    Among those we prefer the MOST CAPABLE available (highest tier) so tool work
+    keeps the best reasoning quality (gpt-5.5 first), falling back to cheaper
+    tool-capable ollama models (glm-5.2 → deepseek-v4-flash) only when higher
+    tiers are unavailable / circuit-broken. Returns "" when none is available.
     """
     available = get_available_models()
+    best = ""
+    best_tier = -1
     for model in available:
-        if _normalize_model_name(model) in TOOL_CAPABLE_MODELS:
-            return model
-    return ""
+        if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(_normalize_model_name(model), 0)
+        if tier > best_tier:
+            best_tier = tier
+            best = model
+    return best
 
 
 def _build_tool_fallback_chain(current_model: str) -> List[str]:
@@ -952,6 +960,29 @@ def escalate_on_failure(
     # Find the next available model with higher capability
     failed_tier = MODEL_CAPABILITY_TIERS.get(failed_model_key, 0)
     available = get_available_models()
+
+    # For tool-required work, if the failed model is the highest-capable tool
+    # model, fall DOWN to the next-most-capable available tool model instead of
+    # failing closed — this is what lets gpt-5.5 → glm-5.2 when gpt-5.5 caps.
+    if requires_tools:
+        best_tier = -1
+        best_model = ""
+        for model in available:
+            if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+                continue
+            tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+            if tier > best_tier:
+                best_tier = tier
+                best_model = model
+        if best_model:
+            return RoutingDecision(
+                selected_model=best_model,
+                selected_provider=_get_provider(best_model),
+                reason=f"tool escalation from {failed_model} ({error_type}) — fell to most-capable tool model {best_model}",
+                fallback_chain=_build_tool_fallback_chain(best_model),
+                is_fallback=True,
+                original_model=failed_model,
+            )
 
     for model in available:
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)

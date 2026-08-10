@@ -940,30 +940,33 @@ class TestOllamaToolCapableModels:
         from router import TOOL_CAPABLE_MODELS
         assert "glm-5.2" in TOOL_CAPABLE_MODELS
 
-    def test_tool_routing_prefers_cheapest_tool_capable(self):
-        """With flash+glm tool-capable, tool work should default to flash (cheapest), not gpt-5.5."""
+    def test_tool_routing_prefers_most_capable_tool_model(self):
+        """With flash+glm tool-capable, tool work should still prefer gpt-5.5
+        (highest capability), falling to flash/glm only when gpt-5.5 is down."""
         decision = route_task(
             complexity_score=0.1,
             task_type="coding",
             requires_tools=True,
         )
-        assert decision.selected_model == "deepseek-v4-flash"
+        assert decision.selected_model == "gpt-5.5"
 
-    def test_tool_routing_escalates_to_gpt55_when_flash_fails(self):
-        """When flash is rate-limited, tool work should escalate to glm-5.2 then gpt-5.5 — not fail closed."""
+    def test_tool_routing_falls_to_glm_when_gpt55_and_flash_down(self):
+        """When gpt-5.5 AND flash are rate-limited, tool work escalates to glm-5.2."""
         from router import mark_rate_limited
+        mark_rate_limited("gpt-5.5")
         mark_rate_limited("deepseek-v4-flash")
         decision = route_task(
             complexity_score=0.5,
             task_type="debugging",
             requires_tools=True,
         )
-        # glm-5.2 (tier 6) is cheaper than gpt-5.5 (tier 10) and now tool-capable
-        assert decision.selected_model in {"glm-5.2", "gpt-5.5"}
+        assert decision.selected_model == "glm-5.2"
+        mark_available("gpt-5.5")
         mark_available("deepseek-v4-flash")
 
     def test_tool_routing_no_longer_fails_closed_when_gpt55_capped(self):
-        """With flash/glm tool-capable, gpt-5.5 being capped no longer 503s tool work."""
+        """With flash/glm tool-capable, gpt-5.5 being capped falls to the next
+        most-capable tool model (glm-5.2) instead of 503ing."""
         from router import mark_rate_limited
         mark_rate_limited("gpt-5.5")
         decision = route_task(
@@ -971,7 +974,8 @@ class TestOllamaToolCapableModels:
             task_type="coding",
             requires_tools=True,
         )
-        assert decision.selected_model == "deepseek-v4-flash"
+        # glm-5.2 is the next most-capable tool model after gpt-5.5
+        assert decision.selected_model == "glm-5.2"
         assert not decision.all_exhausted
         mark_available("gpt-5.5")
 
@@ -997,6 +1001,19 @@ class TestOllamaToolCapableModels:
         # restore
         for m in ("deepseek-v4-flash", "glm-5.2", "gpt-5.5"):
             mark_available(m)
+
+    def test_escalation_from_gpt55_falls_to_glm_for_tools(self):
+        """When gpt-5.5 (highest tier) fails on a tool request, escalation must
+        fall DOWN to the next-most-capable tool model (glm-5.2), not 503."""
+        from router import escalate_on_failure
+        # escalate the already-failed gpt-5.5; glm-5.2 available
+        decision = escalate_on_failure(
+            failed_model="gpt-5.5",
+            complexity_score=0.5,
+            error_type="rate_limit",
+            requires_tools=True,
+        )
+        assert decision.selected_model == "glm-5.2", f"got {decision.selected_model}"
 
 
 class TestCompressionSkippedForToolRequests:
