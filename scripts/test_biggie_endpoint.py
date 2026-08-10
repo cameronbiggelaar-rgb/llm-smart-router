@@ -33,13 +33,15 @@ from router import (
     MODEL_COST_ORDER,
 )
 from biggie_llm_endpoint import (
-    detect_workload_type,
-    compression_level_for_workload,
-    COMPRESSION_LEVEL,
-    _wrap_non_streaming,
-    _response_delta_parts,
-    _ensure_log_columns,
-    _find_abandoned_streams,
+ detect_workload_type,
+ compression_level_for_workload,
+ COMPRESSION_LEVEL,
+ _wrap_non_streaming,
+ _response_delta_parts,
+ _ensure_log_columns,
+ _find_abandoned_streams,
+ _malformed_tool_call_error,
+ _malformed_tool_call_delta_error,
 )
 
 BASE_URL = os.environ.get("BIGGIE_TEST_BASE_URL", "http://127.0.0.1:8080")
@@ -339,7 +341,62 @@ check("TEST10: content delta is meaningful",
 # TEST 11: structured tool-call stream is meaningful
 saw_c, saw_t, term = _sse_delta_parts('{"choices":[{"delta":{"tool_calls":[{"function":{"name":"terminal","arguments":"{}"}}]}}]}')
 check("TEST11: tool-call delta is meaningful",
-      saw_t and not term, f"content={saw_c} tool={saw_t} term={term}")
+ saw_t and not term, f"content={saw_c} tool={saw_t} term={term}")
+
+# TEST 11b/11c: malformed tool-call arguments are model failures, not successes.
+# Flash has emitted {"command=\"echo hi\" timeout=\"10\"":""}, which parses
+# as a dict with no required "command" key. The router must escalate instead of
+# forwarding a 200 that makes Hermes call terminal(command=None) forever.
+_bad_tool_response = {
+ "choices": [{
+ "message": {
+ "role": "assistant",
+ "content": "",
+ "tool_calls": [{
+ "id": "call_bad",
+ "type": "function",
+ "function": {
+ "name": "terminal",
+ "arguments": json.dumps({"command=\"echo hi\" timeout=\"10\"": ""}),
+ },
+ }],
+ }
+ }]
+}
+check("TEST11b: malformed terminal args are detected",
+ _malformed_tool_call_error(_bad_tool_response) is not None,
+ "expected malformed terminal args to trigger model-failure escalation")
+_good_tool_response = {
+ "choices": [{
+ "message": {
+ "role": "assistant",
+ "content": "",
+ "tool_calls": [{
+ "id": "call_good",
+ "type": "function",
+ "function": {"name": "terminal", "arguments": json.dumps({"command": "echo hi", "timeout": 10})},
+ }],
+ }
+ }]
+}
+check("TEST11c: valid terminal args are accepted",
+ _malformed_tool_call_error(_good_tool_response) is None,
+ "valid terminal call should not escalate")
+_bad_stream_delta = json.dumps({
+ "choices": [{
+ "delta": {
+ "tool_calls": [{
+ "function": {
+ "name": "terminal",
+ "arguments": json.dumps({"command=\"echo hi\" timeout=\"10\"": ""}),
+ }
+ }]
+ }
+ }]
+})
+check("TEST11d: malformed streaming terminal args are detected",
+ _malformed_tool_call_delta_error(_bad_stream_delta) is not None,
+ "streaming preflight must escalate malformed terminal args too")
 
 # TEST 12: [DONE] with no prior content is terminal/empty
 saw_c, saw_t, term = _sse_delta_parts("[DONE]")

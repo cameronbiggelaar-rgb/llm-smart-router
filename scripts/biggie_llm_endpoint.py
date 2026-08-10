@@ -695,6 +695,123 @@ def _response_has_empty_content(response: Any) -> bool:
     return False
 
 
+def _parse_tool_arguments(arguments: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse a tool-call arguments payload, returning (args, error).
+
+    OpenAI-compatible backends should return ``function.arguments`` as a JSON
+    object string. Cheap/fallback models sometimes emit XML/attribute-like tool
+    syntax inside the JSON key, e.g. ``{"command=\"echo hi\" timeout=\"10\"":""}``.
+    That parses as JSON but has no required ``command`` field, so Hermes later
+    calls terminal(command=None). Treat that as a model-output failure so the
+    router can escalate before the malformed tool call reaches Hermes.
+    """
+    if isinstance(arguments, dict):
+        return arguments, None
+    if arguments in (None, ""):
+        return {}, None
+    if not isinstance(arguments, str):
+        return None, f"arguments must be a JSON object string, got {type(arguments).__name__}"
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError as e:
+        return None, f"arguments are not valid JSON: {e.msg}"
+    if not isinstance(parsed, dict):
+        return None, f"arguments must decode to object, got {type(parsed).__name__}"
+    return parsed, None
+
+
+def _tool_required_arg_error(function_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Return a validation error when tool args are structurally unusable."""
+    if function_name == "terminal":
+        command = args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            # Explicitly call out the common leaked-attribute shape to make logs useful.
+            weird_keys = [k for k in args.keys() if isinstance(k, str) and "command=" in k]
+            suffix = f" (saw leaked attribute key {weird_keys[0]!r})" if weird_keys else ""
+            return f"terminal tool_call missing non-empty string 'command'{suffix}"
+    return None
+
+
+def _malformed_tool_call_error(response: Any) -> Optional[str]:
+    """Return an error string if a chat-completion response has bad tool args.
+
+    ``None`` means the response is safe to forward. Any string means the selected
+    model emitted a malformed tool call and the router should escalate exactly as
+    it does for empty-content/HTTP failures.
+    """
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices") or []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name") or ""
+            args, parse_err = _parse_tool_arguments(fn.get("arguments", "{}"))
+            if parse_err:
+                return f"malformed tool_call arguments for {name or '<unknown>'}: {parse_err}"
+            if args is None:
+                continue
+            arg_err = _tool_required_arg_error(name, args)
+            if arg_err:
+                return arg_err
+    return None
+
+
+def _malformed_tool_call_delta_error(data: str) -> Optional[str]:
+    """Return an error string if a streaming SSE delta has bad tool args."""
+    if data == "[DONE]":
+        return None
+    try:
+        evt = json.loads(data)
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(evt, dict) or evt.get("error"):
+        return None
+    choices = evt.get("choices") or []
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta") or {}
+        if not isinstance(delta, dict):
+            continue
+        tool_calls = delta.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name") or ""
+            # Streaming APIs may send the function name first and arguments later;
+            # absent/empty arguments are therefore not malformed yet. But when a
+            # non-empty arguments string is present, it must be structurally usable.
+            if "arguments" not in fn or fn.get("arguments") in (None, ""):
+                continue
+            args, parse_err = _parse_tool_arguments(fn.get("arguments"))
+            if parse_err:
+                return f"malformed tool_call arguments for {name or '<unknown>'}: {parse_err}"
+            if args is None:
+                continue
+            arg_err = _tool_required_arg_error(name, args)
+            if arg_err:
+                return arg_err
+    return None
+
+
 def _log_request_to_db(
     model_used: str,
     provider: str,
@@ -1222,6 +1339,13 @@ async def _preflight_openai_stream(
             if line.startswith("data: "):
                 data = line[6:]
                 buffered.append(f"data: {data}")
+                malformed_tool_error = _malformed_tool_call_delta_error(data)
+                if malformed_tool_error:
+                    pf.status = "error"
+                    pf.error = f"Backend {backend_model} emitted malformed tool_call: {malformed_tool_error}"
+                    pf.buffered = buffered
+                    await resp.aclose()
+                    return pf
                 saw_content, saw_tool, is_terminal = _sse_delta_parts(data)
                 if saw_content:
                     pf.saw_content = True
@@ -1486,6 +1610,16 @@ async def _non_streaming_fallback_to_sse(
                 "Streaming fallback non-streaming retry returned empty content for %s/%s",
                 provider,
                 backend_model,
+            )
+            continue
+        malformed_tool_error = _malformed_tool_call_error(result)
+        if malformed_tool_error:
+            last_detail = f"Backend {backend_model} emitted malformed tool_call: {malformed_tool_error}"
+            logger.warning(
+                "Streaming fallback non-streaming retry returned malformed tool_call for %s/%s: %s",
+                provider,
+                backend_model,
+                malformed_tool_error,
             )
             continue
 
@@ -1930,20 +2064,32 @@ async def chat_completions(request: Request):
             )
         else:
             result = await proxy_to_backend(backend, compressed_messages, body)
-            # A 200 with empty assistant content is a degenerate success —
-            # the model produced no output. Escalate exactly as on HTTPException
-            # so the client never receives an empty turn that would waste its
-            # turn budget self-healing.
-            if _response_has_empty_content(result):
-                logger.warning(
-                    "Backend %s returned empty content for %s, escalating...",
-                    backend.get("provider"),
-                    decision.selected_model,
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Backend {decision.selected_model} returned empty content",
-                )
+        # A 200 with empty assistant content is a degenerate success —
+        # the model produced no output. Escalate exactly as on HTTPException
+        # so the client never receives an empty turn that would waste its
+        # turn budget self-healing.
+        if _response_has_empty_content(result):
+            logger.warning(
+                "Backend %s returned empty content for %s, escalating...",
+                backend.get("provider"),
+                decision.selected_model,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {decision.selected_model} returned empty content",
+            )
+        malformed_tool_error = _malformed_tool_call_error(result)
+        if malformed_tool_error:
+            logger.warning(
+                "Backend %s/%s emitted malformed tool call (%s), escalating...",
+                backend.get("provider"),
+                decision.selected_model,
+                malformed_tool_error,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {decision.selected_model} emitted malformed tool_call: {malformed_tool_error}",
+            )
         total_time = time.time() - t0
         llm_time = total_time - routing_time
         # Log the request to DB (skip for streaming — usage comes from stream)
