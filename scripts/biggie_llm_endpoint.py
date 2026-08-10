@@ -609,13 +609,19 @@ def compression_level_for_workload(
     """Choose Biggie request-compression level for the detected workload.
 
     When a request carries OpenAI tool schemas (``requires_tools=True``) we
-    SKIP compression entirely ("off"). Compressing tool-calling traffic costs
-    tokens up front (to compress) without benefit — the downstream model still
-    needs the full tool schema + history to execute calls. This keeps tool
-    requests lean and avoids paying to compress before calling.
+    SKIP compression for NORMAL workloads ("off"). Compressing tool-calling
+    traffic costs tokens up front (to compress) without benefit — the
+    downstream model still needs the full tool schema + history to execute
+    calls. This keeps tool requests lean and avoids paying to compress before
+    calling.
+
+    EXCEPTION: a giant session_compaction (>=50k context) carrying tools must
+    STILL get structural repetition collapse. Such a payload is too large to
+    forward raw to a paid summariser model — the structural pass is what makes
+    the compaction affordable. The tool-skip rule only applies to normal
+    workloads, not to session compactions that would otherwise blow the paid
+    context budget.
     """
-    if requires_tools:
-        return "off"
     header_level = request.headers.get("X-Compression-Level")
     if header_level in ("off", "lite", "standard", "structural", "aggressive"):
         return header_level
@@ -624,7 +630,16 @@ def compression_level_for_workload(
             return "off"
         # Small/normal compactions stay conservative, but giant session payloads
         # need structural repetition collapse before spending paid model context.
-        return "structural" if context_tokens >= 50_000 else "lite"
+        # This applies even when the payload carries tool schemas — a >=50k
+        # compaction is too large to forward raw.
+        if context_tokens >= 50_000:
+            return "structural"
+        # Small session compactions carrying tools stay lean (skip compression).
+        if requires_tools:
+            return "off"
+        return "lite"
+    if requires_tools:
+        return "off"
     return COMPRESSION_LEVEL
 
 
@@ -1096,6 +1111,7 @@ class _StreamPreflight:
     saw_content: bool = False
     saw_tool_calls: bool = False
     response: Any = None                 # the still-open httpx streaming response
+    iterator: Any = None                 # the SAME aiter_lines() iterator to resume
 
 
 def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
@@ -1196,7 +1212,11 @@ async def _preflight_openai_stream(
         status="empty", backend_model=backend_model, provider=provider,
     )
     try:
-        async for line in resp.aiter_lines():
+        # Capture the iterator ONCE. httpx streaming responses are single-use —
+        # a second aiter_lines() call on the same response yields nothing. The
+        # downstream stream must resume THIS iterator, never re-create it.
+        pf.iterator = resp.aiter_lines()
+        async for line in pf.iterator:
             if not line:
                 continue
             if line.startswith("data: "):
@@ -1305,9 +1325,11 @@ async def _resume_stream(
             yield f"{evt}\n\n"
         if pf.buffered and pf.buffered[-1] == "data: [DONE]":
             return
-        # Continue the SAME response — no fresh connection
-        if resp is not None:
-            async for line in resp.aiter_lines():
+        # Continue the SAME iterator captured during preflight — never call
+        # resp.aiter_lines() again (httpx responses are single-use; a second
+        # call silently drops the rest of the stream).
+        if pf.iterator is not None:
+            async for line in pf.iterator:
                 if not line:
                     continue
                 if line.startswith("data: "):

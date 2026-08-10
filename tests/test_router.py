@@ -1017,22 +1017,56 @@ class TestOllamaToolCapableModels:
 
 
 class TestCompressionSkippedForToolRequests:
-    """TDD: when a request carries tool schemas, compression is skipped (off)."""
+    """TDD: tool-carrying traffic skips compression EXCEPT giant session
+    compactions which still need structural repetition collapse."""
 
-    def test_tool_request_skips_compression(self, monkeypatch):
+    def test_normal_tool_request_skips_compression(self, monkeypatch):
         from biggie_llm_endpoint import compression_level_for_workload
 
         class _FakeRequest:
             def __init__(self):
                 self.headers = {}
 
-        # Even a large session_compression request must NOT be compressed when
-        # it carries tool schemas — token economics: don't pay to compress
-        # tool-calling traffic before forwarding it.
+        # A NORMAL (non-session_compression) tool request skips compression —
+        # token economics: don't pay to compress tool-calling traffic.
+        lvl = compression_level_for_workload(
+            _FakeRequest(),
+            "normal_chat",
+            context_tokens=120_000,
+            requires_tools=True,
+        )
+        assert lvl == "off"
+
+    def test_session_compression_with_tools_gets_structural_at_50k(self):
+        from biggie_llm_endpoint import compression_level_for_workload
+
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+
+        # Even when a session_compression payload carries tool schemas, a giant
+        # context (>=50k) must still get structural repetition collapse before
+        # spending paid model context — it is too large to forward raw.
         lvl = compression_level_for_workload(
             _FakeRequest(),
             "session_compression",
             context_tokens=120_000,
+            requires_tools=True,
+        )
+        assert lvl == "structural"
+
+    def test_small_session_compression_with_tools_stays_off(self):
+        from biggie_llm_endpoint import compression_level_for_workload
+
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+
+        # Small session compactions carrying tools stay lean (skip compression).
+        lvl = compression_level_for_workload(
+            _FakeRequest(),
+            "session_compression",
+            context_tokens=2_000,
             requires_tools=True,
         )
         assert lvl == "off"
@@ -1083,22 +1117,14 @@ class TestStreamingNoDuplicateFirstChunk:
                 self._lines = list(lines)
                 self._closed = False
             async def aiter_lines(self):
-                # Preflight consumed line 0; yield the rest
-                for line in self._lines[1:]:
+                # Single-use iterator: yield ALL lines. Preflight consumes line 0
+                # (buffered); _resume_stream continues the SAME iterator from line 1.
+                for line in self._lines:
                     yield line
             async def aclose(self):
                 self._closed = True
 
         resp = _KeepAliveResp([first_chunk, second_chunk, done])
-
-        pf = _StreamPreflight(
-            status="ok",
-            backend_model="glm-5.2:cloud",
-            provider="ollama-cloud",
-            buffered=[first_chunk],
-            saw_content=True,
-            response=resp,
-        )
         backend = {
             "base_url": "http://fake",
             "api_key": "",
@@ -1108,13 +1134,29 @@ class TestStreamingNoDuplicateFirstChunk:
 
         import asyncio
 
-        async def collect():
+        async def run():
+            # Preflight consumes line 0 (buffered) and captures the SAME
+            # single-use iterator, now positioned after line 0.
+            it = resp.aiter_lines()
+            first = await it.__anext__()
+            assert first == first_chunk
+
+            pf = _StreamPreflight(
+                status="ok",
+                backend_model="glm-5.2:cloud",
+                provider="ollama-cloud",
+                buffered=[first_chunk],
+                saw_content=True,
+                response=resp,
+                iterator=it,  # the SAME iterator, already past line 0
+            )
+
             out = []
             async for evt in _resume_stream(pf, backend, [], {}):
                 out.append(evt)
             return out
 
-        events = asyncio.run(collect())
+        events = asyncio.run(run())
         assert fresh_calls == [], "_open_fresh_stream must not be called"
 
         content = "".join(
