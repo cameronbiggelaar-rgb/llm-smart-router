@@ -398,6 +398,57 @@ check("TEST11d: malformed streaming terminal args are detected",
  _malformed_tool_call_delta_error(_bad_stream_delta) is not None,
  "streaming preflight must escalate malformed terminal args too")
 
+# TEST 11e/11f: malformed function NAME (inline syntax leaked into name)
+# glm-5.2 emitted name="terminal(command=\"gh" with the args shoved into the
+# name field. The router must detect this and escalate.
+_bad_name_response = {
+ "choices": [{
+ "message": {
+ "role": "assistant",
+ "content": "",
+ "tool_calls": [{
+ "id": "call_badname",
+ "type": "function",
+ "function": {
+ "name": 'terminal(command="gh',
+ "arguments": json.dumps({"repo list --json name,url -L 50 2>&1\")": ""}),
+ },
+ }],
+ }
+ }]
+}
+check("TEST11e: malformed function name (inline syntax) is detected",
+ _malformed_tool_call_error(_bad_name_response) is not None,
+ "inline-syntax leaked into function name must trigger escalation")
+_bad_name_stream = json.dumps({
+ "choices": [{
+ "delta": {
+ "tool_calls": [{
+ "function": {
+ "name": 'terminal(command="gh',
+ "arguments": "",
+ }
+ }]
+ }
+ }]
+})
+check("TEST11f: malformed streaming function name is detected",
+ _malformed_tool_call_delta_error(_bad_name_stream) is not None,
+ "streaming preflight must escalate malformed function names too")
+# Ensure a valid function name with empty streaming args still passes (name-first pattern)
+_good_name_stream = json.dumps({
+ "choices": [{
+ "delta": {
+ "tool_calls": [{
+ "function": {"name": "terminal", "arguments": ""},
+ }]
+ }
+ }]
+})
+check("TEST11g: valid streaming function name with empty args still passes",
+ _malformed_tool_call_delta_error(_good_name_stream) is None,
+ "valid name with empty streaming args should not escalate")
+
 # TEST 12: [DONE] with no prior content is terminal/empty
 saw_c, saw_t, term = _sse_delta_parts("[DONE]")
 check("TEST12: [DONE] is terminal",

@@ -732,6 +732,31 @@ def _tool_required_arg_error(function_name: str, args: Dict[str, Any]) -> Option
     return None
 
 
+# Tool names are simple identifiers: letters, digits, underscores, hyphens.
+# Anything else (parentheses, quotes, equals, spaces) means the model leaked
+# inline call syntax into the function name field, e.g. terminal(command="gh.
+_TOOL_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+
+def _malformed_function_name_error(function_name: str) -> Optional[str]:
+    """Return an error string if a function name is structurally invalid.
+
+    Cloud fallback models sometimes emit the entire tool invocation as the
+    ``function.name`` field, e.g. ``terminal(command="gh repo list ...")``.
+    That is not a valid tool name — it contains parentheses, quotes, etc. —
+    and Hermes cannot dispatch it. Treat it as a model-output failure so the
+    router escalates.
+    """
+    if not function_name or not isinstance(function_name, str):
+        return None  # absent name handled elsewhere; don't double-report
+    if _TOOL_NAME_RE.match(function_name):
+        return None
+    return (
+        f"malformed function name {function_name!r}: contains characters outside "
+        f"[a-zA-Z0-9_-] — model likely leaked inline tool-call syntax into name field"
+    )
+
+
 def _malformed_tool_call_error(response: Any) -> Optional[str]:
     """Return an error string if a chat-completion response has bad tool args.
 
@@ -758,6 +783,12 @@ def _malformed_tool_call_error(response: Any) -> Optional[str]:
             if not isinstance(fn, dict):
                 continue
             name = fn.get("name") or ""
+            # Check function name first — a malformed name means the model
+            # leaked inline syntax (e.g. terminal(command="gh) and the args
+            # will be garbage too.
+            name_err = _malformed_function_name_error(name)
+            if name_err:
+                return name_err
             args, parse_err = _parse_tool_arguments(fn.get("arguments", "{}"))
             if parse_err:
                 return f"malformed tool_call arguments for {name or '<unknown>'}: {parse_err}"
@@ -796,6 +827,11 @@ def _malformed_tool_call_delta_error(data: str) -> Optional[str]:
             if not isinstance(fn, dict):
                 continue
             name = fn.get("name") or ""
+            # Check function name (malformed names are detectable even before
+            # arguments arrive in the stream).
+            name_err = _malformed_function_name_error(name)
+            if name_err:
+                return name_err
             # Streaming APIs may send the function name first and arguments later;
             # absent/empty arguments are therefore not malformed yet. But when a
             # non-empty arguments string is present, it must be structurally usable.
