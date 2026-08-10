@@ -1380,12 +1380,16 @@ def _wrap_non_streaming(
     """
     content = ""
     tool_calls = None
+    finish_reason = "stop"
     if isinstance(result, dict):
         choices = result.get("choices", [])
         if choices:
             msg = (choices[0].get("message", {}) or {})
             content = msg.get("content", "") or ""
             tool_calls = msg.get("tool_calls")
+            fr = choices[0].get("finish_reason")
+            if isinstance(fr, str) and fr:
+                finish_reason = fr
 
     async def wrap():
         try:
@@ -1414,7 +1418,7 @@ def _wrap_non_streaming(
                 "choices": [{
                     "index": 0,
                     "delta": {},
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
             }
             yield f"data: {json.dumps(finish)}\n\n"

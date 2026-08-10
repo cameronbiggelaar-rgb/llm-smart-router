@@ -818,6 +818,161 @@ check("TEST5: plain assistant message wrapped correctly",
  _plain[1] == {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]})
 
 
+# TEST 6 — Codex output leak regression: function_call_output items must NOT
+# leak into the collected output. The .done handler's else-branch appends ANY
+# item type not matched by id — including function_call_output items that Codex
+# emits as output items. These must be filtered out so they don't repeat/leak
+# into the assistant message.
+from biggie_llm_endpoint import proxy_to_backend
+
+def _codex_stream_events():
+    """Simulate a Codex /responses SSE stream with a function_call_output item."""
+    return [
+        ("event: response.output_item.added", json.dumps({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "fc_1", "name": "terminal", "arguments": ""},
+        })),
+        ("event: response.output_item.done", json.dumps({
+            "type": "response.output_item.done",
+            "item": {"type": "function_call", "id": "fc_1", "name": "terminal", "arguments": "{\"command\": \"echo hi\"}"},
+        })),
+        # Codex emits function_call_output as an output item — this must NOT leak
+        ("event: response.output_item.added", json.dumps({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call_output", "id": "fco_1", "call_id": "fc_1", "output": "hi"},
+        })),
+        ("event: response.output_item.done", json.dumps({
+            "type": "response.output_item.done",
+            "item": {"type": "function_call_output", "id": "fco_1", "call_id": "fc_1", "output": "hi"},
+        })),
+        ("event: response.completed", json.dumps({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "model": "gpt-5.5", "status": "completed", "output": []},
+        })),
+    ]
+
+class _FakeCodexResp:
+    def __init__(self, events):
+        self._events = events
+        self.status_code = 200
+    async def aiter_lines(self):
+        for evt_type, data in self._events:
+            yield evt_type
+            yield f"data: {data}"
+    async def aclose(self):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *exc):
+        return False
+
+async def _run_codex_proxy(events):
+    """Run proxy_to_backend against a fake Codex stream and return the result."""
+    import sys as _sys
+    _hermes = str(Path.home() / ".hermes" / "hermes-agent")
+    if _hermes not in _sys.path:
+        _sys.path.insert(0, _hermes)
+
+    # Patch the httpx client to return our fake response
+    import biggie_llm_endpoint as _b
+    original_client = _b._get_httpx_client
+
+    class _FakeClient:
+        def __init__(self, events):
+            self._events = events
+        def build_request(self, *a, **kw):
+            return None
+        async def send(self, req, stream=True):
+            return _FakeCodexResp(self._events)
+        def stream(self, method, url, json=None, headers=None):
+            return _FakeCodexResp(self._events)
+
+    _b._get_httpx_client = lambda: _FakeClient(events)
+    try:
+        backend = {
+            "base_url": "http://fake-codex",
+            "api_key": "test",
+            "backend_model": "gpt-5.5",
+            "provider": "openai-codex",
+        }
+        result = await _b.proxy_to_backend(backend, [], {})
+        return result
+    finally:
+        _b._get_httpx_client = original_client
+
+_codex_result = asyncio.run(_run_codex_proxy(_codex_stream_events()))
+_codex_msg = _codex_result["choices"][0]["message"]
+check("TEST6: function_call_output does NOT leak into assistant content",
+      "hi" not in str(_codex_msg.get("content", "")),
+      f"leaked content: {_codex_msg.get('content', '')!r}")
+check("TEST6: function_call preserved as tool_calls",
+      any(tc.get("function", {}).get("name") == "terminal" for tc in _codex_msg.get("tool_calls", [])),
+      f"tool_calls: {_codex_msg.get('tool_calls', [])!r}")
+check("TEST6: no function_call_output in tool_calls",
+      not any(tc.get("type") == "function_call_output" for tc in _codex_msg.get("tool_calls", [])),
+      f"tool_calls: {_codex_msg.get('tool_calls', [])!r}")
+
+
+# TEST 7 — _wrap_non_streaming finish_reason regression: a tool-calling turn
+# must emit finish_reason "tool_calls", NOT "stop". When the Codex/local
+# non-streaming path wraps a result that carries tool_calls, the synthesized
+# SSE finish chunk hardcodes "stop" — the client then treats the turn as a
+# final answer instead of a tool call, dropping the tool result and causing
+# the model to repeat the same call every turn (the repeated tool-call loop).
+import asyncio as _asyncio
+
+def _collect_wrap(result):
+    gen = _wrap_non_streaming("openai-codex", "gpt-5.5", result)
+    return _asyncio.run(_collect_wrap_async(gen))
+
+async def _collect_wrap_async(gen):
+    out = []
+    async for evt in gen:
+        out.append(evt)
+    return out
+
+# Tool-calling result — finish_reason must be "tool_calls"
+_tool_result = {
+    "id": "resp_1", "object": "chat.completion", "created": 0, "model": "gpt-5.5",
+    "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{\"command\":\"echo hi\"}"}}],
+    }, "finish_reason": "tool_calls"}],
+}
+_tool_events = _collect_wrap(_tool_result)
+_tool_finish = None
+for e in _tool_events:
+    if e.startswith("data: ") and e[6:].strip() != "[DONE]":
+        chunk = json.loads(e[6:])
+        if chunk["choices"][0].get("finish_reason"):
+            _tool_finish = chunk["choices"][0]["finish_reason"]
+check("TEST7: tool-calling turn emits finish_reason 'tool_calls'",
+      _tool_finish == "tool_calls",
+      f"got finish_reason={_tool_finish!r} — must be 'tool_calls' for a tool-calling turn")
+check("TEST7: tool_calls preserved in delta",
+      any(tc.get("function", {}).get("name") == "terminal"
+          for e in _tool_events
+          if e.startswith("data: ") and e[6:].strip() != "[DONE]"
+          for tc in json.loads(e[6:])["choices"][0]["delta"].get("tool_calls", [])),
+      "tool_calls missing from synthesized SSE delta")
+
+# Plain text result — finish_reason must remain "stop"
+_plain_result = {
+    "id": "resp_2", "object": "chat.completion", "created": 0, "model": "gpt-5.5",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}],
+}
+_plain_events = _collect_wrap(_plain_result)
+_plain_finish = None
+for e in _plain_events:
+    if e.startswith("data: ") and e[6:].strip() != "[DONE]":
+        chunk = json.loads(e[6:])
+        if chunk["choices"][0].get("finish_reason"):
+            _plain_finish = chunk["choices"][0]["finish_reason"]
+check("TEST7: plain text turn still emits finish_reason 'stop'",
+      _plain_finish == "stop",
+      f"got finish_reason={_plain_finish!r} — must be 'stop' for a plain text turn")
+
+
 print(f"\n{'' * 50}")
 print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
 print(f"{'' * 50}")
