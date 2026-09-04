@@ -60,6 +60,15 @@ ESCALATION_DELAY = 1.0
 # bug — stream escalation remains mandatory for the normal path. 0 = disabled.
 FLASH_MAX_CONTEXT_TOKENS = int(os.environ.get("BIGGIE_FLASH_MAX_CONTEXT_TOKENS", "0"))
 
+# Per-model context ceilings (tokens) for session compression. A model whose
+# ceiling is exceeded is skipped in favour of the next ladder rung, mirroring
+# the flash ceiling but for a specific model. 0 = no ceiling for that model.
+# glm-5.3 degenerates into repeated-token garbage on 150K+ contexts, so it is
+# limited to 150K and larger compressions escalate to glm-5.2 (the tier above).
+MODEL_CONTEXT_CEILING = {
+    "glm-5.3": int(os.environ.get("BIGGIE_GLM53_MAX_CONTEXT_TOKENS", "150000")),
+}
+
 # Path to router state DB
 ROUTER_STATE_DB = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_state.db")
 
@@ -1302,6 +1311,10 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     Flash is skipped — known-large contexts bypass Flash and start at the next
     qualified summariser, because Flash is prone to the empty-stream problem on
     very large contexts. Stream escalation remains mandatory regardless.
+
+    Per-model ``MODEL_CONTEXT_CEILING`` entries are also enforced: glm-5.3 is
+    limited at 150K (degenerates into repeated-token garbage above that), so
+    larger compressions escalate to glm-5.2, the tier directly above glm-5.3.
     """
     # Curated summariser ladder (policy subset — deliberately excludes
     # minimax/glm-5/glm-5.1 as summarisers). Each entry is validated against
@@ -1310,6 +1323,7 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     preferred = [
         "deepseek-v4-flash",
         "glm-5.3",
+        "glm-5.2",
         "qwen3.5",
         "deepseek-v4-pro",
         "deepseek-v3.1:671b",
@@ -1319,6 +1333,12 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     ]
     if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
         preferred = [m for m in preferred if m != "deepseek-v4-flash"]
+    # Enforce per-model context ceilings: skip any model whose ceiling the
+    # current context exceeds, escalating to the next rung (glm-5.3 -> glm-5.2).
+    preferred = [
+        m for m in preferred
+        if MODEL_CONTEXT_CEILING.get(m, 0) == 0 or context_tokens <= MODEL_CONTEXT_CEILING[m]
+    ]
     for model in preferred:
         if is_model_available(model):
             return model

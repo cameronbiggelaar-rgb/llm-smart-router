@@ -152,6 +152,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "glm-5":              {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
     "glm-5.1":            {"provider": "ollama-cloud",  "ratio": 2.5,  "input": 1.25,  "output": 3.75,  "tier": 5, "date": "2026-07-01"},
     "glm-5.3":            {"provider": "ollama-cloud",  "ratio": 3.0,  "input": 1.50,  "output": 4.50,  "tier": 6, "date": "2026-08-26"},
+    "glm-5.2":            {"provider": "ollama-cloud",  "ratio": 3.0,  "input": 1.50,  "output": 4.50,  "tier": 6.5, "date": "2026-09-04"},
     "qwen3.5":            {"provider": "ollama-cloud",  "ratio": 3.5,  "input": 1.75,  "output": 5.25,  "tier": 7, "date": "2026-08-08"},
     "deepseek-v4-pro":    {"provider": "ollama-cloud",  "ratio": 4.0,  "input": 2.00,  "output": 6.00,  "tier": 8, "date": "2026-07-01"},
     "deepseek-v3.1:671b": {"provider": "ollama-cloud",  "ratio": 10.0, "input": 5.00,  "output": 15.00, "tier": 9, "date": "2026-07-01"},

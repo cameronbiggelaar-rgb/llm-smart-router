@@ -67,6 +67,7 @@ class TestSessionCompressionCostControl:
         for model in (
             "deepseek-v4-flash",
             "glm-5.3",
+            "glm-5.2",
             "qwen3.5",
             "deepseek-v4-pro",
             "deepseek-v3.1:671b",
@@ -85,7 +86,7 @@ class TestSessionCompressionCostControl:
             requires_tools=False,
         )
         assert decision.selected_model != "gpt-5.5"
-        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.3", "qwen3.5", "deepseek-v4-pro"}
+        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.3", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}
         assert "gpt-5.5" not in decision.fallback_chain
 
     def test_large_session_compression_skips_flash_without_jumping_to_gpt55(self, monkeypatch):
@@ -101,7 +102,66 @@ class TestSessionCompressionCostControl:
         )
         assert decision.selected_model != "deepseek-v4-flash"
         assert decision.selected_model != "gpt-5.5"
-        assert decision.selected_model in {"glm-5.3", "qwen3.5", "deepseek-v4-pro"}
+        # glm-5.3 is ceiling-limited at 150K, so a 180K compression escalates to
+        # glm-5.2 (the tier above glm-5.3) rather than glm-5.3 or qwen3.5.
+        assert decision.selected_model == "glm-5.2"
+
+
+class TestCompressionContextCeiling:
+    """glm-5.3 is limited at 150K; larger compressions must escalate to glm-5.2."""
+
+    def setup_method(self):
+        for model in (
+            "deepseek-v4-flash",
+            "glm-5.3",
+            "glm-5.2",
+            "qwen3.5",
+            "deepseek-v4-pro",
+            "deepseek-v3.1:671b",
+            "llama3.1:8b",
+            "dolphin3",
+        ):
+            mark_available(model)
+
+    def _route(self, context_tokens: int, flash_ceiling: int) -> str:
+        import router
+
+        router.FLASH_MAX_CONTEXT_TOKENS = flash_ceiling
+        decision = route_task(
+            complexity_score=0.65,
+            task_type="session_compression",
+            workload_type="session_compression",
+            context_tokens=context_tokens,
+            requires_tools=False,
+        )
+        return decision.selected_model
+
+    def test_at_exactly_150k_glm53_used(self):
+        # Ceiling is inclusive: <= 150K is safe for glm-5.3.
+        assert self._route(150_000, flash_ceiling=50_000) == "glm-5.3"
+
+    def test_above_150k_glm53_bypassed_for_glm52(self):
+        # 150K < 150_001 -> glm-5.3 ceiling exceeded, escalate to glm-5.2.
+        assert self._route(150_001, flash_ceiling=50_000) == "glm-5.2"
+
+    def test_glm52_sits_above_glm53_in_ladder(self, monkeypatch):
+        # At 120K flash is skipped (ceiling 50K) but glm-5.3 serves (<=150K).
+        # Force glm-5.3 unavailable: the next ladder rung is glm-5.2, not
+        # qwen3.5 or deepseek-v4-pro — glm-5.2 is the tier right above glm-5.3.
+        import router
+
+        real_avail = router.is_model_available
+        router.is_model_available = lambda m: m != "glm-5.3" and real_avail(m)
+        try:
+            assert self._route(120_000, flash_ceiling=50_000) == "glm-5.2"
+        finally:
+            router.is_model_available = real_avail
+
+    def test_below_ceiling_glm53_serves_when_flash_is_skipped(self, monkeypatch):
+        # Even at 140K (below 150K ceiling), glm-5.3 serves once flash is
+        # skipped by its own ceiling — confirms glm-5.3 is NOT limited below
+        # 150K and glm-5.2 only takes over above the ceiling.
+        assert self._route(140_000, flash_ceiling=50_000) == "glm-5.3"
 
 
 class TestLargeContextCompression:
