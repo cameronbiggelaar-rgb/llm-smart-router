@@ -1234,3 +1234,147 @@ class TestStreamingNoDuplicateFirstChunk:
         )
         assert content == "Good morning", f"Expected 'Good morning', got {content!r}"
 
+
+class TestStreamingDegenerationAlert:
+    """Mid-stream degeneration is flagged as a durable, full-context ALERT.
+
+    The preflight stops at the first content delta; the degenerate tail arrives
+    during _resume_stream. This observability-first guard must raise a
+    recovery_log alert (with the exact pattern + emitted output tail) exactly
+    once per stream, while continuing to forward the stream unchanged — it is
+    for debugging, not re-routing.
+    """
+
+    def _resp(self, lines):
+        class _Resp:
+            def __init__(self, ls):
+                self._lines = list(ls)
+            async def aiter_lines(self):
+                for line in self._lines:
+                    yield line
+            async def aclose(self):
+                pass
+        return _Resp(lines)
+
+    def test_clean_stream_does_not_alert(self, monkeypatch):
+        from biggie_llm_endpoint import _StreamPreflight, _resume_stream
+
+        alerts = []
+        monkeypatch.setattr(
+            "biggie_llm_endpoint.log_recovery_event",
+            lambda model, event, detail: alerts.append((model, event, detail)),
+        )
+
+        first = 'data: {"choices":[{"delta":{"content":"Good"}}]}'
+        second = 'data: {"choices":[{"delta":{"content":" morning"}}]}'
+        done = "data: [DONE]"
+        resp = self._resp([second, done])
+        it = resp.aiter_lines()
+
+        async def run():
+            # Simulate the preflight having buffered only the first delta. The
+            # iterator stays FRESH so _resume_stream replays buffered=[first]
+            # then continues it from the second delta onward.
+            pf = _StreamPreflight(
+                status="ok", backend_model="glm-5.3:cloud", provider="ollama-cloud",
+                buffered=[first], saw_content=True, response=resp, iterator=it,
+            )
+            out = []
+            async for evt in _resume_stream(pf, {}, [], {}):
+                out.append(evt)
+            return out
+
+        import asyncio
+        events = asyncio.run(run())
+        assert any(e.startswith("data: [DONE]") for e in events)
+        # No degeneration alert for clean, short prose.
+        assert alerts == [], "clean stream must not raise a stream_degeneration_alert"
+        # Stream still forwarded unchanged.
+        joined = "".join(
+            json.loads(e[6:])["choices"][0]["delta"].get("content", "")
+            for e in events if e.startswith("data: ") and e[6:].strip() != "[DONE]"
+        )
+        assert joined == "Good morning"
+
+    def test_degenerate_stream_alerts_once_with_full_context(self, monkeypatch):
+        from biggie_llm_endpoint import _StreamPreflight, _resume_stream
+
+        alerts = []
+        monkeypatch.setattr(
+            "biggie_llm_endpoint.log_recovery_event",
+            lambda model, event, detail: alerts.append((model, event, detail)),
+        )
+
+        first = 'data: {"choices":[{"delta":{"content":"Here is"}}]}'
+        import json as _json
+        repeated = _json.dumps("optooloop" * 8)  # 72 chars, ≥ the 64-char minimum
+        degenerate = 'data: {"choices":[{"delta":{"content": %s}}]}' % repeated
+        done = "data: [DONE]"
+        resp = self._resp([degenerate, done])
+        # Iterator stays FRESH: preflight only buffered `first` upstream; the
+        # remaining degenerate + done lines are consumed by _resume_stream.
+        it = resp.aiter_lines()
+
+        async def run():
+            pf = _StreamPreflight(
+                status="ok", backend_model="glm-5.3:cloud", provider="ollama-cloud",
+                buffered=[first], saw_content=True, response=resp, iterator=it,
+            )
+            out = []
+            async for evt in _resume_stream(pf, {}, [], {}):
+                out.append(evt)
+            return out
+
+        import asyncio
+        events = asyncio.run(run())
+
+        # Exactly one durable alert with the full debug context.
+        assert len(alerts) == 1, f"expected 1 alert, got {alerts!r}"
+        model, event, detail = alerts[0]
+        assert model == "glm-5.3:cloud"
+        assert event == "stream_degeneration_alert"
+        assert "provider=ollama-cloud" in detail
+        assert "optooloop" in detail          # the repeated pattern
+        assert "output_tail=" in detail       # the emitted output tail
+        # Stream still forwarded to the client verbatim.
+        assert any(e.startswith("data: [DONE]") for e in events)
+
+    def test_alert_is_observability_only_forwarding_unchanged(self, monkeypatch):
+        from biggie_llm_endpoint import _StreamPreflight, _resume_stream
+
+        alerts = []
+        monkeypatch.setattr(
+            "biggie_llm_endpoint.log_recovery_event",
+            lambda model, event, detail: alerts.append((model, event, detail)),
+        )
+
+        first = 'data: {"choices":[{"delta":{"content":"Lead"}}]}'
+        import json as _json
+        repeated = _json.dumps("optooloop" * 8)
+        degenerate = 'data: {"choices":[{"delta":{"content": %s}}]}' % repeated
+        done = "data: [DONE]"
+        resp = self._resp([degenerate, done])
+        it = resp.aiter_lines()  # fresh — preflight buffered only `first`
+
+        async def run():
+            pf = _StreamPreflight(
+                status="ok", backend_model="glm-5.3:cloud", provider="ollama-cloud",
+                buffered=[first], saw_content=True, response=resp, iterator=it,
+            )
+            out = []
+            async for evt in _resume_stream(pf, {}, [], {}):
+                out.append(evt)
+            return out
+
+        import asyncio
+        events = asyncio.run(run())
+
+        content = "".join(
+            json.loads(e[6:])["choices"][0]["delta"].get("content", "")
+            for e in events if e.startswith("data: ") and e[6:].strip() != "[DONE]"
+        )
+        # The degenerate bytes still reached the client — this guard does not
+        # re-route; it records so we can debug. Forwarding is the contract.
+        assert content.startswith("Lead") and "optooloop" in content
+        assert len(alerts) == 1
+

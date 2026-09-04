@@ -1495,6 +1495,8 @@ class _StreamPreflight:
     saw_tool_calls: bool = False
     response: Any = None                 # the still-open httpx streaming response
     iterator: Any = None                 # the SAME aiter_lines() iterator to resume
+    accumulated: str = ""                # raw streamed content tail, for mid-stream
+                                         # degeneration alerting (observability only)
 
 
 def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
@@ -1526,6 +1528,85 @@ def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
         if delta.get("tool_calls"):
             saw_tool = True
     return (saw_content, saw_tool, False)
+
+
+def _sse_content_text(data: str) -> str:
+    """Extract the text content from one SSE ``data:`` payload.
+
+    Returns only the streamed content delta(s) as string, concatenated across
+    choices. Tool-call deltas and non-content fields are ignored. Empty string
+    when the payload carries no content (or is unparsable / terminal). This is
+    the raw accumulation source for mid-stream degeneration detection — it must
+    NOT be fed back into the client path.
+    """
+    if data == "[DONE]":
+        return ""
+    try:
+        evt = json.loads(data)
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+    if not isinstance(evt, dict):
+        return ""
+    parts: List[str] = []
+    for ch in evt.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta") or {}
+        if not isinstance(delta, dict):
+            continue
+        c = delta.get("content")
+        if isinstance(c, str) and c:
+            parts.append(c)
+    return "".join(parts)
+
+
+def _alert_stream_degeneration(
+    provider: str,
+    backend_model: str,
+    pattern: str,
+    output_tail: str,
+) -> None:
+    """Emit a durable, full-context ALERT for mid-stream degeneration.
+
+    Called when the streaming tail accumulates text that the repetition guard
+    flags as a degeneration loop (the glm-5.3 optooloop failure class). Writes a
+    recovery_log row (event ``stream_degeneration_alert``) and logs at ERROR
+    with the exact repeated pattern plus a bounded tail of the emitted output,
+    so future occurrences are greppable and debuggable without re-routing the
+    request. This is observability-first: it does NOT abort or re-route the
+    in-flight stream.
+    """
+    try:
+        log_recovery_event(
+            backend_model,
+            "stream_degeneration_alert",
+            (
+                f"provider={provider} pattern={pattern!r} "
+                f"output_tail={output_tail!r}"
+            ),
+        )
+    except Exception as exc:  # never let alerting break the stream path
+        logger.warning("Failed to log stream degeneration alert: %s", exc)
+    logger.error(
+        "STREAM DEGENERATION provider=%s model=%s pattern=%r output_tail=%r",
+        provider,
+        backend_model,
+        pattern,
+        output_tail,
+    )
+
+
+def _scan_stream_content(accumulated: str, minimum: int = 64) -> Optional[str]:
+    """Run the degeneration detector over accumulated streamed text.
+
+    Accumulating per-delta and running a regex each time is wasteful and would
+    raise latency; this helper runs the same ``_repetition_error`` detector the
+    non-streaming guard uses, only once enough content has accumulated to be
+    meaningful. Returns the pattern description on a hit, else None.
+    """
+    if len(accumulated) < minimum:
+        return None
+    return _repetition_error(accumulated)
 
 
 async def _preflight_openai_stream(
@@ -1727,6 +1808,16 @@ async def _resume_stream(
             yield f"{evt}\n\n"
         if pf.buffered and pf.buffered[-1] == "data: [DONE]":
             return
+        # Mid-stream degeneration alert: accumulate the raw streamed content and
+        # scan it with the same repetition guard the non-streaming path uses.
+        # The preflight stopped at the first content delta, so the degenerate
+        # tail typically lands here. This is observability-only — the stream is
+        # forwarded unchanged and the alert (recovery_log + ERROR log) captures
+        # the full context for future debugging.
+        accumulated = pf.accumulated
+        for evt in pf.buffered:
+            if evt.startswith("data: "):
+                accumulated += _sse_content_text(evt[6:])
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
         # call silently drops the rest of the stream).
@@ -1740,7 +1831,16 @@ async def _resume_stream(
                         yield f"data: {data}\n\n"
                         break
                     yield f"data: {data}\n\n"
+                    accumulated += _sse_content_text(data)
             await resp.aclose()
+        # Scan once at the end of the stream. Repeatedly re-regexing the growing
+        # buffer per delta is pointless latency; a single scan after stream close
+        # still catches the degenerate output that reached the client.
+        pattern = _scan_stream_content(accumulated)
+        if pattern:
+            _alert_stream_degeneration(
+                pf.provider, pf.backend_model, pattern, output_tail=accumulated[-400:],
+            )
     finally:
         if resp is not None:
             try:
