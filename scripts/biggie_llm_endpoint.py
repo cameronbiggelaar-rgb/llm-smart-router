@@ -25,6 +25,7 @@ import time
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import httpx
@@ -55,6 +56,8 @@ from router import (
     check_limp_home_status,
     get_recovery_summary,
     mark_rate_limited,
+    mark_credential_expired,
+    log_recovery_event,
     mark_available,
     RoutingDecision,
     MODEL_CAPABILITY_TIERS,
@@ -101,6 +104,98 @@ _STREAM_OBS_COLUMNS = {
     "saw_tool_calls": "INTEGER NOT NULL DEFAULT 0",
     "final_model": "TEXT NOT NULL DEFAULT ''",
 }
+
+# Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
+_CODEX_REAUTH_HINT = "run: hermes auth add openai-codex --type oauth"
+
+
+def _handle_backend_status(
+    provider: str, backend_model: str, status: int, error_text: str = ""
+) -> None:
+    """Classify a non-2xx backend response and record the failure state.
+
+    - 429 -> mark_rate_limited (transient; recovers on its own)
+    - 401/403 -> mark_credential_expired on the codex provider (needs human
+      re-auth; surfaces as a distinct 'credential_expired' event instead of a
+      generic 'error' / silent circuit trip)
+    - everything else -> left to normal escalation / circuit breaker
+    """
+    if status == 429:
+        mark_rate_limited(backend_model)
+    elif status in (401, 403) and provider == "openai-codex":
+        mark_credential_expired(
+            backend_model,
+            f"{provider} credential rejected (HTTP {status}) — {_CODEX_REAUTH_HINT}",
+        )
+
+
+# Access tokens are short-lived; warn well before they expire so a dead
+# credential surfaces proactively instead of as a mid-request 401.
+_CODEX_TOKEN_AGE_WARN_DAYS = 6   # OpenAI codex access tokens typically live ~1 week
+_CODEX_TOKEN_AGE_ALERT_DAYS = 14 # beyond this, treat as expired outright
+_last_token_age_warn_at: float = 0.0
+
+
+def _check_codex_token_age() -> None:
+    """Warn if the openai-codex credential pool's newest token is old.
+
+    Reads the same auth.json pool the backend loader uses, computes the age of
+    the most recent ``last_refresh`` across entries, and surfaces a distinct,
+    actionable warning — WITHOUT taking the model out of rotation. A token near
+    expiry is a routine maintenance signal, not a failure; the request path
+    still handles an actual 401 via ``_handle_backend_status``.
+
+    Rate-limited to one warning per 6 hours so it doesn't spam logs/DB on the
+    60s backend-cache refresh.
+    """
+    global _last_token_age_warn_at
+    now = time.time()
+    if now - _last_token_age_warn_at < 6 * 3600:
+        return
+
+    newest_refresh_ts: Optional[float] = None
+    try:
+        _auth_path = Path.home() / ".hermes" / "auth.json"
+        if not _auth_path.exists():
+            return
+        with open(_auth_path) as _af:
+            _auth_data = json.load(_af)
+        for _entry in (_auth_data.get("credential_pool", {}).get("openai-codex", []) or []):
+            if not isinstance(_entry, dict):
+                continue
+            _lr = _entry.get("last_refresh")
+            if _lr:
+                try:
+                    _ts = datetime.fromisoformat(_lr.replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if newest_refresh_ts is None or _ts > newest_refresh_ts:
+                    newest_refresh_ts = _ts
+    except Exception:
+        return  # auth.json unreadable — request path already handles failure
+
+    if newest_refresh_ts is None:
+        return
+
+    age_min = (now - newest_refresh_ts) / 60.0
+    if age_min >= _CODEX_TOKEN_AGE_ALERT_DAYS * 24 * 60:
+        level = "ALERT"
+        msg = (f"openai-codex token {age_min / 1440:.1f} days old — almost "
+               f"certainly expired. {_CODEX_REAUTH_HINT}")
+    elif age_min >= _CODEX_TOKEN_AGE_WARN_DAYS * 24 * 60:
+        level = "WARN"
+        msg = (f"openai-codex token {age_min / 1440:.1f} days old — near expiry. "
+               f"Refresh proactively: {_CODEX_REAUTH_HINT}")
+    else:
+        return  # young enough — no warning
+
+    _last_token_age_warn_at = now
+    logger.warning("[token-age %s] %s", level, msg)
+    log_recovery_event(
+        "openai-codex",
+        "token_age_warn" if level == "WARN" else "token_age_alert",
+        msg,
+    )
 
 
 def _ensure_log_columns(db: Any) -> None:
@@ -310,6 +405,11 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
     now = time.time()
     if _backends_cache and (now - _backends_cache_time) < _BACKENDS_CACHE_TTL:
         return _backends_cache
+
+    # Proactive credential-health check: warn (durably) if the openai-codex
+    # access token is approaching expiry. Runs on this 60s refresh, rate-limited
+    # internally to one warning per 6h.
+    _check_codex_token_age()
 
     hermes = load_hermes_config()
     backends: Dict[str, Dict[str, Any]] = {}
@@ -757,6 +857,132 @@ def _malformed_function_name_error(function_name: str) -> Optional[str]:
     )
 
 
+def _normalize_tool_call(tc: Any) -> Tuple[str, str]:
+    """Return (name, normalized_arguments) for a tool call, or empty on junk."""
+    if not isinstance(tc, dict):
+        return ("", "")
+    fn = tc.get("function") or {}
+    if not isinstance(fn, dict):
+        return ("", "")
+    name = fn.get("name") or ""
+    args = fn.get("arguments")
+    if not isinstance(name, str):
+        name = ""
+    if isinstance(args, dict):
+        try:
+            args = json.dumps(args, sort_keys=True)
+        except Exception:
+            args = ""
+    elif isinstance(args, str):
+        # Canonicalize JSON-string args (key order can vary between otherwise
+        # identical tool calls — a semantic duplicate the model may emit as
+        # part of a degeneration loop). Non-JSON strings are compared verbatim.
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, (dict, list)):
+                args = json.dumps(parsed, sort_keys=True)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    else:
+        args = ""
+    return (name, args)
+
+
+def _degeneration_error(response: Any) -> Optional[str]:
+    """Return an error string if a chat-completion response shows degeneration.
+
+    Degeneration is the failure class where the model is NOT erroring (non-empty
+    content, well-formed tool calls) but is stuck in a repetition loop — emitting
+    the same tool call twice in one turn, or repeatedly spitting the same tokens.
+
+    ``None`` means the response is safe to forward. Any string means the selected
+    model degenerated and the router should escalate exactly as it does for
+    empty-content/malformed-tool-call failures, so corrupt output never reaches
+    the client (Hermes) where it would waste turn budget or break downstream
+    parsing (e.g. failing build assertions).
+
+    Detects two distinct signatures:
+      1. Duplicate tool calls — the same (name, arguments) emitted 2+ times in
+         one response. The agent logs "Removed duplicate tool call" for these,
+         but by then the degenerate turn has already consumed a model call and
+         returned corrupt output; better to catch and escalate server-side.
+      2. Runaway text repetition — a word/token repeated many times in a row,
+         the classic degeneration loop (e.g. ``turning_offturning_off...``).
+    """
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices") or []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+
+        # 1) Duplicate tool calls in a single turn.
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and len(tool_calls) >= 2:
+            seen: Dict[Tuple[str, str], int] = {}
+            for tc in tool_calls:
+                key = _normalize_tool_call(tc)
+                if not key[0]:
+                    continue
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] >= 2:
+                    return (
+                        f"degenerate tool calls: {key[0]!r} emitted {seen[key]} times "
+                        f"with identical arguments in a single response"
+                    )
+
+        # 2) Runaway text repetition.
+        content = message.get("content")
+        if isinstance(content, str) and len(content) >= 12:
+            rep_err = _repetition_error(content)
+            if rep_err:
+                return f"degenerate content repetition: {rep_err}"
+
+    return None
+
+
+_DEGEN_WORD_RE = None  # compiled lazily below (module import order safety)
+
+
+def _repetition_error(text: str) -> Optional[str]:
+    """Return a description if ``text`` shows runaway repetition, else None.
+
+    Signature: a short token or word (>=2 chars, <=20) repeated 8+ times in a
+    row, with or without intervening whitespace (e.g. ``turning_offturning_off``
+    or ``response response response``). 8+ identical consecutive units is far
+    beyond any legitimate prose and reliably marks a degeneration loop.
+    """
+    global _DEGEN_WORD_RE
+    if _DEGEN_WORD_RE is None:
+        # Word: 2-20 word-chars, no boundary requirement (degens repeat inside
+        # runs too). Repeated 8+ times, back-to-back or space-separated.
+        _DEGEN_WORD_RE = re.compile(
+            r"(\b[a-zA-Z_]{2,20}\b)(?:\1|[ \t]+(?:\1)){7,}",
+            re.IGNORECASE,
+        )
+    # Also catch concatenated no-space repeats of common short tokens like
+    # "turning_offturning_off" (>=2 chars, 8+ times directly adjacent).
+    m = _DEGEN_WORD_RE.search(text)
+    if m:
+        return f"{m.group(1)!r} repeated {m.group(0).count(m.group(1)) + 1} times consecutively"
+    # Concatenated no-space runs of a short word-like token (e.g.
+    # "turning_offturning_off"). Require the token to contain at least 2
+    # DISTINCT characters so runs of identical symbols (=====, aaaa, -----)
+    # — legitimate in code/plain text — are never flagged.
+    concat = re.search(
+        r"([a-zA-Z_]{3,40}?[a-zA-Z0-9_-]*[a-zA-Z_]){0}([a-zA-Z_]{2,40}[-_]?[a-zA-Z0-9_]*)\2{7,}",
+        text,
+    )
+    if concat:
+        tok = concat.group(2)
+        if len(set(tok)) >= 2:
+            return f"{tok!r} repeated in a concatenated loop"
+    return None
+
+
 def _malformed_tool_call_error(response: Any) -> Optional[str]:
     """Return an error string if a chat-completion response has bad tool args.
 
@@ -1040,8 +1266,7 @@ async def proxy_to_backend(
                     error_text = await resp.aread()
                     detail = f"Backend error: {error_text[:500].decode()}"
                     logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
-                    if resp.status_code == 429:
-                        mark_rate_limited(backend_model)
+                    _handle_backend_status(provider, backend_model, resp.status_code)
                     raise HTTPException(status_code=502, detail=detail)
 
                 # Collect SSE events — assemble the response from stream events
@@ -1094,8 +1319,7 @@ async def proxy_to_backend(
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
             logger.error("Backend %s returned %d: %s", provider, status, detail)
-            if status == 429:
-                mark_rate_limited(backend_model)
+            _handle_backend_status(provider, backend_model, status)
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
             logger.error("Backend %s request failed: %s", provider, e)
@@ -1206,8 +1430,7 @@ async def proxy_to_backend(
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
             logger.error("Backend %s returned %d: %s", provider, status, detail)
-            if status == 429:
-                mark_rate_limited(backend_model)
+            _handle_backend_status(provider, backend_model, status)
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
             logger.error("Backend %s request failed: %s", provider, e)
@@ -1223,6 +1446,14 @@ async def proxy_to_backend(
         if param in request_body:
             body[param] = request_body[param]
 
+    # Forward tool schemas so the model can emit structured tool_calls.
+    # Ollama Cloud's /chat/completions accepts standard OpenAI tool format
+    # natively — no conversion needed (unlike Codex Responses API).
+    if request_body.get("tools"):
+        body["tools"] = request_body["tools"]
+    if request_body.get("tool_choice"):
+        body["tool_choice"] = request_body["tool_choice"]
+
     url = f"{base_url.rstrip('/')}/chat/completions"
 
     try:
@@ -1234,8 +1465,7 @@ async def proxy_to_backend(
         status = e.response.status_code
         detail = f"Backend error: {e.response.text[:500]}"
         logger.error("Backend %s returned %d: %s", provider, status, detail)
-        if status == 429:
-            mark_rate_limited(backend_model)
+        _handle_backend_status(provider, backend_model, status)
         raise HTTPException(status_code=502, detail=detail)
     except httpx.RequestError as e:
         logger.error("Backend %s request failed: %s", provider, e)
@@ -1336,6 +1566,13 @@ async def _preflight_openai_stream(
     for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
         if param in body:
             out[param] = body[param]
+
+    # Forward tool schemas so the model can emit structured tool_calls.
+    if body.get("tools"):
+        out["tools"] = body["tools"]
+    if body.get("tool_choice"):
+        out["tool_choice"] = body["tool_choice"]
+
     url = f"{base_url.rstrip('/')}/chat/completions"
     client = _get_httpx_client()
     try:
@@ -1353,8 +1590,7 @@ async def _preflight_openai_stream(
         except Exception:
             error_text = ""
         await resp.aclose()
-        if resp.status_code == 429:
-            mark_rate_limited(backend_model)
+        _handle_backend_status(provider, backend_model, resp.status_code)
         logger.error("Backend %s returned %d during preflight: %s", provider, resp.status_code, error_text[:500])
         return _StreamPreflight(
             status="error", backend_model=backend_model, provider=provider,
@@ -1442,6 +1678,13 @@ async def _open_fresh_stream(
     for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
         if param in request_body:
             out[param] = request_body[param]
+
+    # Forward tool schemas so the model can emit structured tool_calls.
+    if request_body.get("tools"):
+        out["tools"] = request_body["tools"]
+    if request_body.get("tool_choice"):
+        out["tool_choice"] = request_body["tool_choice"]
+
     url = f"{base_url.rstrip('/')}/chat/completions"
     client = _get_httpx_client()
     try:
@@ -1456,8 +1699,7 @@ async def _open_fresh_stream(
         except Exception:
             error_text = ""
         await resp.aclose()
-        if resp.status_code == 429:
-            mark_rate_limited(backend_model)
+        _handle_backend_status(provider, backend_model, resp.status_code)
         logger.error("Backend %s returned %d: %s", provider, resp.status_code, error_text[:500])
         raise HTTPException(status_code=502, detail=f"Backend error: {error_text[:500]}")
     return resp, url
@@ -2126,6 +2368,23 @@ async def chat_completions(request: Request):
                 status_code=502,
                 detail=f"Backend {decision.selected_model} emitted malformed tool_call: {malformed_tool_error}",
             )
+        # Degeneration guard: catch the model stuck in a repetition loop —
+        # duplicate tool calls or runaway text repetition. Non-empty and
+        # well-formed, so it slips past the checks above, but corrupted output
+        # would waste turn budget and break downstream parsing (build failures).
+        # Escalate to a stronger model exactly as for malformed/empty.
+        degeneration_error = _degeneration_error(result)
+        if degeneration_error:
+            logger.warning(
+                "Backend %s/%s degenerated (%s), escalating...",
+                backend.get("provider"),
+                decision.selected_model,
+                degeneration_error,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {decision.selected_model} degenerated: {degeneration_error}",
+            )
         total_time = time.time() - t0
         llm_time = total_time - routing_time
         # Log the request to DB (skip for streaming — usage comes from stream)
@@ -2147,13 +2406,25 @@ async def chat_completions(request: Request):
                 **_obs,
             )
         return result
-    except HTTPException:
-        # Backend failed — try escalation
-        logger.warning("Backend %s failed, escalating...", decision.selected_model)
+    except HTTPException as http_exc:
+        # Backend failed — try escalation. Classify the failure so model-output
+        # quality issues (malformed tool call, empty content) escalate WITHOUT
+        # tripping the circuit breaker, while genuine provider/availability
+        # errors count toward the breaker as before.
+        detail = str(http_exc.detail)
+        if "malformed tool_call" in detail or "malformed function name" in detail:
+            fail_type = "malformed_tool_call"
+        elif "degenerated" in detail:
+            fail_type = "degeneration"
+        elif "empty content" in detail:
+            fail_type = "empty_content"
+        else:
+            fail_type = "error"
+        logger.warning("Backend %s failed (%s), escalating...", decision.selected_model, fail_type)
         escalation = escalate_on_failure(
             failed_model=decision.selected_model,
             complexity_score=features["complexity_score"],
-            error_type="error",
+            error_type=fail_type,
             requires_tools=requires_tools,
         )
 

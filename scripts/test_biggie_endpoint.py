@@ -96,7 +96,7 @@ models = http_get("/v1/models")
 check("Models endpoint returns list", models.get("object") == "list")
 model_ids = [m["id"] for m in models.get("data", [])]
 check("deepseek-v4-flash:cloud in models", "deepseek-v4-flash:cloud" in model_ids)
-check("glm-5.2:cloud in models", "glm-5.2:cloud" in model_ids)
+check("glm-5.3:cloud in models", "glm-5.3:cloud" in model_ids)
 check("llama3.1:8b in models", "llama3.1:8b" in model_ids)
 check("dolphin3 in models", "dolphin3" in model_ids)
 check("biggie-router NOT in models (self-skip)", "biggie-router" not in model_ids)
@@ -194,7 +194,7 @@ d = route_task(
     context_tokens=240_000,
 )
 check("Session compression falls back to next summariser",
-      d.selected_model in ("glm-5.2", "qwen3.5", "deepseek-v3.1:671b", "gpt-5.5"),
+      d.selected_model in ("glm-5.3", "qwen3.5", "deepseek-v3.1:671b", "gpt-5.5"),
       f"got {d.selected_model}")
 mark_available("deepseek-v4-flash")
 
@@ -278,11 +278,11 @@ d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
 check("TEST6: glm cheaper/available → still gpt-5.5 (most capable tool model)",
       d.selected_model == "gpt-5.5", f"got {d.selected_model}")
 
-# TEST 7: gpt-5.5 unavailable + tools -> falls to next most-capable (glm-5.2)
+# TEST 7: gpt-5.5 unavailable + tools -> falls to next most-capable (glm-5.3)
 mark_rate_limited("gpt-5.5")
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("TEST7: gpt-5.5 unavailable + tools → glm-5.2 (not fail closed)",
-      d.selected_model == "glm-5.2" and not d.all_exhausted,
+check("TEST7: gpt-5.5 unavailable + tools → glm-5.3 (not fail closed)",
+      d.selected_model == "glm-5.3" and not d.all_exhausted,
       f"got {d.selected_model} (all_exhausted={d.all_exhausted})")
 mark_available("gpt-5.5")
 
@@ -504,11 +504,11 @@ check("TEST18: streaming observability columns defined",
       f"columns={list(_STREAM_OBS_COLUMNS)}")
 
 # Verify endpoint-level fail-closed only when NO tool-capable model is available.
-# With gpt-5.5 capped, glm-5.2 is still tool-capable → routes, does not fail closed.
+# With gpt-5.5 capped, glm-5.3 is still tool-capable → routes, does not fail closed.
 mark_rate_limited("gpt-5.5")
 d = route_task(complexity_score=0.1, task_type="coding", requires_tools=True)
-check("Tool routing with gpt-5.5 capped → glm-5.2 (not all_exhausted)",
-      not d.all_exhausted and d.selected_model == "glm-5.2",
+check("Tool routing with gpt-5.5 capped → glm-5.3 (not all_exhausted)",
+      not d.all_exhausted and d.selected_model == "glm-5.3",
       f"got {d.selected_model} (all_exhausted={d.all_exhausted})")
 mark_available("gpt-5.5")
 
@@ -750,10 +750,10 @@ fallback_result = {
     "id": "fallback-test",
     "object": "chat.completion",
     "created": 123,
-    "model": "glm-5.2",
+    "model": "glm-5.3",
     "choices": [{"message": {"role": "assistant", "content": "hello"}}],
 }
-fallback_raw = asyncio.run(_collect_async(_wrap_non_streaming("ollama-cloud", "glm-5.2", fallback_result)))
+fallback_raw = asyncio.run(_collect_async(_wrap_non_streaming("ollama-cloud", "glm-5.3", fallback_result)))
 check("Synthesized SSE fallback emits data events", "data: " in fallback_raw, fallback_raw[:200])
 check("Synthesized SSE fallback emits chunk object", "chat.completion.chunk" in fallback_raw, fallback_raw[:200])
 check("Synthesized SSE fallback ends with DONE", "data: [DONE]" in fallback_raw, fallback_raw[-200:])

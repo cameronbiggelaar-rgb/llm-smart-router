@@ -74,15 +74,16 @@ PRIVATE_CHAT_SCRIPT = str(Path.home() / ".hermes" / "skills" / "security" / "pri
 #
 # Verified 2026-08-10 via direct Ollama Cloud API probe (test_ollama_tools*.py):
 #   - deepseek-v4-flash: emits tool_calls with valid JSON args; continues cleanly
-#   - glm-5.2:            emits tool_calls with valid JSON args; continues cleanly
+#   - glm-5.3:            emits tool_calls with valid JSON args; continues cleanly
 #   - qwen3.5:            emits tool_calls but re-invokes (loop tendency) — NOT added
 # gpt-5.5 remains tool-capable (ChatGPT). These let tool work fall to cheaper
 # ollama-cloud models instead of always gpt-5.5, and avoid failing closed when
 # gpt-5.5 hits its ChatGPT usage cap.
 TOOL_CAPABLE_MODELS = {
-    "gpt-5.5",
-    "deepseek-v4-flash",
-    "glm-5.2",
+ "gpt-5.5",
+ "deepseek-v4-pro", # verified 2026-08-15: emits clean tool_calls + finish_reason (streaming + non-streaming, multi-tool)
+ "deepseek-v4-flash",
+ "glm-5.3",
 }
 
 
@@ -205,6 +206,16 @@ def _log_recovery_event(model: str, event: str, detail: str = "") -> None:
         conn.close()
 
 
+def log_recovery_event(model: str, event: str, detail: str = "") -> None:
+    """Public wrapper around ``_log_recovery_event`` for callers outside router.py.
+
+    Lets the endpoint surface non-failure maintenance signals (e.g. a
+    proactive token-age warning) as durable recovery_log rows without coupling
+    them to a model's breaker state.
+    """
+    _log_recovery_event(model, event, detail)
+
+
 # ── Model registry (backed by persistent state) ───────────────────────────────
 
 # Load persisted states, fall back to defaults for any missing models
@@ -252,6 +263,29 @@ def mark_rate_limited(model: str) -> None:
                    model, cooldown, status.consecutive_failures)
 
 
+def mark_credential_expired(model: str, detail: str = "") -> None:
+    """Record that a backend's credential has expired (HTTP 401 / token expired).
+
+    Unlike a rate limit or an outage, an expired credential will NOT recover on
+    its own — it needs a human to re-authenticate. This is deliberately a soft
+    marker, NOT a circuit breaker: the model stays in rotation (so a fallback /
+    refreshed credential can still serve it), but the incident is written to the
+    recovery_log with an actionable reason so the operator sees a distinct
+    'credential_expired' event instead of a generic 'error' / circuit trip.
+
+    Detail should include the re-auth hint (e.g. 'run: hermes auth add
+    <provider>').
+    """
+    status = _MODEL_STATUSES.get(model)
+    reason = detail or "credential_expired"
+    if status:
+        status.last_error = "auth_expired"
+        _save_model_state(status)
+    _log_recovery_event(model, "credential_expired", reason)
+    logger.warning("Credential for %s expired — human re-auth required: %s",
+                   model, reason)
+
+
 def open_circuit(model: str, error: str = "") -> None:
     """Open the circuit breaker for a model after repeated failures.
 
@@ -266,8 +300,13 @@ def open_circuit(model: str, error: str = "") -> None:
     status.last_error = error or "circuit_open"
 
     _save_model_state(status)
+    # Surface WHY the circuit opened (e.g. '401 token expired', 'connection
+    # reset') in the recovery_log — a bare 'error' reason leaves the operator
+    # guessing whether this was a transient blip or a credential that died.
+    reason = error or "circuit_open"
     _log_recovery_event(model, "circuit_opened",
-                        f"cooldown={CIRCUIT_BREAKER_COOLDOWN}s, failures={status.consecutive_failures}")
+                        f"cooldown={CIRCUIT_BREAKER_COOLDOWN}s, "
+                        f"failures={status.consecutive_failures}, reason={reason}")
     logger.warning("Circuit breaker opened for %s (%ds) — %d consecutive failures",
                    model, CIRCUIT_BREAKER_COOLDOWN, status.consecutive_failures)
 
@@ -696,11 +735,36 @@ def route_task(
     _check_limp_home()
 
     # ── Tool capability gate (dominates all other routing) ──────────────
-    # A request carrying tool schemas must go to a model proven to emit real
-    # structured tool_calls. Reasoning tier / cost classification may pick among
-    # eligible tool-capable models but may never downgrade below this capability.
-    # If no tool-capable backend is available we FAIL CLOSED — we never route a
-    # tool request to a model that would answer with "Tool call: ..." prose.
+    # ── Native Hermes session-compression workload ─────────────────────
+    # Compression requests may carry tool schemas from the parent session even
+    # though the summariser is not expected to call tools. Treat compaction as a
+    # first-class maintenance workload BEFORE the tool-capability gate, otherwise
+    # these huge prompts can still burn gpt-5.5 simply because tools are present.
+    if workload_type == "session_compression" or task_type == "session_compression":
+        selected = _select_session_compression_model(context_tokens=context_tokens)
+        if not selected:
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason="session_compression workload but no summariser model available",
+                fallback_chain=[],
+                all_exhausted=True,
+            )
+        return RoutingDecision(
+            selected_model=selected,
+            selected_provider=_get_provider(selected),
+            reason=(
+                "native session_compression workload — selected cheapest "
+                f"available summariser {selected} (tier {MODEL_CAPABILITY_TIERS.get(selected, 0)}, "
+                f"context≈{context_tokens} tokens)"
+            ),
+            fallback_chain=_build_session_compression_fallback_chain(selected),
+        )
+
+    # A non-compression request carrying tool schemas must go to a model proven
+    # to emit real structured tool_calls. Reasoning tier / cost classification
+    # may pick among eligible tool-capable models but may never downgrade below
+    # this capability. If no tool-capable backend is available we FAIL CLOSED.
     if requires_tools:
         tool_model = _select_tool_capable_model()
         if not tool_model:
@@ -788,32 +852,8 @@ def route_task(
         )
 
     # ── Native Hermes session-compression workload ─────────────────────
-    # A context-compaction prompt is often huge, but that size is a context
-    # requirement, not proof that the task needs the most expensive reasoning
-    # model. Keep it inside the router (health, circuit breakers, fallbacks,
-    # logging), but apply a summarisation-specific policy: prefer the cheapest
-    # cloud summariser at/above tier 3 and escalate through the normal chain on
-    # failure. Avoid local limp-home models unless limp-home is already active.
-    if workload_type == "session_compression" or task_type == "session_compression":
-        selected = _select_session_compression_model(context_tokens=context_tokens)
-        if not selected:
-            return RoutingDecision(
-                selected_model="",
-                selected_provider="",
-                reason="session_compression workload but no summariser model available",
-                fallback_chain=[],
-                all_exhausted=True,
-            )
-        return RoutingDecision(
-            selected_model=selected,
-            selected_provider=_get_provider(selected),
-            reason=(
-                "native session_compression workload — selected cheapest "
-                f"available summariser {selected} (tier {MODEL_CAPABILITY_TIERS.get(selected, 0)}, "
-                f"context≈{context_tokens} tokens)"
-            ),
-            fallback_chain=_build_fallback_chain(selected),
-        )
+    # Handled before the tool-capability gate above because compaction requests
+    # may inherit parent-session tool schemas but do not require tool calls.
 
     # ── Capability-based routing ──
     # Find the cheapest available model that meets the minimum tier
@@ -854,7 +894,7 @@ def _select_tool_capable_model() -> str:
     Tool capability is a hard gate: only models in TOOL_CAPABLE_MODELS qualify.
     Among those we prefer the MOST CAPABLE available (highest tier) so tool work
     keeps the best reasoning quality (gpt-5.5 first), falling back to cheaper
-    tool-capable ollama models (glm-5.2 → deepseek-v4-flash) only when higher
+    tool-capable ollama models (glm-5.3 → deepseek-v4-flash) only when higher
     tiers are unavailable / circuit-broken. Returns "" when none is available.
     """
     available = get_available_models()
@@ -913,15 +953,28 @@ def escalate_on_failure(
 
     if error_type == "rate_limit":
         mark_rate_limited(failed_model_key)
+    elif error_type in ("malformed_tool_call", "empty_content", "degeneration"):
+        # Model-output quality failures: the backend is reachable and healthy,
+        # but the model emitted a malformed tool call or empty content.
+        # Escalate to the next model WITHOUT incrementing the circuit-breaker
+        # failure count — tripping the breaker here would wrongly take a
+        # healthy model out of rotation for 30 minutes over a per-request
+        # output-quality issue. (glm-5.2 leaked inline tool-call syntax into
+        # the name field; that must escalate, not open the circuit.)
+        logger.warning(
+            "Model %s emitted %s — escalating without breaker trip (failures=%d)",
+            failed_model_key, error_type,
+            status.consecutive_failures if status else 0,
+        )
     else:
         if status:
             status.consecutive_failures += 1
             status.last_error = error_type
             _save_model_state(status)
 
-    # Check circuit breaker threshold
-    if status and status.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
-        open_circuit(failed_model_key, error_type)
+        # Check circuit breaker threshold
+        if status and status.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            open_circuit(failed_model_key, error_type)
 
     # Check if we should enter limp-home mode
     _check_limp_home()
@@ -963,7 +1016,7 @@ def escalate_on_failure(
 
     # For tool-required work, if the failed model is the highest-capable tool
     # model, fall DOWN to the next-most-capable available tool model instead of
-    # failing closed — this is what lets gpt-5.5 → glm-5.2 when gpt-5.5 caps.
+    # failing closed — this is what lets gpt-5.5 → glm-5.3 when gpt-5.5 caps.
     if requires_tools:
         best_tier = -1
         best_model = ""
@@ -1256,11 +1309,13 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     # never reference an unregistered model.
     preferred = [
         "deepseek-v4-flash",
-        "glm-5.2",
+        "glm-5.3",
         "qwen3.5",
         "deepseek-v4-pro",
         "deepseek-v3.1:671b",
-        "gpt-5.5",
+        # Deliberately exclude gpt-5.5 from routine compression: 100K-token
+        # summaries burn scarce ChatGPT capacity and triggered Plus usage caps.
+        # Use gpt-5.5 for real reasoning/debugging, not maintenance summarization.
     ]
     if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
         preferred = [m for m in preferred if m != "deepseek-v4-flash"]
@@ -1269,8 +1324,11 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
             return model
 
     # If all preferred summariser models are unavailable, fall back to the
-    # cheapest available tier-3+ model before declaring exhaustion.
+    # cheapest available tier-3+ model before declaring exhaustion. Keep gpt-5.5
+    # out of the automatic compression fallback for the same capacity reason.
     for model in get_available_models():
+        if model == "gpt-5.5":
+            continue
         if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
             return model
     return ""
@@ -1319,6 +1377,16 @@ def _build_fallback_chain(current_model: str) -> List[str]:
         chain.append("llama3.1:8b")
 
     return chain
+
+
+def _build_session_compression_fallback_chain(current_model: str) -> List[str]:
+    """Build session-compression fallbacks while preserving ChatGPT capacity.
+
+    Compression prompts can be 100K+ tokens; do not automatically escalate
+    them to gpt-5.5, because that burns scarce ChatGPT usage on maintenance
+    summarization. Keep gpt-5.5 for ordinary capability/tool routing.
+    """
+    return [m for m in _build_fallback_chain(current_model) if m != "gpt-5.5"]
 
 
 def _get_provider(model: str) -> str:

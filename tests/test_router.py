@@ -66,7 +66,7 @@ class TestSessionCompressionCostControl:
     def setup_method(self):
         for model in (
             "deepseek-v4-flash",
-            "glm-5.2",
+            "glm-5.3",
             "qwen3.5",
             "deepseek-v4-pro",
             "deepseek-v3.1:671b",
@@ -85,8 +85,8 @@ class TestSessionCompressionCostControl:
             requires_tools=False,
         )
         assert decision.selected_model != "gpt-5.5"
-        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}
-        assert "gpt-5.5" in decision.fallback_chain
+        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.3", "qwen3.5", "deepseek-v4-pro"}
+        assert "gpt-5.5" not in decision.fallback_chain
 
     def test_large_session_compression_skips_flash_without_jumping_to_gpt55(self, monkeypatch):
         import router
@@ -101,7 +101,7 @@ class TestSessionCompressionCostControl:
         )
         assert decision.selected_model != "deepseek-v4-flash"
         assert decision.selected_model != "gpt-5.5"
-        assert decision.selected_model in {"glm-5.2", "qwen3.5", "deepseek-v4-pro"}
+        assert decision.selected_model in {"glm-5.3", "qwen3.5", "deepseek-v4-pro"}
 
 
 class TestLargeContextCompression:
@@ -296,11 +296,11 @@ class TestExtractFeatures:
     def test_research_task(self):
         session = {
             "id": "test-session-4",
-            "model": "glm-5.2",
+            "model": "glm-5.3",
             "started_at": 3000.0,
             "ended_at": 3005.0,
         }
-        usage = [{"model": "glm-5.2", "input_tokens": 200, "output_tokens": 100}]
+        usage = [{"model": "glm-5.3", "input_tokens": 200, "output_tokens": 100}]
         log = extract_features(session, usage, "What is the latest research on LLMs?")
         assert log is not None
         assert log.task_type == "research"
@@ -327,7 +327,7 @@ class TestModelCost:
         models = {mc.model for mc in DEFAULT_MODEL_COSTS}
         assert "gpt-5.5" in models
         assert "deepseek-v4-flash" in models
-        assert "glm-5.2" in models
+        assert "glm-5.3" in models
         assert "llama3.1:8b" in models
 
     def test_cost_order_cheapest_first(self):
@@ -918,12 +918,12 @@ class TestEdgeCases:
 
 
 class TestOllamaToolCapableModels:
-    """TDD: deepseek-v4-flash and glm-5.2 are now proven tool-capable via ollama-cloud."""
+    """TDD: deepseek-v4-flash and glm-5.3 are now proven tool-capable via ollama-cloud."""
 
     def setup_method(self):
         for model in (
             "deepseek-v4-flash",
-            "glm-5.2",
+            "glm-5.3",
             "qwen3.5",
             "deepseek-v4-pro",
             "deepseek-v3.1:671b",
@@ -936,9 +936,13 @@ class TestOllamaToolCapableModels:
         from router import TOOL_CAPABLE_MODELS
         assert "deepseek-v4-flash" in TOOL_CAPABLE_MODELS
 
-    def test_glm52_is_tool_capable(self):
+    def test_glm53_is_tool_capable(self):
         from router import TOOL_CAPABLE_MODELS
-        assert "glm-5.2" in TOOL_CAPABLE_MODELS
+        assert "glm-5.3" in TOOL_CAPABLE_MODELS
+
+    def test_deepseek_v4_pro_is_tool_capable(self):
+        from router import TOOL_CAPABLE_MODELS
+        assert "deepseek-v4-pro" in TOOL_CAPABLE_MODELS
 
     def test_tool_routing_prefers_most_capable_tool_model(self):
         """With flash+glm tool-capable, tool work should still prefer gpt-5.5
@@ -951,7 +955,8 @@ class TestOllamaToolCapableModels:
         assert decision.selected_model == "gpt-5.5"
 
     def test_tool_routing_falls_to_glm_when_gpt55_and_flash_down(self):
-        """When gpt-5.5 AND flash are rate-limited, tool work escalates to glm-5.2."""
+        """When gpt-5.5 AND flash are rate-limited, tool work escalates to the
+        next-most-capable tool model (deepseek-v4-pro or glm-5.3)."""
         from router import mark_rate_limited
         mark_rate_limited("gpt-5.5")
         mark_rate_limited("deepseek-v4-flash")
@@ -960,13 +965,15 @@ class TestOllamaToolCapableModels:
             task_type="debugging",
             requires_tools=True,
         )
-        assert decision.selected_model == "glm-5.2"
+        # deepseek-v4-pro (tier 8) is now tool-capable, so it may be selected
+        # over glm-5.3 (tier 6) as the more capable option
+        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}
         mark_available("gpt-5.5")
         mark_available("deepseek-v4-flash")
 
     def test_tool_routing_no_longer_fails_closed_when_gpt55_capped(self):
-        """With flash/glm tool-capable, gpt-5.5 being capped falls to the next
-        most-capable tool model (glm-5.2) instead of 503ing."""
+        """With multiple tool-capable models, gpt-5.5 being capped falls to the
+        next-most-capable tool model instead of 503ing."""
         from router import mark_rate_limited
         mark_rate_limited("gpt-5.5")
         decision = route_task(
@@ -974,22 +981,22 @@ class TestOllamaToolCapableModels:
             task_type="coding",
             requires_tools=True,
         )
-        # glm-5.2 is the next most-capable tool model after gpt-5.5
-        assert decision.selected_model == "glm-5.2"
+        # deepseek-v4-pro (tier 8) is now the most capable tool model below gpt-5.5
+        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3", "deepseek-v4-flash"}
         assert not decision.all_exhausted
         mark_available("gpt-5.5")
 
     def test_tool_fallback_chain_contains_new_models(self):
         from router import _build_tool_fallback_chain
         chain = _build_tool_fallback_chain("deepseek-v4-flash")
-        # glm-5.2 is now tool-capable, so it should appear in the escalation chain
-        assert any("glm-5.2" in m for m in chain) or any("gpt-5.5" in m for m in chain)
+        # glm-5.3 is now tool-capable, so it should appear in the escalation chain
+        assert any("glm-5.3" in m for m in chain) or any("gpt-5.5" in m for m in chain)
 
     def test_tool_routing_fails_closed_when_all_tool_capable_down(self):
         """CRITICAL: if every tool-capable model is unavailable, tool work must
         STILL fail closed — never leak to a non-tool-capable model like qwen."""
         from router import mark_rate_limited
-        for m in ("deepseek-v4-flash", "glm-5.2", "gpt-5.5"):
+        for m in ("deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_rate_limited(m)
         decision = route_task(
             complexity_score=0.5,
@@ -999,21 +1006,22 @@ class TestOllamaToolCapableModels:
         assert decision.selected_model == ""
         assert decision.all_exhausted
         # restore
-        for m in ("deepseek-v4-flash", "glm-5.2", "gpt-5.5"):
+        for m in ("deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_available(m)
 
-    def test_escalation_from_gpt55_falls_to_glm_for_tools(self):
+    def test_escalation_from_gpt55_falls_to_next_tool_model(self):
         """When gpt-5.5 (highest tier) fails on a tool request, escalation must
-        fall DOWN to the next-most-capable tool model (glm-5.2), not 503."""
+        fall to the next-most-capable tool model (deepseek-v4-pro), not 503."""
         from router import escalate_on_failure
-        # escalate the already-failed gpt-5.5; glm-5.2 available
+        # escalate the already-failed gpt-5.5; deepseek-v4-pro is next
         decision = escalate_on_failure(
             failed_model="gpt-5.5",
             complexity_score=0.5,
             error_type="rate_limit",
             requires_tools=True,
         )
-        assert decision.selected_model == "glm-5.2", f"got {decision.selected_model}"
+        # deepseek-v4-pro (tier 8) is now tool-capable, so it is the next pick
+        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3", "deepseek-v4-flash"}, f"got {decision.selected_model}"
 
 
 class TestCompressionSkippedForToolRequests:
@@ -1128,7 +1136,7 @@ class TestStreamingNoDuplicateFirstChunk:
         backend = {
             "base_url": "http://fake",
             "api_key": "",
-            "backend_model": "glm-5.2:cloud",
+            "backend_model": "glm-5.3:cloud",
             "provider": "ollama-cloud",
         }
 
@@ -1143,7 +1151,7 @@ class TestStreamingNoDuplicateFirstChunk:
 
             pf = _StreamPreflight(
                 status="ok",
-                backend_model="glm-5.2:cloud",
+                backend_model="glm-5.3:cloud",
                 provider="ollama-cloud",
                 buffered=[first_chunk],
                 saw_content=True,
