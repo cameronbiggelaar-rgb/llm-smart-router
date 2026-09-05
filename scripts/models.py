@@ -157,6 +157,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "deepseek-v4-pro":    {"provider": "ollama-cloud",  "ratio": 4.0,  "input": 2.00,  "output": 6.00,  "tier": 8, "date": "2026-07-01"},
     "deepseek-v3.1:671b": {"provider": "ollama-cloud",  "ratio": 10.0, "input": 5.00,  "output": 15.00, "tier": 9, "date": "2026-07-01"},
     "gpt-5.5":            {"provider": "openai-codex",  "ratio": 30.0, "input": 15.00, "output": 60.00, "tier": 10,"date": "2026-07-01"},
+    "gpt-5.6-luna":       {"provider": "openai-codex",  "ratio": 32.0, "input": 16.00, "output": 64.00, "tier": 11,"date": "2026-09-05"},
+    "gpt-5.6-terra":      {"provider": "openai-codex",  "ratio": 34.0, "input": 17.00, "output": 68.00, "tier": 12,"date": "2026-09-05"},
+    "gpt-5.6-sol":        {"provider": "openai-codex",  "ratio": 36.0, "input": 18.00, "output": 72.00, "tier": 13,"date": "2026-09-05"},
+    "gpt-6-astra":        {"provider": "openai-codex",  "ratio": 40.0, "input": 20.00, "output": 80.00, "tier": 14,"date": "2026-09-05"},
 }
 
 DEFAULT_MODEL_COSTS: List[ModelCost] = [

@@ -392,7 +392,7 @@ class TestModelCost:
 
     def test_cost_order_cheapest_first(self):
         assert MODEL_COST_ORDER[0] == "llama3.1:8b"
-        assert MODEL_COST_ORDER[-1] == "gpt-5.5"
+        assert MODEL_COST_ORDER[-1] == "gpt-6-astra"
 
     def test_router_log_to_dict(self):
         log = RouterLog(
@@ -991,6 +991,12 @@ class TestOllamaToolCapableModels:
             "llama3.1:8b",
         ):
             mark_available(model)
+        # The gpt-5.6 models are tool-capable and higher-tier than gpt-5.5;
+        # these tests exercise the ollama-cloud tool fallback path, so keep
+        # the 5.6 models out of rotation here.
+        from router import mark_rate_limited
+        for m in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
+            mark_rate_limited(m)
 
     def test_flash_is_tool_capable(self):
         from router import TOOL_CAPABLE_MODELS

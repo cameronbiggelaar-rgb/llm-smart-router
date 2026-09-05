@@ -90,10 +90,20 @@ PRIVATE_CHAT_SCRIPT = str(Path.home() / ".hermes" / "skills" / "security" / "pri
 # gpt-5.5 hits its ChatGPT usage cap.
 TOOL_CAPABLE_MODELS = {
  "gpt-5.5",
+ "gpt-5.6-luna", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
+ "gpt-5.6-terra", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
+ "gpt-5.6-sol", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
  "deepseek-v4-pro", # verified 2026-08-15: emits clean tool_calls + finish_reason (streaming + non-streaming, multi-tool)
  "deepseek-v4-flash",
  "glm-5.3",
 }
+
+# gpt-6-astra is a separate, explicit lane (Lane 2) — reachable ONLY via
+# force_model. It must never appear in automatic routing: not in _select_model,
+# not in fallback chains, not in escalation. This preserves the user's directive
+# to keep the $20/mo ChatGPT capacity for the bigger problems and never let
+# routine work drift onto the strongest model.
+EXCLUDED_FROM_AUTO_ROUTING = {"gpt-6-astra"}
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -1032,6 +1042,8 @@ def escalate_on_failure(
         for model in available:
             if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
                 continue
+            if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+                continue
             tier = MODEL_CAPABILITY_TIERS.get(model, 0)
             if tier > best_tier:
                 best_tier = tier
@@ -1050,6 +1062,9 @@ def escalate_on_failure(
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         # Tool-required escalation must never downgrade below the capability gate
         if requires_tools and _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+            continue
+        # Models reserved for explicit lanes must never be reached by escalation
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
             continue
         if tier > failed_tier:
             return RoutingDecision(
@@ -1296,8 +1311,11 @@ def _estimate_min_tier(
         else:
             min_tier = max(min_tier, 3)
 
-    # Clamp to valid range
-    return max(1, min(min_tier, 10))
+    # Clamp to valid range. Ceiling is 13 (not 10) so the explicit
+    # rethink/rearchitect trigger (tier 13) can reach gpt-5.6-sol. gpt-6-astra
+    # stays at tier 14 and is excluded from auto-routing, so it is never
+    # reached by normal routing — only via force_model.
+    return max(1, min(min_tier, 13))
 
 
 def _select_session_compression_model(context_tokens: int = 0) -> str:
@@ -1366,13 +1384,19 @@ def _select_model(min_tier: int) -> str:
     available = get_available_models()
 
     for model in available:
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+            continue
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         if tier >= min_tier:
             return model
 
     # If nothing meets the tier, return the most capable available
+    # (excluding models reserved for explicit lanes)
     if available:
-        return available[-1]
+        for model in reversed(available):
+            if _normalize_model_name(model) not in EXCLUDED_FROM_AUTO_ROUTING:
+                return model
+        return ""
 
     # Truly nothing available
     return ""
@@ -1388,6 +1412,8 @@ def _build_fallback_chain(current_model: str) -> List[str]:
 
     chain = []
     for model in available:
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+            continue
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         if tier > current_tier:
             chain.append(model)

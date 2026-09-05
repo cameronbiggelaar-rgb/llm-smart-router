@@ -22,7 +22,12 @@
 #   6  = glm-5.3:cloud       (ollama-cloud)
 #   7  = deepseek-v4-pro     (ollama-cloud)
 #   8  = deepseek-v3.1:671b  (ollama-cloud, most expensive cloud)
-#   10 = gpt-5.5             (openai-codex, most capable)
+#   10 = gpt-5.5             (openai-codex)
+#   11 = gpt-5.6-luna        (openai-codex, agentic-coding)
+#   12 = gpt-5.6-terra       (openai-codex, agentic-coding)
+#   13 = gpt-5.6-sol         (openai-codex, agentic-coding, strongest 5.6)
+#   14 = gpt-6-astra         (openai-codex, explicit lane — force_model only,
+#                            never auto-selected)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 routing:
@@ -79,6 +84,14 @@ routing:
   planning:
     default_tier: 7
     sub_types:
+      # Explicit rethink/rearchitect lane — the "bigger problems the lower
+      # models can't solve". Routes deliberate high-stakes asks straight to the
+      # strongest 5.6 model (gpt-5.6-sol, tier 13). Listed FIRST so it wins over
+      # the generic architecture sub-type below (e.g. "rearchitect the system
+      # design" must hit tier 13, not tier 8). Requires the clamp ceiling
+      # raised to 13 (router.py _estimate_min_tier) to actually reach it.
+      - keywords: ["rethink", "rearchitect", "redesign the architecture", "find failure states", "update the plans", "review the architecture"]
+        tier: 13
       - keywords: ["quick plan", "simple design", "brief proposal"]
         tier: 5
       - keywords: ["architecture", "system design", "production", "scalable", "migration"]
