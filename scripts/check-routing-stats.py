@@ -20,6 +20,7 @@ import sys
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Dict
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -164,6 +165,9 @@ def main():
     router_task_types = {}
     corrections = 0
     routing_misses = 0
+    completion_success = 0
+    completion_failures = 0
+    failure_by_type: Dict[str, int] = {}
     try:
         rconn = sqlite3.connect(ROUTER_LOGS)
         rconn.row_factory = sqlite3.Row
@@ -204,6 +208,12 @@ def main():
 
             tt = r["task_type"] or r["workload_type"] or "unknown"
             router_task_types[tt] = router_task_types.get(tt, 0) + 1
+            if r["success"]:
+                completion_success += 1
+            else:
+                completion_failures += 1
+                et = r["error_type"] or "unknown"
+                failure_by_type[et] = failure_by_type.get(et, 0) + 1
             if (r["user_corrected"] if "user_corrected" in r.keys() else 0):
                 corrections += 1
             if r["cheaper_model_would_work"]:
@@ -273,6 +283,14 @@ def main():
             "task_types": task_types,
             "corrections": corrections,
             "routing_misses": routing_misses,
+            "completion": {
+                "success": completion_success,
+                "failures": completion_failures,
+                "success_rate_pct": round(
+                    completion_success / (completion_success + completion_failures) * 100, 2
+                ) if (completion_success + completion_failures) else None,
+                "failure_by_type": failure_by_type,
+            },
         }
         print(json.dumps(report, indent=2))
         return
@@ -344,6 +362,14 @@ def main():
 
     # ── Quality signals ────────────────────────────────────────────────────
     print(f"  ── Quality Signals ──")
+    completed = completion_success + completion_failures
+    if completed:
+        rate = completion_success / completed * 100
+        print(f"  Completion success rate: {rate:.2f}%  ({completion_success} ok / {completion_failures} failed, in-flight streams excluded)")
+        if failure_by_type:
+            print("  Failures by type:")
+            for et, cnt in sorted(failure_by_type.items(), key=lambda x: -x[1]):
+                print(f"    {et:34s} {cnt:6d}")
     print(f"  Corrections detected:  {corrections}")
     if total_calls > 0:
         print(f"  Correction rate:       {corrections / total_calls * 100:.2f}%")
