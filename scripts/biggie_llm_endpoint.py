@@ -103,6 +103,7 @@ _STREAM_OBS_COLUMNS = {
     "saw_content": "INTEGER NOT NULL DEFAULT 0",
     "saw_tool_calls": "INTEGER NOT NULL DEFAULT 0",
     "final_model": "TEXT NOT NULL DEFAULT ''",
+    "routing_reason": "TEXT NOT NULL DEFAULT ''",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -1099,6 +1100,7 @@ def _log_request_to_db(
     saw_content: bool = True,
     saw_tool_calls: bool = False,
     final_model: str = "",
+    routing_reason: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -1120,8 +1122,8 @@ def _log_request_to_db(
                     compression_level, compression_savings_pct, compression_time_ms,
                     request_id, requested_model, streaming, workload_type,
                     requires_tools, context_tokens, empty_stream, saw_content,
-                    saw_tool_calls, final_model
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    saw_tool_calls, final_model, routing_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -1148,6 +1150,7 @@ def _log_request_to_db(
                     1 if saw_content else 0,
                     1 if saw_tool_calls else 0,
                     final_model or model_used,
+                    routing_reason,
                 ),
             )
             db.commit()
@@ -2406,6 +2409,7 @@ async def chat_completions(request: Request):
                 compression_level=compression_stats["level"],
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
+                routing_reason=decision.reason,
                 **_obs,
             )
             _stream_stats: Dict[str, Any] = {"saw_content": False, "saw_tool_calls": False}
@@ -2430,6 +2434,7 @@ async def chat_completions(request: Request):
                     compression_time_ms=compression_stats["compression_time_ms"],
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
+                    routing_reason=decision.reason,
                     **_obs,
                 )
 
@@ -2503,6 +2508,7 @@ async def chat_completions(request: Request):
                 compression_level=compression_stats["level"],
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
+                routing_reason=decision.reason,
                 **_obs,
             )
         return result
@@ -2630,6 +2636,7 @@ async def chat_completions(request: Request):
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     final_model=_stream_stats.get("final_model", escalation.selected_model),
+                    routing_reason=escalation.reason,
                     **_obs,
                 )
 
@@ -2695,6 +2702,7 @@ async def chat_completions(request: Request):
                 compression_level=compression_stats["level"],
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
+                routing_reason=escalation.reason,
             )
         return result
 
