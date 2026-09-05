@@ -130,6 +130,10 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | deepseek-v4-pro | **4.0x** | 8 | Premium tier |
 | deepseek-v3.1:671b | **10.0x** | 9 | Massive 671B MoE |
 | gpt-5.5 | **30.0x** | 10 | ChatGPT $20/mo, most capable, rate-limited |
+| gpt-5.6-luna | **32.0x** | 11 | openai-codex, agentic-coding |
+| gpt-5.6-terra | **34.0x** | 12 | openai-codex, agentic-coding |
+| gpt-5.6-sol | **36.0x** | 13 | openai-codex, agentic-coding |
+| gpt-6-astra | **40.0x** | 14 | openai-codex, **excluded from auto-routing** |
 
 ### Effective compute units per 1M tokens
 | Model | Provider | Input units/1M | Output units/1M |
@@ -145,6 +149,10 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | deepseek-v4-pro | ollama-cloud | 2.00 | 6.00 |
 | deepseek-v3.1:671b | ollama-cloud | 5.00 | 15.00 |
 | gpt-5.5 | openai-codex | 15.00 | 60.00 |
+| gpt-5.6-luna | openai-codex | 16.00 | 64.00 |
+| gpt-5.6-terra | openai-codex | 17.00 | 68.00 |
+| gpt-5.6-sol | openai-codex | 18.00 | 72.00 |
+| gpt-6-astra | openai-codex | 20.00 | 80.00 |
 
 ## Operating the live endpoint
 
@@ -169,6 +177,14 @@ journalctl -u biggie-llm-endpoint.service --since "5 min ago" --no-pager
 - **Malformed tool calls / empty content escalate WITHOUT tripping the breaker:** model-output quality failures (glm-5.2 leaking `skill_view(name='...')` inline syntax into the tool `name` field; empty preflight streams) are classified by the endpoint (`fail_type`) and passed to `escalate_on_failure` as `malformed_tool_call`/`empty_content`. These escalate to the next model but do NOT increment `consecutive_failures` or open the circuit — a reachable-but-sloppy model must not be taken out of rotation for 30 min. Only genuine `error` (provider/availability) or `rate_limit` failures count toward the breaker.
 - **Tool schema forwarding (FIX 2026-08-12):** the OpenAI-compatible proxy paths (non-streaming `proxy_to_backend`, streaming `_preflight_openai_stream`, `_open_fresh_stream`) MUST forward `tools` and `tool_choice` from the incoming request to the backend. Without this, Ollama Cloud models never see tool schemas and emit tool-call syntax as prose instead of structured `tool_calls`. The Codex path already converted via `_responses_tools`; the Ollama Cloud path needs no conversion — standard OpenAI tool format is accepted natively.
 - **Model registration:** edit `MODEL_REGISTRY` in `scripts/models.py` **and** Hermes `config.yaml` together — they must stay in sync.
+
+## Routing tiers, the clamp, and the exclusion design
+
+- **The clamp is the real ceiling, not the routing table.** `_estimate_min_tier` returns `max(1, min(min_tier, 10))` (router.py line 1300) and complexity scoring caps at 10. So **no normal routing path can ever reach tier 11+** — the routing-table floors above 10 are unreachable by ordinary routing. Strong models (5.6, gpt-6) are reached ONLY via `escalate_on_failure` (uses `MODEL_CAPABILITY_TIERS` directly, no clamp) or `force_model`. To let an explicit high-tier trigger (e.g. rethink/rearchitect at tier 13) actually reach a strong model, raise the clamp ceiling (10→13) — gpt-6 stays at 14 so it's still never auto-selected.
+- **A registered model is auto-reachable unless explicitly excluded.** `_build_fallback_chain` and `escalate_on_failure` walk ALL of `MODEL_COST_ORDER`, so any model in `MODEL_REGISTRY` appears in every fallback chain and is reachable via escalation — even one you intended as "explicit trigger only". To keep a model out of auto-routing, add it to `EXCLUDED_FROM_AUTO_ROUTING` (router.py) and filter it out of **all three** auto-routing paths: `_select_model` (main loop AND the `available[-1]` fallback), `_build_fallback_chain`, and `escalate_on_failure` (both the tool-escalation loop and the normal loop). `force_model` (line 855) bypasses these, so the model stays reachable explicitly.
+- **`match_sub_type` returns the FIRST match.** When adding a more-specific/higher-stakes sub-type that overlaps a broader one (e.g. "rethink/rearchitect" vs "system design"), the specific sub-type must be ordered BEFORE the broader one in `routing_table.yaml`, or the broader match wins and the trigger never fires. Test with a prompt that contains the broader keyword (e.g. "rearchitect the system design") to catch the ordering bug.
+- **Adding a model to `MODEL_REGISTRY` breaks tests that hardcode the most-expensive model** (`MODEL_COST_ORDER[-1] == "gpt-5.5"`). Update those assertions to the new top model — the invariant is "cheapest first", not a fixed name.
+- **Adding a model to `TOOL_CAPABLE_MODELS` breaks tool-routing tests that assume the old most-capable tool model.** Tests that `mark_available()` a fixed set and assert the tool fallback path now pick the new higher-tier tool-capable model. Preserve their intent by `mark_rate_limited()`-ing the new tool-capable models in `setup_method`.
 
 ## Pitfalls
 
