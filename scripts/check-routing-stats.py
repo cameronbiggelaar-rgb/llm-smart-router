@@ -32,39 +32,16 @@ SWITCH_DT = datetime(2026, 7, 31, 4, 31, 0, tzinfo=timezone.utc)
 SWITCH_TS = SWITCH_DT.timestamp()
 SWITCH_ISO = SWITCH_DT.isoformat()
 
-# Tier reference
-TIERS = {
-    "llama3.1:8b": 1,
-    "deepseek-v4-flash": 3,
-    "deepseek-v4-flash:cloud": 3,
-    "minimax-m2.7:cloud": 4,
-    "glm-5": 4,
-    "glm-5.1": 5,
-    "glm-5.2": 6,
-    "glm-5.2:cloud": 6,
-    "glm-5.3": 6,
-    "glm-5.3:cloud": 6,
-    "deepseek-v4-pro": 7,
-    "deepseek-v3.1:671b": 8,
-    "gpt-5.5": 10,
-}
+# Tier reference — derived from MODEL_REGISTRY (single source of truth) so
+# newly registered models (gpt-5.6-luna/terra/sol, gpt-6-astra) are measured
+# correctly instead of silently falling back to tier 0 / 1.0x.
+from models import MODEL_REGISTRY  # noqa: E402
 
-# Compute units (relative to deepseek-v4-flash = 1.0)
-COMPUTE_UNITS = {
-    "llama3.1:8b": 0.0,
-    "deepseek-v4-flash": 1.0,
-    "deepseek-v4-flash:cloud": 1.0,
-    "minimax-m2.7:cloud": 2.0,
-    "glm-5": 2.0,
-    "glm-5.1": 2.5,
-    "glm-5.2": 3.0,
-    "glm-5.2:cloud": 3.0,
-    "glm-5.3": 3.0,
-    "glm-5.3:cloud": 3.0,
-    "deepseek-v4-pro": 4.0,
-    "deepseek-v3.1:671b": 10.0,
-    "gpt-5.5": 30.0,
-}
+TIERS = {name: cfg["tier"] for name, cfg in MODEL_REGISTRY.items()}
+
+# Compute units (relative to deepseek-v4-flash = 1.0) — derived from
+# MODEL_REGISTRY ratios.
+COMPUTE_UNITS = {name: cfg["ratio"] for name, cfg in MODEL_REGISTRY.items()}
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
