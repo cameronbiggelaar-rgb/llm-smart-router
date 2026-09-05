@@ -309,7 +309,7 @@ def main():
     for model, data in sorted(model_agg.items(), key=lambda x: -x[1]["calls"]):
         pct = data["calls"] / total_calls * 100 if total_calls > 0 else 0
         cu = COMPUTE_UNITS.get(model, 1.0)
-        print(f"  {model:30s} {TIERS.get(model, 0):<5d} {data['calls']:8d} {pct:5.1f}% {cu:7.1f}x")
+        print(f"  {model:30s} {TIERS.get(model, 0):<5g} {data['calls']:8d} {pct:5.1f}% {cu:7.1f}x")
     print()
 
     # ── Router endpoint observability ──────────────────────────────────────

@@ -58,3 +58,21 @@ def test_no_hardcoded_duplication():
     src = inspect.getsource(crs)
     # The dicts are built from MODEL_REGISTRY, not a literal list of models.
     assert "MODEL_REGISTRY" in src
+
+
+def test_float_tiers_do_not_break_integer_formatting():
+    # glm-5.2 has a fractional tier (6.5) in MODEL_REGISTRY. The model
+    # distribution row prints tiers with a width-5 format; a float tier must
+    # not crash the report (regression: "Unknown format code 'd' for float").
+    import inspect
+
+    src = inspect.getsource(crs)
+    # TIERS is derived (no hardcoded copy); find the distribution print line.
+    dist_line = next(l for l in src.splitlines() if "TIERS.get(model" in l and "print(" in l)
+    # It must render floats: use :g-style, never integer-only :d on a tier.
+    assert "get(model, 0):<5g" in dist_line or "get(model, 0):<6g" in dist_line, (
+        f"model-distribution tier format must accept float tiers, got:\n{dist_line}"
+    )
+    # And the registry really does carry a float that would have crashed :d.
+    assert crs.TIERS["glm-5.2"] == 6.5
+
