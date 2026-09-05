@@ -140,6 +140,7 @@ def main():
     router_selected = {}
     router_requested = {}
     router_task_types = {}
+    router_lanes = {"rethink_rearchitect": 0, "escalation": 0, "force_model": 0, "normal": 0}
     corrections = 0
     routing_misses = 0
     completion_success = 0
@@ -185,6 +186,19 @@ def main():
 
             tt = r["task_type"] or r["workload_type"] or "unknown"
             router_task_types[tt] = router_task_types.get(tt, 0) + 1
+            # Classify which routing lane fired, from the logged routing_reason.
+            reason = (r["routing_reason"] if "routing_reason" in r.keys() else "") or ""
+            model = canonical_model(r["final_model"] or r["model_used"] or "unknown")
+            if "forced model" in reason:
+                router_lanes["force_model"] += 1
+            elif r["escalated"] or "escalation" in reason:
+                router_lanes["escalation"] += 1
+            elif TIERS.get(model, 0) >= 13:
+                # The rethink/rearchitect trigger is the ONLY normal-routing path to
+                # tier 13+ (gpt-5.6-sol); escalation/force are handled above.
+                router_lanes["rethink_rearchitect"] += 1
+            else:
+                router_lanes["normal"] += 1
             if r["success"]:
                 completion_success += 1
             else:
@@ -239,6 +253,7 @@ def main():
                 "abandoned_streams": router_abandoned_streams,
                 "requested_models": router_requested,
                 "selected_models": router_selected,
+                "lanes": router_lanes,
                 "note": (
                     "Direct-vs-routed stats are available only for requests that hit "
                     "the Biggie endpoint. Hermes state.db does not label provider calls "
@@ -316,10 +331,20 @@ def main():
             for model, count in sorted(router_selected.items(), key=lambda x: -x[1])[:8]:
                 pct = count / router_completion_rows * 100 if router_completion_rows else 0
                 print(f"    {model:28s} {count:8d} ({pct:5.1f}%)")
-        print("  Note: Hermes state.db records aggregate model usage, but does not label")
-        print("        calls as direct vs routed. Direct-call stats here only cover calls")
-        print("        that passed through the Biggie endpoint and populated requested_model.")
-    print()
+        print(" Note: Hermes state.db records aggregate model usage, but does not label")
+        print(" calls as direct vs routed. Direct-call stats here only cover calls")
+        print(" that passed through the Biggie endpoint and populated requested_model.")
+        print()
+        print(" Routing Lanes (why a strong model was chosen) ")
+        for lane, count in router_lanes.items():
+            label = {
+                "rethink_rearchitect": "rethink/rearchitect trigger",
+                "escalation": "failure escalation",
+                "force_model": "force_model override",
+                "normal": "normal routing",
+            }[lane]
+            print(f" {label:28s} {count:6d}")
+        print()
 
     # ── Compute savings ────────────────────────────────────────────────────
     print(f"  ── Compute Savings ──")
