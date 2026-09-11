@@ -86,7 +86,7 @@ class TestSessionCompressionCostControl:
             requires_tools=False,
         )
         assert decision.selected_model != "gpt-5.5"
-        assert decision.selected_model in {"deepseek-v4-flash", "glm-5.3", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}
+        assert decision.selected_model in {"deepseek-v4.1-flash", "deepseek-v4-flash", "glm-5.3", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}
         assert "gpt-5.5" not in decision.fallback_chain
 
     def test_large_session_compression_skips_flash_without_jumping_to_gpt55(self, monkeypatch):
@@ -477,8 +477,8 @@ class TestRouterDB:
         mc = get_model_cost("deepseek-v4-flash", conn)
         assert mc is not None
         assert mc.model == "deepseek-v4-flash"
-        assert mc.input_cost_per_1m == 0.50
-        assert mc.output_cost_per_1m == 1.50
+        assert mc.input_cost_per_1m == 0.22
+        assert mc.output_cost_per_1m == 0.66
 
         unknown = get_model_cost("nonexistent-model", conn)
         assert unknown is None
@@ -487,8 +487,8 @@ class TestRouterDB:
     def test_estimate_cost(self, router_db):
         conn = sqlite3.connect(router_db)
         cost = estimate_cost("deepseek-v4-flash", 1_000_000, 500_000, conn)
-        # 1M input * $0.50/1M = $0.50, 500K output * $1.50/1M = $0.75
-        assert cost == pytest.approx(1.25, rel=0.01)
+        # Real USD: 1M input * $0.22/1M = $0.22, 500K output * $0.66/1M = $0.33
+        assert cost == pytest.approx(0.55, rel=0.01)
 
         # Unknown model = free
         cost = estimate_cost("nonexistent", 1000, 500, conn)
