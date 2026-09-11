@@ -1,0 +1,56 @@
+# Experiments — directing production traffic to a candidate model.
+#
+# This file is the ONLY interface needed to test a new model against production.
+# Edit it and the endpoint hot-reloads it (no restart, no code change).
+#
+#   shadow  — production serves the control answer unchanged. The candidate is
+#             ALSO called on the real payload; its cost/latency/quality are
+#             logged and its output discarded. Real load, zero user risk.
+#             Always start here.
+#   split   — `percent` of matching traffic is actually SERVED by the candidate.
+#             This changes what users receive; promote to it only after shadow
+#             evidence looks good.
+#
+# Arm assignment is a stable hash of the session id, so a session never flaps
+# between models mid-conversation.
+#
+# Fields:
+#   name             unique label, recorded on every affected router_logs row
+#   enabled          true/false — false disables without deleting
+#   model            the candidate's registered model name
+#   mode             shadow | split
+#   percent          0-100, honoured for `split`; ignored for `shadow`
+#   match.workload   workload_type values to match ([] = all)
+#   match.min_tier   only apply when the routed tier is at least this
+#
+# NOTE: the candidate must be registered in MODEL_REGISTRY and reachable via a
+# configured backend. An experiment naming an unknown model is skipped, never
+# half-applied.
+
+experiments:
+  # Observational test of glm-5.3-flash on real compression payloads.
+  # Rationale: glm-5.3-flash is priced identically to deepseek-v4.1-flash on
+  # input and cheaper on output, but was measured slower and more verbose in the
+  # offline A/B. Shadow gives real-load numbers before any traffic is moved.
+  - name: glm53flash-compression-shadow
+    enabled: false
+    model: glm-5.3-flash
+    mode: shadow
+    match:
+      workload: [session_compression]
+    notes: >
+      Measure cost/latency/quality of glm-5.3-flash vs the incumbent
+      deepseek-v4.1-flash on production compressions. Output discarded.
+
+  # Deliberate promotion step — moves 10% of compressions onto the candidate.
+  # Keep disabled until shadow evidence supports it.
+  - name: glm53flash-compression-split
+    enabled: false
+    model: glm-5.3-flash
+    mode: split
+    percent: 10
+    match:
+      workload: [session_compression]
+    notes: >
+      Serve 10% of session compression from glm-5.3-flash. Requires shadow
+      evidence and explicit approval before enabling.
