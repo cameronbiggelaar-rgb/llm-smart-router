@@ -1,0 +1,175 @@
+[
+  {
+    "test": "compliance",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "OK",
+    "reasoning": "The user wants me to reply with exactly \"OK\". Just that word, nothing else.",
+    "finish_reason": "stop",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 17,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 21,
+      "total_tokens": 38
+    },
+    "latency_s": 1.21
+  },
+  {
+    "test": "tool_single_nonstream",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "",
+    "reasoning": "",
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_rh2fxokp",
+        "index": 0,
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Melbourne\"}"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 175,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 13,
+      "total_tokens": 188
+    },
+    "latency_s": 0.99
+  },
+  {
+    "test": "tool_single_stream",
+    "model": "glm-5.3-flash",
+    "stream": true,
+    "error": null,
+    "content": "",
+    "reasoning": "The user wants to know the weather in Melbourne right now. I should use the get_weather tool with the city \"Melbourne\".",
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_7inlqu8h",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Melbourne\"}"
+        }
+      }
+    ],
+    "usage": {},
+    "latency_s": 1.81,
+    "served_model": "glm-5.3-flash"
+  },
+  {
+    "test": "tool_multi_stream",
+    "model": "glm-5.3-flash",
+    "stream": true,
+    "error": null,
+    "content": "I'll get the weather for Sydney and add those numbers for you. Since these are independent tasks, I'll make both calls at once:",
+    "reasoning": "The user wants two things: weather for Sydney and to add 17 and 25. These are independent calls, so I should make both in the same block.",
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_gzo0vto4",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Sydney\"}"
+        }
+      },
+      {
+        "id": "call_1v3clw9m",
+        "function": {
+          "name": "add_numbers",
+          "arguments": "{\"a\":17,\"b\":25}"
+        }
+      }
+    ],
+    "usage": {},
+    "latency_s": 1.68,
+    "served_model": "glm-5.3-flash"
+  },
+  {
+    "test": "structured_json",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "{\"status\":\"ok\",\"count\":3,\"items\":[\"a\",\"b\",\"c\"]}",
+    "reasoning": "The user wants me to return ONLY compact JSON with a specific format. This is a simple instruction-following task. They've shown me exactly what they want:\n\n{\"status\":\"ok\",\"count\":3,\"items\":[\"a\",\"b\",\"c\"]}\n\nI should return exactly this JSON with no additional text, no markdown code fences (since they said \"ONLY compact JSON\"), and in compact form (no pretty printing/indentation).\n\nThe answer is straightforward - just output the JSON as requested.",
+    "finish_reason": "stop",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 34,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 117,
+      "total_tokens": 151
+    },
+    "latency_s": 2.36
+  },
+  {
+    "test": "reasoning_arithmetic",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "82.5",
+    "reasoning": "The train travels 240 km in 2.5 hours, then 90 km in 1.5 hours.\n\nTotal distance = 240 + 90 = 330 km\nTotal time = 2.5 + 1.5 = 4 hours\n\nAverage speed = 330/4 = 82.5 km/h",
+    "finish_reason": "stop",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 55,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 73,
+      "total_tokens": 128
+    },
+    "latency_s": 2.02
+  },
+  {
+    "test": "output_budget_64",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "",
+    "reasoning": "The user wants a two-sentence summary of what a SQLite WAL file is. Let me think about what a WAL file is in SQLite.\n\nWAL stands for Write-Ahead Logging. It's an alternative journaling mode to the traditional rollback journal in SQLite. When SQLite operates in WAL mode, changes are first written to",
+    "finish_reason": "length",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 26,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 64,
+      "total_tokens": 90
+    },
+    "latency_s": 1.67
+  },
+  {
+    "test": "context_30k",
+    "model": "glm-5.3-flash",
+    "stream": false,
+    "error": null,
+    "content": "Nothing \u2014 there is no word after the filler. The sequence of numbers ends with **35211**, and the only text following it is the question itself (\"QUESTION: What single word appears immediately after the filler above?\"). No single word appears between the last number and the end of the message.",
+    "reasoning": "The user has provided a long list of numbers and asks: \"What single word appears immediately after the filler above?\"\n\nLooking at the end of the message, it ends with \"...19373 27292 35211\" \u2014 there doesn't seem to be any word after the numbers. The message ends with numbers, no word follows.\n\nWait, let me check the structure. The message starts with numbers and ends with numbers. There's no word appearing after the filler. So the answer is that no word appears \u2014 the filler is followed by nothing (or the question itself follows).\n\nActually, the question text \"QUESTION: What single word appears immediately after the filler above?\" comes after the numbers. But within the numbers themselves, is there a word embedded? Let me think \u2014 perhaps the trick is that among the numbers, there could be a word hidden. But scanning... The numbers are all numeric. The message ends with \"35211\" and then the question.\n\nSo the answer: there is no word after the filler; the filler ends the message (followed only by the question). Possibly the intended answer is that nothing appears after the filler.\n\nI should respond that no word appears immediately after the filler \u2014 the number list ends with 35211, and the only text after it is the question itself.",
+    "finish_reason": "stop",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 45606,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens": 329,
+      "total_tokens": 45935
+    },
+    "latency_s": 6.73
+  }
+]

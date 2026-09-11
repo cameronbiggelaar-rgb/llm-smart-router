@@ -121,6 +121,7 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 |---|---|---|---|
 | llama3.1:8b | 0.0x | 1 | Local, free |
 | dolphin3 | 0.0x | 2 | Local, free |
+| deepseek-v4.1-flash | **0.68x** | 3 | Cheapest rung of the compression ladder (cheaper than v4-flash on input AND output) |
 | deepseek-v4-flash | **1.0x** | 3 | Baseline — small, fast |
 | minimax-m2.7:cloud | **2.0x** | 4 | Mid-size |
 | glm-5 | **2.0x** | 4 | Mid-size |
@@ -140,6 +141,7 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 |---|---|---|---|
 | llama3.1:8b | local | 0.00 | 0.00 |
 | dolphin3 | local | 0.00 | 0.00 |
+| deepseek-v4.1-flash | ollama-cloud | 0.34 | 1.35 |
 | deepseek-v4-flash | ollama-cloud | 0.50 | 1.50 |
 | minimax-m2.7:cloud | ollama-cloud | 1.00 | 3.00 |
 | glm-5 | ollama-cloud | 1.00 | 3.00 |
@@ -177,17 +179,92 @@ journalctl -u biggie-llm-endpoint.service --since "5 min ago" --no-pager
 - **Malformed tool calls / empty content escalate WITHOUT tripping the breaker:** model-output quality failures (glm-5.2 leaking `skill_view(name='...')` inline syntax into the tool `name` field; empty preflight streams) are classified by the endpoint (`fail_type`) and passed to `escalate_on_failure` as `malformed_tool_call`/`empty_content`. These escalate to the next model but do NOT increment `consecutive_failures` or open the circuit — a reachable-but-sloppy model must not be taken out of rotation for 30 min. Only genuine `error` (provider/availability) or `rate_limit` failures count toward the breaker.
 - **Tool schema forwarding (FIX 2026-08-12):** the OpenAI-compatible proxy paths (non-streaming `proxy_to_backend`, streaming `_preflight_openai_stream`, `_open_fresh_stream`) MUST forward `tools` and `tool_choice` from the incoming request to the backend. Without this, Ollama Cloud models never see tool schemas and emit tool-call syntax as prose instead of structured `tool_calls`. The Codex path already converted via `_responses_tools`; the Ollama Cloud path needs no conversion — standard OpenAI tool format is accepted natively.
 - **Model registration:** edit `MODEL_REGISTRY` in `scripts/models.py` **and** Hermes `config.yaml` together — they must stay in sync.
+- **The compression ladder's flash ceiling must match by FAMILY, not by literal name.** `_select_session_compression_model` gates flash out above `FLASH_MAX_CONTEXT_TOKENS` (100K) because flash degenerates on very large contexts. The original filter was `m != "deepseek-v4-flash"` — adding a second flash alias (`deepseek-v4.1-flash`) silently bypassed the ceiling, letting 125K-token jobs land on flash. Filter by family (`_normalize_model_name(m).startswith("deepseek-v4") and .endswith("-flash")`) so every flash alias inherits the ceiling.
+- **That ceiling's stated rationale does NOT hold up (measured 2026-09-12) — see `references/ollama-unit-economics.md`.** The empty-stream bug is **output-budget**-induced, not context-size-induced: a 16K context with `max_tokens=256` fails the same way 173K does, and v4.1-flash served itself 3/3 at 141K `prompt_tokens` with a realistic budget. Production empty-stream rates for v4-flash are **flat** from <20K to 100K (0.17-0.27 pct), which falsifies "degenerates on very large contexts". Before trusting any behavioural gate, check the harness varies the variable it claims to test: the original `flash_ceiling_headtohead.py` logged `prompt_tokens: 14232` at *every* target size because the router compresses requests **before** routing — send `X-Compression-Level: off` to test raw context size.
+- **Adding a ladder rung requires a live restart to take effect.** `models.py`/`router.py` edits do nothing to a running endpoint — the process holds the old registry, so a request for the new model falls through to local `llama3.1:8b`. `sudo systemctl restart biggie-llm-endpoint` and verify in `router_logs.db` that the new model is actually serving.
+- **`discover_backends()` reads only `fallback_chain`/`default_model`, NOT `custom_providers`.** Adding a model to `custom_providers` alone leaves it undiscovered (`v4.1 discovered: False`); it must also appear in `fallback_providers` in `config.yaml`.
+- **You cannot A/B models through the router.** For `task_type=session_compression` the router always overrides the client's requested model with the ladder rung, so every leg returns the same model. A/B must call the provider (`https://ollama.com/v1`) directly — `force_model` is not reachable from the HTTP API.
 
 ## Routing tiers, the clamp, and the exclusion design
 
 - **The clamp is the real ceiling, not the routing table.** `_estimate_min_tier` returns `max(1, min(min_tier, 10))` (router.py line 1300) and complexity scoring caps at 10. So **no normal routing path can ever reach tier 11+** — the routing-table floors above 10 are unreachable by ordinary routing. Strong models (5.6, gpt-6) are reached ONLY via `escalate_on_failure` (uses `MODEL_CAPABILITY_TIERS` directly, no clamp) or `force_model`. To let an explicit high-tier trigger (e.g. rethink/rearchitect at tier 13) actually reach a strong model, raise the clamp ceiling (10→13) — gpt-6 stays at 14 so it's still never auto-selected.
 - **A registered model is auto-reachable unless explicitly excluded.** `_build_fallback_chain` and `escalate_on_failure` walk ALL of `MODEL_COST_ORDER`, so any model in `MODEL_REGISTRY` appears in every fallback chain and is reachable via escalation — even one you intended as "explicit trigger only". To keep a model out of auto-routing, add it to `EXCLUDED_FROM_AUTO_ROUTING` (router.py) and filter it out of **all three** auto-routing paths: `_select_model` (main loop AND the `available[-1]` fallback), `_build_fallback_chain`, and `escalate_on_failure` (both the tool-escalation loop and the normal loop). `force_model` (line 855) bypasses these, so the model stays reachable explicitly.
 - **`match_sub_type` returns the FIRST match.** When adding a more-specific/higher-stakes sub-type that overlaps a broader one (e.g. "rethink/rearchitect" vs "system design"), the specific sub-type must be ordered BEFORE the broader one in `routing_table.yaml`, or the broader match wins and the trigger never fires. Test with a prompt that contains the broader keyword (e.g. "rearchitect the system design") to catch the ordering bug.
+- **`exact_keywords` = full-phrase substrings, not bare words.** A sub-type can carry an `exact_keywords` list (checked in `match_sub_type` alongside `keywords`) for triggers that must only fire on deliberate phrasing. "deep review" lives there (as "perform a deep review" / "do a deep review" / "deep review of the") so incidental mentions like "do a quick deep review of this diff" do NOT hit tier 13. Keep bare-word triggers in `keywords`, phrase-only triggers in `exact_keywords`.
+
+## Firing and verifying the rethink/rearchitect lane
+
+Use `scripts/probe_rethink_lane.py` (`--dry` to preview, default fires + verifies, `--deep` to exercise the "deep review" phrasing, `--count` to read the lane without sending): it POSTs a normal chat-completion whose prompt carries **both** a `planning` keyword and a rethink sub-type keyword (e.g. "rethink the architecture and plan the migration" or "perform a deep review of the system architecture") to `/v1/chat/completions` with model sentinel `biggie-router`. Because the keyword trigger routes through `match_sub_type`, this exercises the **normal-routing** tier-13 path to `gpt-5.6-sol` — distinct from `force_model` (which bypasses routing and would land in the force_model lane). Fire it to prove the lane records and to populate the rethink row for a user's major review.
+
+**Lane-detection pitfall:** the recorded `routing_reason` string does **NOT** contain the literal word "rethink" — it is `"capability tier 13 needed, selected gpt-5.6-sol (tier 13)"`. So detect the rethink lane by **final model == the tier-13 target AND the tier number in the reason AND `escalated == 0` AND not a force_model string**, never by substring-matching "rethink". This matches how `check-routing-stats.py` buckets lanes (a rethink probe that fired correctly must show in the `rethink/rearchitect` count going 0 → 1 in `router_logs.db`, not in escalation or force_model).
 - **Adding a model to `MODEL_REGISTRY` breaks tests that hardcode the most-expensive model** (`MODEL_COST_ORDER[-1] == "gpt-5.5"`). Update those assertions to the new top model — the invariant is "cheapest first", not a fixed name.
 - **Adding a model to `TOOL_CAPABLE_MODELS` breaks tool-routing tests that assume the old most-capable tool model.** Tests that `mark_available()` a fixed set and assert the tool fallback path now pick the new higher-tier tool-capable model. Preserve their intent by `mark_rate_limited()`-ing the new tool-capable models in `setup_method`.
 
+## Driving gpt-6-astra directly with reasoning effort (large reviews)
+
+`force_model` reaches astra but the router's codex proxy hardcodes the request body and does NOT forward a `reasoning` param — so you get NO effort control through the router. To run a heavy/reasoning-guided review on astra, bypass the router and call the codex backend directly:
+
+- **Endpoint:** `POST https://chatgpt.com/backend-api/codex/responses` (NOT `/v1/chat/completions` on the local endpoint, and NOT `/v1/responses`).
+- **Auth:** `Authorization: Bearer <openai-codex access_token>` from `~/.hermes/auth.json` (credential_pool.openai-codex; skip entries with last_status == "exhausted" and last_error_code == 429).
+- **Body:** `{model: ["gpt-6-astra"], input: [{role:"user",content:...}], store:false, stream:true, reasoning:{effort:"low"|"medium"|"high"}}`.
+- **Stream is MANDATORY:** non-stream returns `400 {"detail":"Stream must be set to true"}`. Read SSE `data:` lines; capture `response.output_text.delta` events for text (NOT `response.content_part.done`/`.completed`'s output — deltas are where the words are), and `response.completed`'s `usage` field for token/reasoning stats.
+- **`reasoning.effort` IS accepted:** verified `low` and `high` both return clean output (e.g. "ASTRA_DIRECT_OK").
+- **Probe:** `python3 scripts/probe_astra_direct.py --effort high` (flags: `--stream`, `--effort <low|medium|high>`, `--no-reasoning`).
+
+This is the path for the user's upcoming large review — hand over `probe_astra_direct.py` as the working template (it reads the token from auth.json, so no secrets in the script).
+
+## Self-optimising layer (cost accounting, rollup, experiments)
+
+Full design: `references/self-optimising-router-plan.md`. Modules:
+
+- `scripts/unit_economics.py` — **real USD** per model/call-type/volume, with **versioned** prices (`model_pricing`, `price_for(model, at=...)`) and `Decimal` money. Unpriced ⇒ `None`, never a confident `$0`.
+- `scripts/quality.py` — `fact_coverage_v1`, the *established* A/B scorer promoted to a module. One scorer, not a second opinion.
+- `scripts/rollup.py` — schema migration, `rollup_day`/`rollup_range` → `daily_findings`, `purge_raw` retention, `vacuum_if_needed`.
+- `scripts/traffic_split.py` + `scripts/experiments.yaml` — **directing production traffic to a candidate model**: `mode: shadow` (observe only, incumbent still serves) or `mode: split` with `percent`. Deterministic hash bucketing, sticky per session.
+- `scripts/optimiser.py` — ranks models per workload by **cost per quality point**; emits `candidate_routing.yaml`. **Propose-only.**
+- `scripts/router_ops.py` — CLI: `rollup | report | findings | propose | purge | audit | backfill | maintain`.
+
+```bash
+cd ~/.hermes/skills/llm-smart-router/scripts
+python3 router_ops.py audit --days 30          # logging-health: unpriced rows, quality coverage
+python3 router_ops.py report --days 14         # unit cost per (model, call type)
+python3 router_ops.py backfill --yes           # reconstruct cost for pre-instrumentation rows
+python3 router_ops.py propose --days 14        # write candidate_routing.yaml (never applies)
+python3 router_ops.py purge --retention 30     # dry-run by default; --yes to delete
+python3 router_ops.py maintain                 # what the daily timer runs
+```
+
+### To test a new model against production traffic
+
+Edit `scripts/experiments.yaml` — no code change:
+
+```yaml
+experiments:
+  - name: glm53flash-split
+    enabled: true          # ships disabled
+    model: glm-5.3-flash
+    mode: split            # or: shadow
+    percent: 10            # % of matching sessions
+    match: { workload: [session_compression] }
+```
+
+The endpoint re-reads it within ~30s. The candidate must already be a discovered backend (present in `~/.hermes/config.yaml`), otherwise the request stays on the incumbent and the arm is logged `control` rather than silently reporting treatment outcomes it never served.
+
+- **`shadow`** — incumbent answers the user; candidate is recorded (`is_shadow=1`) for offline scoring. Zero user-visible risk.
+- **`split`** — the percentage of matching sessions genuinely get the candidate. This is the real-load A/B.
+
+### Operating facts (measured on production data)
+
+- Every call is priced inline and written to `router_logs.cost_usd` with `cost_unknown` and `pricing_version`.
+- The optimiser **refuses to propose without quality evidence** (`quality_n` from `daily_findings`). With no measured quality there is no evidence a cheaper model is safe, so nothing is proposed — that is the correct answer, not a bug. Populate quality via `mode: shadow` runs scored with `quality.py`.
+- **Retention refuses to purge any day without a committed rollup** — a crash mid-rollup must never destroy unrolled raw rows. Purge is dry-run unless `--yes`.
+
 ## Pitfalls
 
+- **`cost_unknown` defaults to 1, not 0.** The `router_logs` migration adds `cost_unknown DEFAULT 1` because every pre-existing row has no cost data. Defaulting to 0 would claim 231k legacy rows were "priced at $0" — indistinguishable from free models. Preserve this default when touching the schema.
+- **`estimated_cost_usd` in `router_logs` is dead.** It was never written by the endpoint (all 231k rows were 0.0). Cost now lives in `cost_usd` + `cost_unknown` + `pricing_version`. Do not report spend from `estimated_cost_usd`.
+- **Backfilled costs are reconstructed, not measured.** They carry `pricing_version='backfill:<date>'`; filter `pricing_version LIKE 'backfill%'` to separate them. Rows with no output tokens (streaming) understate output cost — the backfill reports how many.
+- **The optimiser never edits `routing_table.yaml`.** It writes `candidate_routing.yaml` with `applied: false`; promotion is a human edit.
 - **`aiter_lines()` is single-use:** capture the iterator once in preflight and reuse it. Calling it again on the same httpx response returns nothing/empty.
 - **state.db is large (~2GB):** The collector queries with `mode=ro` (read-only) and uses indexed queries. It only reads sessions newer than the last collection timestamp.
 - **Missing model prices:** Unknown models get $0 cost. Add them to `MODEL_REGISTRY` in `models.py` (never edit the derived `DEFAULT_MODEL_COSTS` / `MODEL_COST_ORDER` directly).

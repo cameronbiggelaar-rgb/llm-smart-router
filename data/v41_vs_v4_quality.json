@@ -1,0 +1,22 @@
+{
+  "sid": "20260911_065143_8e021a05",
+  "chars": 89468,
+  "results": {
+    "deepseek-v4-flash:0731": {
+      "ok": true,
+      "fin": "load",
+      "pt": 0,
+      "ct": 0,
+      "lat": 1.5,
+      "content": ""
+    },
+    "deepseek-v4.1-flash": {
+      "ok": true,
+      "fin": "load",
+      "pt": 0,
+      "ct": 0,
+      "lat": 1.9,
+      "content": ""
+    }
+  }
+}
