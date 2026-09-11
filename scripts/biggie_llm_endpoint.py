@@ -73,8 +73,46 @@ from feature_extractor import (
 )
 from compression import compress_messages
 from compression_sampler import capture_compression_sample
+from unit_economics import cost_of_call
+from traffic_split import (
+    Experiment,
+    load_experiments,
+    pick_experiment,
+    select_arm as _select_arm,
+)
 
 logger = logging.getLogger("biggie-llm-endpoint")
+
+# Reasoning-capable summariser models can spend several thousand tokens on their
+# hidden reasoning trace before emitting visible summary content. A low caller
+# budget therefore creates an empty completion even at small context sizes. Give
+# native session-compression requests enough room for reasoning plus the summary;
+# models may still stop earlier, so this is a ceiling rather than reserved spend.
+SESSION_COMPRESSION_MIN_MAX_TOKENS = int(
+    os.environ.get("BIGGIE_SESSION_COMPRESSION_MIN_MAX_TOKENS", "16384")
+)
+
+
+def apply_session_compression_output_floor(
+    body: Dict[str, Any], workload_type: str
+) -> bool:
+    """Ensure native compactions have room to emit content after reasoning.
+
+    Mutates ``body`` and returns whether the value changed. Explicit caller
+    budgets above the floor are preserved.
+    """
+    if workload_type != "session_compression":
+        return False
+    current = body.get("max_tokens")
+    try:
+        current = int(current) if current is not None else None
+    except (TypeError, ValueError):
+        current = None
+    if current is not None and current >= SESSION_COMPRESSION_MIN_MAX_TOKENS:
+        return False
+    body["max_tokens"] = SESSION_COMPRESSION_MIN_MAX_TOKENS
+    return True
+
 
 # ── Cached state ───────────────────────────────────────────────────────────────
 
@@ -106,8 +144,31 @@ _STREAM_OBS_COLUMNS = {
     "routing_reason": "TEXT NOT NULL DEFAULT ''",
 }
 
+# Cost / quality / experiment columns (self-optimising router). Kept identical
+# in intent to rollup.NEW_LOG_COLUMNS so the endpoint's own migration and the
+# offline migrate() agree; rollup.migrate() is the authoritative source.
+_COST_OBS_COLUMNS = {
+    "compression_level": "TEXT NOT NULL DEFAULT ''",
+    "compression_savings_pct": "REAL NOT NULL DEFAULT 0",
+    "compression_time_ms": "REAL NOT NULL DEFAULT 0",
+    "cost_usd": "REAL NOT NULL DEFAULT 0",
+    "cost_unknown": "INTEGER NOT NULL DEFAULT 1",
+    "quality_score": "REAL",
+    "quality_method": "TEXT NOT NULL DEFAULT ''",
+    "pricing_version": "TEXT NOT NULL DEFAULT ''",
+    "experiment": "TEXT NOT NULL DEFAULT ''",
+    "experiment_arm": "TEXT NOT NULL DEFAULT ''",
+    "is_shadow": "INTEGER NOT NULL DEFAULT 0",
+}
+
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
 _CODEX_REAUTH_HINT = "run: hermes auth add openai-codex --type oauth"
+
+# Experiment config (experiments.yaml) is re-read at most this often, so an
+# operator can change traffic split without restarting the service.
+_EXPERIMENTS_TTL = 30.0
+_experiments_cache: Optional[List[Experiment]] = None
+_experiments_cache_time: float = 0.0
 
 
 def _handle_backend_status(
@@ -200,15 +261,130 @@ def _check_codex_token_age() -> None:
 
 
 def _ensure_log_columns(db: Any) -> None:
-    """Add streaming-observability columns to router_logs if missing."""
+    """Add cost/quality/experiment + streaming-observability columns if missing."""
     try:
         existing = {r[1] for r in db.execute("PRAGMA table_info(router_logs)").fetchall()}
-        for col, ddl in _STREAM_OBS_COLUMNS.items():
+        for col, ddl in {**_STREAM_OBS_COLUMNS, **_COST_OBS_COLUMNS}.items():
             if col not in existing:
                 db.execute(f"ALTER TABLE router_logs ADD COLUMN {col} {ddl}")
         db.commit()
     except Exception as e:
         logger.warning("Failed to migrate router_logs columns: %s", e)
+
+
+def compute_cost_fields(
+    model: str,
+    input_tokens: Any,
+    output_tokens: Any,
+    conn: Any = None,
+) -> Tuple[float, int]:
+    """Return ``(cost_usd, cost_unknown)`` for one call.
+
+    ``cost_unknown`` is 1 when the model has no price on record. That flag is
+    the whole point: before this existed every row in router_logs carried
+    ``estimated_cost_usd = 0``, so an unpriced model was indistinguishable from
+    a free one and the spend number was fiction.
+
+    Never raises — cost capture is diagnostic and must not break a request.
+    """
+    try:
+        in_tok = int(input_tokens or 0)
+        out_tok = int(output_tokens or 0)
+    except (TypeError, ValueError):
+        return 0.0, 1
+    if in_tok == 0 and out_tok == 0:
+        return 0.0, 0
+    try:
+        if conn is None:
+            conn = _get_db_connection()
+        amount = cost_of_call(model, in_tok, out_tok, conn=conn)
+    except Exception as e:                                  # pragma: no cover
+        logger.debug("cost_of_call failed for %s: %s", model, e)
+        return 0.0, 1
+    if amount is None:
+        return 0.0, 1
+    return float(amount), 0
+
+
+def _pricing_version() -> str:
+    """Date stamp of the pricing table in force, for auditing a cost figure.
+
+    A cost number is only meaningful alongside the prices that produced it.
+    """
+    try:
+        row = _get_db_connection().execute(
+            "SELECT MAX(effective_from) FROM model_pricing"
+        ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _experiments_cached() -> List[Experiment]:
+    """Load experiments.yaml, cached briefly so config edits are picked up
+    without a restart but not re-read on every request."""
+    global _experiments_cache, _experiments_cache_time
+    now = time.time()
+    if _experiments_cache is not None and (now - _experiments_cache_time) < _EXPERIMENTS_TTL:
+        return _experiments_cache
+    try:
+        _experiments_cache = load_experiments()
+    except Exception as e:                                  # pragma: no cover
+        logger.warning("Failed to load experiments.yaml: %s", e)
+        _experiments_cache = []
+    _experiments_cache_time = now
+    return _experiments_cache
+
+
+def apply_experiment(
+    selected_model: str,
+    experiment: Any,
+    workload_type: str = "",
+    request_id: str = "",
+    session_id: str = "",
+    tier: int = 0,
+) -> Tuple[str, Dict[str, Any]]:
+    """Decide whether an experiment changes who serves this request.
+
+    Returns ``(model_to_serve, observability_fields)``.
+
+    * **split** — the treatment arm genuinely serves the candidate, so the
+      request is the real-load A/B test.
+    * **shadow** — the incumbent still serves the user; the candidate is only
+      recorded for observation. Shadow must never change what the user gets.
+    """
+    obs: Dict[str, Any] = {
+        "experiment": "",
+        "experiment_arm": "",
+        "is_shadow": False,
+        "shadow_model": "",
+    }
+    if experiment is None or not experiment.enabled:
+        return selected_model, obs
+
+    if workload_type and not _experiment_matches(experiment, workload_type, tier):
+        return selected_model, obs
+
+    arm = _select_arm(experiment, request_id=request_id, session_id=session_id)
+    obs["experiment"] = experiment.name
+    obs["experiment_arm"] = "shadow" if experiment.is_shadow else arm
+
+    if experiment.is_shadow:
+        obs["is_shadow"] = True
+        obs["shadow_model"] = experiment.model
+        return selected_model, obs
+
+    if arm == "treatment":
+        return experiment.model, obs
+    return selected_model, obs
+
+
+def _experiment_matches(experiment: Experiment, workload_type: str, tier: int = 0) -> bool:
+    """Re-exported match check so the endpoint and traffic_split agree."""
+    from traffic_split import pick_experiment
+
+    picked = pick_experiment([experiment], workload=workload_type, tier=tier)
+    return picked is not None
 
 
 def _find_abandoned_streams(db: Any, older_than_seconds: int = 300) -> List[str]:
@@ -267,6 +443,21 @@ def _get_db_connection() -> Any:
         _sqlite_conn = sqlite3.connect(str(db_path))
         _ensure_log_columns(_sqlite_conn)
     return _sqlite_conn
+
+
+def _get_sqlite_lock() -> Any:
+    """Return the connection mutex, creating it if the connection was injected.
+
+    Tests replace ``_get_db_connection`` with a fixture connection, which skips
+    the lazy ``_sqlite_lock`` creation above. Without this the logging path
+    raises "'NoneType' object does not support the context manager protocol"
+    and silently drops every row.
+    """
+    global _sqlite_lock
+    if _sqlite_lock is None:
+        import threading
+        _sqlite_lock = threading.Lock()
+    return _sqlite_lock
 
 
 def _invalidate_backends_cache():
@@ -1101,6 +1292,14 @@ def _log_request_to_db(
     saw_tool_calls: bool = False,
     final_model: str = "",
     routing_reason: str = "",
+    cost_usd: float = 0.0,
+    cost_unknown: int = 1,
+    quality_score: Optional[float] = None,
+    quality_method: str = "",
+    pricing_version: str = "",
+    experiment: str = "",
+    experiment_arm: str = "",
+    is_shadow: bool = False,
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -1108,22 +1307,29 @@ def _log_request_to_db(
     Streaming requests are logged at both route-start and completion so the
     router's behaviour on streaming is observable (FIX 3). No prompt bodies or
     secrets are stored.
+
+    ``cost_unknown`` defaults to 1: an un-priced call is recorded as *unknown*,
+    never as a confident zero, so cost rollups can exclude it rather than
+    understate spend.
     """
     try:
         from datetime import datetime, timezone
 
         db = _get_db_connection()
-        with _sqlite_lock:
+        with _get_sqlite_lock():
             db.execute(
                 """INSERT INTO router_logs (
-                    timestamp, session_id, model_used, provider, task_type,
-                    input_tokens, output_tokens, latency_seconds, complexity_score,
-                    success, escalated, error_type,
-                    compression_level, compression_savings_pct, compression_time_ms,
-                    request_id, requested_model, streaming, workload_type,
-                    requires_tools, context_tokens, empty_stream, saw_content,
-                    saw_tool_calls, final_model, routing_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                timestamp, session_id, model_used, provider, task_type,
+                input_tokens, output_tokens, latency_seconds, complexity_score,
+                success, escalated, error_type,
+                compression_level, compression_savings_pct, compression_time_ms,
+                request_id, requested_model, streaming, workload_type,
+                requires_tools, context_tokens, empty_stream, saw_content,
+                saw_tool_calls, final_model, routing_reason,
+                cost_usd, cost_unknown, quality_score, quality_method,
+                pricing_version, experiment, experiment_arm, is_shadow
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -1151,9 +1357,17 @@ def _log_request_to_db(
                     1 if saw_tool_calls else 0,
                     final_model or model_used,
                     routing_reason,
+                    float(cost_usd or 0.0),
+                    1 if cost_unknown else 0,
+                    quality_score,
+                    quality_method,
+                    pricing_version,
+                    experiment,
+                    experiment_arm,
+                    1 if is_shadow else 0,
                 ),
             )
-            db.commit()
+        db.commit()
     except Exception as e:
         logger.warning("Failed to log request to DB: %s", e)
 
@@ -2381,6 +2595,16 @@ async def chat_completions(request: Request):
             "compression_time_ms": 0.0,
         }
 
+    # Session compression is output-budget sensitive: low max_tokens caused
+    # reasoning-only empty completions even at 16K context. Enforce the floor
+    # after any in-request compression so both the initial upstream call and
+    # escalation/fallback attempts inherit it through `body`.
+    if apply_session_compression_output_floor(body, workload_type):
+        logger.info(
+            "Session compression max_tokens floor applied: %s",
+            SESSION_COMPRESSION_MIN_MAX_TOKENS,
+        )
+
     # Proxy to the backend
     _obs = {
         "request_id": request_id,
@@ -2390,6 +2614,48 @@ async def chat_completions(request: Request):
         "requires_tools": requires_tools,
         "context_tokens": features.get("context_tokens", 0),
     }
+
+    # Self-optimising router: optional experiment routes a share of production
+    # to a candidate model, and every call is priced so spend is measured
+    # rather than inferred. Both are observability-first: a shadow experiment
+    # never changes what the user receives.
+    _experiment = pick_experiment(
+        _experiments_cached(),
+        workload=workload_type,
+        tier=MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0),
+    )
+    decision.selected_model, _exp_obs = apply_experiment(
+        decision.selected_model,
+        _experiment,
+        workload_type=workload_type,
+        request_id=request_id,
+    )
+    _obs.update({k: v for k, v in _exp_obs.items() if k != "shadow_model"})
+    if _exp_obs.get("experiment_arm") == "treatment":
+        # The candidate may live under a provider-suffixed backend key.
+        _cand_backend = backends.get(decision.selected_model)
+        if _cand_backend is None:
+            for _suffix in (":cloud", ":local", ":ollama"):
+                if decision.selected_model + _suffix in backends:
+                    _cand_backend = backends[decision.selected_model + _suffix]
+                    decision.selected_model = decision.selected_model + _suffix
+                    break
+        if _cand_backend is not None:
+            backend = _cand_backend
+            logger.info(
+                "Experiment %s: serving %s instead of %s",
+                _exp_obs["experiment"], decision.selected_model,
+                _exp_obs.get("experiment", "?"),
+            )
+        else:
+            # Candidate is not reachable — stay on the incumbent rather than
+            # failing the request. Log the arm as control so the experiment
+            # does not silently report treatment outcomes it never served.
+            logger.warning(
+                "Experiment %s wants %s but no backend is configured; staying on %s",
+                _exp_obs.get("experiment"), decision.selected_model, decision.selected_model,
+            )
+            _obs["experiment_arm"] = "control"
     try:
         if want_stream:
             # Streaming requests are observable too: record the route at start,
@@ -2494,13 +2760,18 @@ async def chat_completions(request: Request):
         llm_time = total_time - routing_time
         # Log the request to DB (skip for streaming — usage comes from stream)
         if not want_stream:
+            _in_tok = _get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" ")
+            _out_tok = _get_usage_tokens(result, "output") or 0
+            _cost, _cost_unknown = compute_cost_fields(
+                decision.selected_model, _in_tok, _out_tok
+            )
             _log_request_to_db(
                 model_used=decision.selected_model,
                 provider=backend.get("provider", ""),
                 task_type=routed_task_type,
                 complexity_score=features["complexity_score"],
-                input_tokens=_get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" "),
-                output_tokens=_get_usage_tokens(result, "output") or 0,
+                input_tokens=_in_tok,
+                output_tokens=_out_tok,
                 latency_seconds=total_time,
                 routing_time_ms=round(routing_time * 1000),
                 success=True,
@@ -2509,6 +2780,9 @@ async def chat_completions(request: Request):
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
                 routing_reason=decision.reason,
+                cost_usd=_cost,
+                cost_unknown=_cost_unknown,
+                pricing_version=_pricing_version(),
                 **_obs,
             )
         return result

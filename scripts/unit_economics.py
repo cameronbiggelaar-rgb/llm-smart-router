@@ -189,6 +189,14 @@ def cost_of_call(
         conn = _default_conn()
     price = price_for(model, at=at, conn=conn)
     if price is None:
+        # A caller-supplied DB may not be seeded yet. Seed once and retry, so
+        # an un-seeded connection reports a real price instead of "unknown".
+        try:
+            seed_prices(conn)
+        except Exception:                                   # pragma: no cover
+            return None
+        price = price_for(model, at=at, conn=conn)
+    if price is None:
         return None
     billable_in = (input_tokens or 0) - (cached_input_tokens or 0)
     if billable_in < 0:
