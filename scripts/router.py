@@ -1206,6 +1206,12 @@ def match_sub_type(task_type: str, prompt: str) -> Optional[int]:
         keywords = sub.get("keywords", [])
         if any(kw in prompt_lower for kw in keywords):
             return sub.get("tier")
+        # exact_keywords are full-phrase substrings (not bare words) — so "deep
+        # review" only fires on deliberate phrasing like "perform a deep review",
+        # not incidental mentions ("do a quick deep review of this diff").
+        exact = sub.get("exact_keywords", [])
+        if any(kw in prompt_lower for kw in exact):
+            return sub.get("tier")
 
     return None
 
@@ -1339,6 +1345,7 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     # MODEL_REGISTRY at import time by _validate_curated_ladder() so it can
     # never reference an unregistered model.
     preferred = [
+        "deepseek-v4.1-flash",
         "deepseek-v4-flash",
         "glm-5.3",
         "glm-5.2",
@@ -1350,7 +1357,14 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
         # Use gpt-5.5 for real reasoning/debugging, not maintenance summarization.
     ]
     if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
-        preferred = [m for m in preferred if m != "deepseek-v4-flash"]
+        # Skip the whole flash family, not just the bare v4-flash tag — the
+        # ceiling guards the empty-stream problem on very large contexts, and
+        # any flash alias shares that serving path until proven otherwise.
+        preferred = [
+            m for m in preferred
+            if not _normalize_model_name(m).startswith("deepseek-v4")
+            or not _normalize_model_name(m).endswith("-flash")
+        ]
     # Enforce per-model context ceilings: skip any model whose ceiling the
     # current context exceeds, escalating to the next rung (glm-5.3 -> glm-5.2).
     preferred = [

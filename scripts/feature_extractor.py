@@ -34,7 +34,7 @@ PLANNING_KEYWORDS = [
     "approach to", "roadmap", "timeline", "milestone", "proposal", "spec",
     "decision", "trade-off", "evaluate options",
     "how should we", "what if we", "consider", "recommend",
-    "system design", "design the", "architect",
+    "system design", "design the", "architect", "deep review",
 ]
 
 RESEARCH_KEYWORDS = [

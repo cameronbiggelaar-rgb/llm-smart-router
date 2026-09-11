@@ -91,6 +91,7 @@ routing:
       # design" must hit tier 13, not tier 8). Requires the clamp ceiling
       # raised to 13 (router.py _estimate_min_tier) to actually reach it.
       - keywords: ["rethink", "rearchitect", "redesign the architecture", "find failure states", "update the plans", "review the architecture"]
+        exact_keywords: ["perform a deep review", "do a deep review", "deep review of the"]
         tier: 13
       - keywords: ["quick plan", "simple design", "brief proposal"]
         tier: 5

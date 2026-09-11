@@ -42,6 +42,8 @@ from biggie_llm_endpoint import (
  _find_abandoned_streams,
  _malformed_tool_call_error,
  _malformed_tool_call_delta_error,
+ apply_session_compression_output_floor,
+ SESSION_COMPRESSION_MIN_MAX_TOKENS,
 )
 
 BASE_URL = os.environ.get("BIGGIE_TEST_BASE_URL", "http://127.0.0.1:8080")
@@ -477,11 +479,12 @@ check("TEST14/15: empty flash escalates to higher tier",
 check("TEST16: escalation does not return to same failed backend",
       d.selected_model != "deepseek-v4-flash", f"got {d.selected_model}")
 
-# TEST 17: large session-compression context moves away from Flash per policy
-# (with FLASH_MAX_CONTEXT_TOKENS set, context_tokens above it bypasses flash)
+# TEST 17: session-compression flash ceiling is disabled when threshold is 0.
+# The historical large-context failures were output-budget induced, not context-size
+# induced, so production should not bypass Flash solely because context is large.
 import router as _router_mod
 _orig_flash_max = _router_mod.FLASH_MAX_CONTEXT_TOKENS
-_router_mod.FLASH_MAX_CONTEXT_TOKENS = 100_000
+_router_mod.FLASH_MAX_CONTEXT_TOKENS = 0
 for m in MODEL_COST_ORDER:
     mark_available(m)
 d = route_task(
@@ -490,10 +493,27 @@ d = route_task(
     workload_type="session_compression",
     context_tokens=240_000,
 )
-check("TEST17: large compression bypasses Flash when threshold set",
-      d.selected_model != "deepseek-v4-flash" and d.selected_model != "",
+check("TEST17: disabled flash ceiling keeps large compression on cheapest Flash",
+      d.selected_model == "deepseek-v4.1-flash",
       f"got {d.selected_model}")
 _router_mod.FLASH_MAX_CONTEXT_TOKENS = _orig_flash_max
+
+# TEST 17b/c/d: native session compression gets an output budget floor.
+body_floor = {"model": "biggie-router", "max_tokens": 256}
+changed = apply_session_compression_output_floor(body_floor, "session_compression")
+check("TEST17b: compression max_tokens below floor is raised",
+      changed and body_floor["max_tokens"] == SESSION_COMPRESSION_MIN_MAX_TOKENS,
+      f"body={body_floor}")
+body_keep = {"model": "biggie-router", "max_tokens": SESSION_COMPRESSION_MIN_MAX_TOKENS + 1024}
+changed = apply_session_compression_output_floor(body_keep, "session_compression")
+check("TEST17c: compression max_tokens above floor is preserved",
+      not changed and body_keep["max_tokens"] == SESSION_COMPRESSION_MIN_MAX_TOKENS + 1024,
+      f"body={body_keep}")
+body_normal = {"model": "biggie-router", "max_tokens": 256}
+changed = apply_session_compression_output_floor(body_normal, "normal_chat")
+check("TEST17d: non-compression max_tokens is untouched",
+      not changed and body_normal["max_tokens"] == 256,
+      f"body={body_normal}")
 
 # TEST 18: streaming observability columns exist in the log schema
 from biggie_llm_endpoint import _STREAM_OBS_COLUMNS

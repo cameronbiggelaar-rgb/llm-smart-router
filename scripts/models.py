@@ -147,7 +147,9 @@ class FitSummary:
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "llama3.1:8b":        {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 1, "date": "2026-07-01"},
     "dolphin3":           {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 2, "date": "2026-07-01"},
-    "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.50,  "output": 1.50,  "tier": 3, "date": "2026-07-01"},
+    "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.47, "input": 0.22,  "output": 0.66,  "tier": 3, "date": "2026-09-12"},
+    "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "tier": 3, "date": "2026-09-12"},
+    "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "tier": 5.5, "date": "2026-09-12"},
     "minimax-m2.7:cloud": {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
     "glm-5":              {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
     "glm-5.1":            {"provider": "ollama-cloud",  "ratio": 2.5,  "input": 1.25,  "output": 3.75,  "tier": 5, "date": "2026-07-01"},

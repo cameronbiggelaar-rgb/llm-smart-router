@@ -99,7 +99,10 @@ def test_migrate_preserves_existing_rows(tmp_path):
     assert row[2] == 250
     # new columns come back with sane defaults
     assert row[3] == 0.0          # cost_usd
-    assert row[4] == 0            # cost_unknown
+    # Pre-instrumentation rows have no recorded price, so they must migrate as
+    # cost_unknown=1. Defaulting to 0 would claim 231k legacy rows were priced
+    # at $0 — the exact fiction this column exists to prevent.
+    assert row[4] == 1            # cost_unknown
     assert row[5] == 0            # is_shadow
     assert row[6] is None         # quality_score NULL == "not measured"
     assert row[7] == ""           # quality_method

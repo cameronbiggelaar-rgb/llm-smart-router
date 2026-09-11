@@ -25,7 +25,7 @@ from typing import Dict, List, Mapping, Optional
 
 NEW_LOG_COLUMNS: Mapping[str, str] = {
     "cost_usd": "REAL NOT NULL DEFAULT 0",
-    "cost_unknown": "INTEGER NOT NULL DEFAULT 0",
+    "cost_unknown": "INTEGER NOT NULL DEFAULT 1",
     "pricing_version": "TEXT NOT NULL DEFAULT ''",
     "experiment": "TEXT NOT NULL DEFAULT ''",
     "experiment_arm": "TEXT NOT NULL DEFAULT ''",
@@ -185,6 +185,11 @@ def _ensure_indexes(conn: sqlite3.Connection) -> None:
 # Raw rows are rolled up into daily_findings, which are ~1 row per
 # (day, workload, model, call_type) — small enough to keep forever. Once a day's
 # rollup is committed, its raw rows become eligible for retention purge.
+
+# Default raw-log retention. At ~10k rows/day this keeps ~300k raw rows; the
+# daily_findings rollup retains the durable history indefinitely, so changing
+# this trades disk against forensic detail, not against reporting.
+DEFAULT_KEEP_DAYS = 30
 
 
 @dataclass(frozen=True)

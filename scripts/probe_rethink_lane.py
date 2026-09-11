@@ -10,6 +10,7 @@ exercises the rethink lane end-to-end. gpt-6-astra stays force_model-only.
 
 Usage:
   python3 probe_rethink_lane.py                 # fire a rethink probe + verify
+  python3 probe_rethink_lane.py --deep         # fire a "deep review" probe + verify
   python3 probe_rethink_lane.py --dry           # show what would be sent, no call
   python3 probe_rethink_lane.py --count         # report rethink lane count in DB
 """
@@ -32,6 +33,12 @@ PROMPT = (
     "Please rethink the whole architecture of this system and plan the migration. "
     "Reply with exactly: RETHINK_OK"
 )
+# "deep review" is also a rethink sub-type keyword (tier 13) — use --deep to
+# exercise that phrasing instead.
+DEEP_PROMPT = (
+    "Perform a deep review of the system architecture and plan the migration. "
+    "Reply with exactly: DEEP_REVIEW_OK"
+)
 
 # Model sentinel = the router itself, so it is NOT treated as a force_model
 # override — capability routing fires normally.
@@ -51,6 +58,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true", help="print payload, no network call")
     ap.add_argument("--count", action="store_true", help="just report rethink-lane count")
+    ap.add_argument("--deep", action="store_true", help="use the 'deep review' prompt")
     args = ap.parse_args()
 
     conn = sqlite3.connect(DB)
@@ -67,7 +75,7 @@ def main():
         "model": MODEL,
         "stream": False,
         "max_tokens": 16,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": DEEP_PROMPT if args.deep else PROMPT}],
     }
     body = json.dumps(payload).encode()
 

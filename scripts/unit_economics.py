@@ -286,3 +286,110 @@ def unit_cost(
             )
         )
     return rows
+
+# cost backfill 
+
+BACKFILL_VERSION_PREFIX = "backfill"
+
+
+def backfill_costs(
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+    batch: int = 20_000,
+) -> dict:
+    """Reconstruct ``cost_usd`` for rows logged before cost capture existed.
+
+    231k historical rows carry ``cost_unknown=1`` and ``cost_usd=0``, but their
+    model names and token counts survive — so the spend is recoverable.
+
+    Two honesty rules make this safe to run:
+
+    * Reconstructed rows are stamped ``pricing_version='backfill:<date>'`` so a
+      recovered figure is never mistaken for a measured one. Reporting can then
+      separate "what we logged" from "what we worked out".
+    * A model with no price on record stays ``cost_unknown=1`` with ``cost_usd=0``.
+      Backfill must never invent a price to make a total look complete.
+
+    Output-token cost is understated for streaming rows (the endpoint did not
+    record ``output_tokens`` for them); ``rows_missing_output_tokens`` reports
+    how many, so the resulting figure carries its own caveat.
+    """
+    from datetime import date
+
+    version = f"{BACKFILL_VERSION_PREFIX}:{date.today().isoformat()}"
+    stats = {
+        "updated": 0,
+        "would_update": 0,
+        "skipped_unpriced": 0,
+        "rows_missing_output_tokens": 0,
+        "pricing_version": version,
+        "dry_run": bool(dry_run),
+    }
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM router_logs WHERE cost_unknown = 1"
+    ).fetchone()[0]
+    stats["rows_missing_output_tokens"] = conn.execute(
+        "SELECT COUNT(*) FROM router_logs WHERE cost_unknown = 1 AND output_tokens = 0"
+    ).fetchone()[0]
+
+    # Resolve each distinct model once: pricing a million rows should not mean
+    # a million price lookups.
+    models = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT model_used FROM router_logs WHERE cost_unknown = 1"
+        ).fetchall()
+    ]
+    priced = {}
+    for m in models:
+        if m == "":
+            continue
+        pr = price_for(m, conn=conn)
+        if pr is not None:
+            priced[m] = pr
+    stats["skipped_unpriced"] = sum(1 for m in models if m not in priced)
+
+    if dry_run:
+        for m, pr in priced.items():
+            n = conn.execute(
+                "SELECT COUNT(*) FROM router_logs WHERE cost_unknown = 1 AND model_used = ?",
+                (m,),
+            ).fetchone()[0]
+            stats["would_update"] += n
+        return stats
+
+    # Batched so a 231k-row rewrite never holds a long write lock.
+    for model, pr in priced.items():
+        while True:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM router_logs WHERE cost_unknown = 1 AND model_used = ? LIMIT ?",
+                    (model, batch),
+                ).fetchall()
+            ]
+            if not ids:
+                break
+            for row_id in ids:
+                in_tok, out_tok = conn.execute(
+                    "SELECT input_tokens, output_tokens FROM router_logs WHERE id = ?",
+                    (row_id,),
+                ).fetchone()
+                amount = (
+                    Decimal(int(in_tok or 0)) / Decimal(1_000_000) * pr.input_usd_per_1m
+                    + Decimal(int(out_tok or 0)) / Decimal(1_000_000) * pr.output_usd_per_1m
+                )
+                conn.execute(
+                    "UPDATE router_logs SET cost_usd = ?, cost_unknown = 0, "
+                    "pricing_version = ? WHERE id = ?",
+                    (float(amount), version, row_id),
+                )
+            conn.commit()
+            stats["updated"] += len(ids)
+
+    stats["unpriced_after"] = conn.execute(
+        "SELECT COUNT(*) FROM router_logs WHERE cost_unknown = 1"
+    ).fetchone()[0]
+    stats["rows_total"] = total
+    return stats
