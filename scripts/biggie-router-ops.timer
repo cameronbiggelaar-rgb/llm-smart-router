@@ -1,0 +1,14 @@
+[Unit]
+Description=Run LLM router daily maintenance
+Documentation=file:/home/hermes/.hermes/skills/llm-smart-router/references/self-optimising-router-plan.md
+
+[Timer]
+# 18:10 AEST — after the working day, so the day's traffic is complete.
+OnCalendar=*-*-* 18:10:00
+# Catch up if the host was asleep/off at the scheduled time.
+Persistent=true
+# Spread load slightly; the job is I/O heavy over a ~100MB SQLite DB.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

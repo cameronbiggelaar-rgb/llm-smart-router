@@ -1,0 +1,32 @@
+[Unit]
+Description=LLM router daily maintenance — rollup, retention, report, propose
+Documentation=file:/home/hermes/.hermes/skills/llm-smart-router/references/self-optimising-router-plan.md
+After=network.target
+
+[Service]
+Type=oneshot
+User=hermes
+WorkingDirectory=/home/hermes/.hermes/skills/llm-smart-router/scripts
+
+# Roll up recent days into daily_findings, purge raw rows beyond retention
+# (refuses any day without a committed rollup), print the unit-cost report and
+# write candidate_routing.yaml.
+#
+# This job PROPOSES; it never edits routing_table.yaml or enables an
+# experiment. Promotion stays a human decision.
+ExecStart=/usr/bin/python3 /home/hermes/.hermes/skills/llm-smart-router/scripts/router_ops.py maintain --days 3 --retention 30
+
+# The daily job is idempotent (rollup_day is delete-then-insert for a day), so
+# a missed run is recovered by the next one rather than double-counted.
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes/skills/llm-smart-router/data
+ReadWritePaths=/home/hermes/.hermes/skills/llm-smart-router/scripts
+
+StandardOutput=append:/home/hermes/.hermes/skills/llm-smart-router/data/router_ops.log
+StandardError=append:/home/hermes/.hermes/skills/llm-smart-router/data/router_ops.log
+
+[Install]
+WantedBy=multi-user.target
