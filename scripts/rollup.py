@@ -16,7 +16,8 @@ Batch isolation note: this file is imported by ``tests/test_rollup_schema.py``,
 from __future__ import annotations
 
 import sqlite3
-from typing import Dict, Mapping
+from dataclasses import dataclass
+from typing import Dict, List, Mapping, Optional
 
 # ── Log columns added to router_logs ──────────────────────────────────────────
 # name -> SQL type/constraint fragment. Kept as an ordered mapping so the
@@ -131,11 +132,26 @@ def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
                 model_used TEXT NOT NULL DEFAULT '',
                 provider TEXT NOT NULL DEFAULT '',
                 task_type TEXT NOT NULL DEFAULT 'other',
+                prompt_length INTEGER NOT NULL DEFAULT 0,
+                context_length INTEGER NOT NULL DEFAULT 0,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                contains_code_blocks INTEGER NOT NULL DEFAULT 0,
+                has_keywords INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 latency_seconds REAL NOT NULL DEFAULT 0,
                 estimated_cost_usd REAL NOT NULL DEFAULT 0,
                 success INTEGER NOT NULL DEFAULT 1,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                escalated INTEGER NOT NULL DEFAULT 0,
+                user_corrected INTEGER NOT NULL DEFAULT 0,
+                error_type TEXT,
+                complexity_score REAL NOT NULL DEFAULT 0.0,
+                is_subagent INTEGER NOT NULL DEFAULT 0,
+                model_switched INTEGER NOT NULL DEFAULT 0,
+                request_id TEXT NOT NULL DEFAULT '',
+                requested_model TEXT NOT NULL DEFAULT '',
+                streaming INTEGER NOT NULL DEFAULT 0,
                 workload_type TEXT NOT NULL DEFAULT ''
             )"""
         )
@@ -162,3 +178,297 @@ def _ensure_indexes(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+
+# ── daily rollup ──────────────────────────────────────────────────────────────
+#
+# Raw rows are rolled up into daily_findings, which are ~1 row per
+# (day, workload, model, call_type) — small enough to keep forever. Once a day's
+# rollup is committed, its raw rows become eligible for retention purge.
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One rolled-up (day, workload, model, call_type) aggregate."""
+
+    day: str
+    workload_type: str
+    model: str
+    call_type: str
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    cost_unknown_calls: int
+    success_calls: int
+    escalated_calls: int
+    latency_p50: float
+    latency_p95: float
+    quality_avg: Optional[float]
+    quality_n: int
+
+
+@dataclass(frozen=True)
+class PurgePlan:
+    """Outcome of a retention purge."""
+
+    keep_days: int
+    cutoff: str
+    candidates: int
+    deleted: int
+    refused: bool = False
+    reason: str = ""
+
+
+def _set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO rollup_state (key, value) VALUES (?, ?)", (key, value)
+    )
+    conn.commit()
+
+
+def _get_state(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM rollup_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def last_rolled_up_day(conn: sqlite3.Connection) -> str:
+    return _get_state(conn, "last_rolled_up_day", "")
+
+
+def last_purged_day(conn: sqlite3.Connection) -> str:
+    return _get_state(conn, "last_purged_day", "")
+
+
+def _percentile(sorted_values: List[float], pct: float) -> float:
+    """Nearest-rank percentile. Deterministic and dependency-free."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    # nearest-rank: ceil(pct/100 * N) clamped to [1, N]
+    import math
+
+    rank = max(1, min(len(sorted_values), math.ceil(pct / 100.0 * len(sorted_values))))
+    return float(sorted_values[rank - 1])
+
+
+def rollup_day(conn: sqlite3.Connection, day: str) -> int:
+    """Aggregate one day's raw rows into ``daily_findings``. Idempotent.
+
+    Implemented as delete-then-insert for the day so late-arriving rows are
+    picked up on a re-run, and so a re-run can never double-count. Returns the
+    number of finding rows written.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            COALESCE(NULLIF(workload_type, ''), 'unknown') AS workload_type,
+            model_used,
+            COALESCE(NULLIF(workload_type, ''), 'unknown') AS call_type,
+            COUNT(*),
+            COALESCE(SUM(input_tokens), 0),
+            COALESCE(SUM(output_tokens), 0),
+            COALESCE(SUM(cost_usd), 0),
+            COALESCE(SUM(cost_unknown), 0),
+            COALESCE(SUM(success), 0),
+            COALESCE(SUM(escalated), 0),
+            AVG(quality_score),
+            COUNT(quality_score)
+        FROM router_logs
+        WHERE substr(timestamp, 1, 10) = substr(?, 1, 10)
+        GROUP BY workload_type, model_used
+        """,
+        (day,),
+    ).fetchall()
+
+    if not rows:
+        # Still record the watermark: the day is legitimately empty, and
+        # refusing to mark it would block retention forever.
+        conn.execute("DELETE FROM daily_findings WHERE day = ?", (day,))
+        conn.commit()
+        _set_state(conn, "last_rolled_up_day", day)
+        return 0
+
+    conn.execute("DELETE FROM daily_findings WHERE day = ?", (day,))
+
+    written = 0
+    for r in rows:
+        (workload_type, model, call_type, calls, in_tok, out_tok, cost,
+         unknown_calls, success_calls, escalated_calls, q_avg, q_n) = r
+        latencies = [
+            float(x[0])
+            for x in conn.execute(
+                "SELECT latency_seconds FROM router_logs "
+                "WHERE substr(timestamp,1,10)=substr(?,1,10) AND model_used=? "
+                "AND COALESCE(NULLIF(workload_type,''),'unknown')=? "
+                "AND latency_seconds > 0 ORDER BY latency_seconds",
+                (day, model, workload_type),
+            )
+        ]
+        conn.execute(
+            "INSERT INTO daily_findings (day, workload_type, model, call_type, calls, "
+            "input_tokens, output_tokens, cost_usd, cost_unknown_calls, success_calls, "
+            "escalated_calls, latency_p50, latency_p95, quality_avg, quality_n) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                day, workload_type, model, call_type, int(calls),
+                int(in_tok), int(out_tok), float(cost), int(unknown_calls),
+                int(success_calls), int(escalated_calls),
+                _percentile(latencies, 50.0), _percentile(latencies, 95.0),
+                float(q_avg) if q_avg is not None else None, int(q_n or 0),
+            ),
+        )
+        written += 1
+
+    conn.commit()
+    _set_state(conn, "last_rolled_up_day", day)
+    return written
+
+
+def rollup_range(conn: sqlite3.Connection, start: str, end: str) -> int:
+    """Roll up every day from ``start`` to ``end`` inclusive."""
+    from datetime import date, timedelta
+
+    def _parse(s: str) -> date:
+        return date.fromisoformat(s[:10])
+
+    d = _parse(start)
+    stop = _parse(end)
+    if d > stop:
+        return 0
+    total = 0
+    while d <= stop:
+        total += rollup_day(conn, d.isoformat())
+        d += timedelta(days=1)
+    return total
+
+
+def findings(conn: sqlite3.Connection, days: int = 7) -> List[Finding]:
+    """Return rolled-up findings for the last ``days`` days."""
+    from datetime import date, timedelta
+
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    out: List[Finding] = []
+    for r in conn.execute(
+        "SELECT day, workload_type, model, call_type, calls, input_tokens, output_tokens, "
+        "cost_usd, cost_unknown_calls, success_calls, escalated_calls, latency_p50, "
+        "latency_p95, quality_avg, quality_n FROM daily_findings "
+        "WHERE day >= ? ORDER BY day DESC, cost_usd DESC",
+        (cutoff,),
+    ):
+        out.append(Finding(*r))
+    return out
+
+
+# ── retention ─────────────────────────────────────────────────────────────────
+
+def purge_raw(
+    conn: sqlite3.Connection,
+    keep_days: int,
+    now: Optional[str] = None,
+    dry_run: bool = True,
+    batch: int = 50_000,
+) -> PurgePlan:
+    """Delete raw ``router_logs`` older than ``keep_days``. Rolled-up days only.
+
+    **Ordering is inviolable: a day is purged only if its rollup is committed.**
+    Deleting raw rows for an un-rolled-up day is irreversible data loss, so this
+    refuses rather than proceeds.
+
+    Deletion is batched so a large DB does not hold a write lock for minutes.
+    ``dry_run=True`` (the default) reports the plan without deleting anything.
+    """
+    from datetime import date, timedelta
+
+    today = (now or date.today().isoformat())[:10]
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+
+    # Days eligible by age...
+    eligible = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT substr(timestamp,1,10) AS d FROM router_logs "
+            "WHERE d < ? ORDER BY d",
+            (cutoff,),
+        )
+    ]
+    # ...intersected with days that actually have committed findings.
+    rolled = {
+        r[0] for r in conn.execute("SELECT DISTINCT day FROM daily_findings")
+    }
+    unrolled = [d for d in eligible if d not in rolled]
+
+    if unrolled:
+        return PurgePlan(
+            keep_days=keep_days,
+            cutoff=cutoff,
+            candidates=len(eligible),
+            deleted=0,
+            refused=True,
+            reason=(
+                f"refusing to purge {len(unrolled)} day(s) with no committed rollup: "
+                + ", ".join(unrolled[:5])
+                + ("..." if len(unrolled) > 5 else "")
+            ),
+        )
+
+    if not eligible:
+        return PurgePlan(keep_days=keep_days, cutoff=cutoff, candidates=0, deleted=0)
+
+    candidate_rows = conn.execute(
+        "SELECT COUNT(*) FROM router_logs WHERE substr(timestamp,1,10) < ?",
+        (cutoff,),
+    ).fetchone()[0]
+
+    if dry_run:
+        return PurgePlan(
+            keep_days=keep_days, cutoff=cutoff,
+            candidates=int(candidate_rows), deleted=0,
+        )
+
+    deleted = 0
+    while deleted < batch:
+        cur = conn.execute(
+            "DELETE FROM router_logs WHERE id IN ("
+            "  SELECT id FROM router_logs WHERE substr(timestamp,1,10) < ? LIMIT ?"
+            ")",
+            (cutoff, batch - deleted),
+        )
+        if cur.rowcount <= 0:
+            break
+        deleted += cur.rowcount
+        conn.commit()
+
+    # Advance the watermark only for days that are now fully gone.
+    remaining = conn.execute(
+        "SELECT MIN(substr(timestamp,1,10)) FROM router_logs "
+        "WHERE substr(timestamp,1,10) < ?",
+        (cutoff,),
+    ).fetchone()[0]
+    purged_through = max(eligible)
+    if remaining is None:
+        _set_state(conn, "last_purged_day", purged_through)
+
+    return PurgePlan(
+        keep_days=keep_days, cutoff=cutoff,
+        candidates=int(candidate_rows), deleted=deleted,
+    )
+
+
+def vacuum_if_needed(conn: sqlite3.Connection, min_free_pages: int = 2000) -> bool:
+    """VACUUM when enough free pages have accumulated. Returns True if it ran.
+
+    Deleting rows frees pages but does not shrink the file; without this the DB
+    stays at its high-water mark forever.
+    """
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    if free is None or free < min_free_pages:
+        return False
+    # VACUUM cannot run inside a transaction.
+    try:
+        conn.commit()
+        conn.execute("VACUUM")
+        return True
+    except sqlite3.Error:
+        return False
