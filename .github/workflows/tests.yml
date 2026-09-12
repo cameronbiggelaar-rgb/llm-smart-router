@@ -1,0 +1,44 @@
+name: tests
+
+# The point of this workflow is to make the local gates unavoidable.
+#
+# Context: on 2026-09-12 a single live enablement of the shadow experiment
+# surfaced four defects, and the new preflight harness found a fifth on its
+# first run. Every one of them lived in the seam between "the unit tests pass"
+# and "the real endpoint works" — production wiring, real schema, real price
+# book. Unit tests that inject a fake connection cannot see that seam, so the
+# suite was green while the production path was broken.
+#
+# These two steps are therefore both required:
+#   * pytest      — unit + contract tests
+#   * preflight   — boots the real endpoint against a throwaway DB and asserts
+#                   end-to-end behaviour (schema, pricing, logging, no silent
+#                   drops). It must never be skipped: it is the only check that
+#                   exercises the code path production actually runs.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pyyaml fastapi httpx uvicorn
+
+      - name: Unit + contract tests
+        working-directory: .
+        run: python -m pytest tests/ -q
+
+      - name: Preflight (real wiring, throwaway DB)
+        run: python scripts/preflight.py

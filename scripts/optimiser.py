@@ -80,6 +80,15 @@ class Proposal:
     applied: bool = False
     generated: str = ""
     notes: str = ""
+    # Why this proposal is empty, recorded as data rather than left to prose.
+    # "no candidate" has three very different meanings and a caller must be able
+    # to tell them apart without string-matching an English sentence:
+    #   workloads_examined == 0  -> no traffic in the window at all
+    #   workloads_unrankable > 0  -> quality is unmeasured, so nothing is eligible
+    #                                and the router CANNOT self-optimise yet
+    #   examined > 0, unrankable == 0 -> ranked, and the incumbent already wins
+    workloads_examined: int = 0
+    workloads_unrankable: int = 0
 
 
 def _window(days: int) -> str:
@@ -185,10 +194,17 @@ def propose(
     )
 
     for workload in _workloads(conn, days):
+        prop.workloads_examined += 1
         ranked = rank_models(
             conn, workload, days=days, quality_floor=quality_floor, min_samples=min_samples
         )
         if not ranked:
+            # Nothing eligible. The usual cause is that quality has never been
+            # measured: eligibility demands a measured quality_avg, so an
+            # unmeasured workload yields no ranking even when it carries heavy
+            # traffic. Record it — silence here is what let the report claim
+            # "incumbent is optimal" from no evidence at all.
+            prop.workloads_unrankable += 1
             continue
 
         # Incumbent = the model actually taking the most traffic. Deterministic
@@ -305,14 +321,46 @@ def write_candidate(prop: Proposal, path: str) -> None:
 
 
 def format_proposal(prop: Proposal) -> str:
-    """Human-readable rendering for reports and CLI output."""
+    """Human-readable rendering for reports and CLI output.
+
+    The empty case must not overstate. "No candidate" has three meanings and
+    they call for different actions from the reader:
+
+      * nothing measured -> the router CANNOT self-optimise yet; fix
+        measurement. Reporting "incumbent is optimal" here is false: the
+        optimiser never ranked anything, so it has no basis to call the
+        incumbent optimal. (This was the live behaviour, with 0 of 235,000+
+        rows carrying a measured quality score.)
+      * ranked, incumbent already cheapest -> genuinely optimal, stop looking.
+      * no traffic in the window -> nothing to optimise.
+    """
     lines = [
         f"Routing proposal (last {prop.days}d, quality floor {prop.quality_floor}, "
         f"min {prop.min_samples} calls) — NOT APPLIED",
         "",
     ]
     if not prop.candidates:
-        lines.append("  No cheaper qualified routing identified — incumbent is optimal.")
+        if prop.workloads_examined == 0:
+            lines.append(" No traffic in the window — nothing to optimise.")
+        elif prop.workloads_unrankable >= prop.workloads_examined:
+            lines.append(
+                f" No model has measured quality, so nothing is eligible to be "
+                f"ranked — checked {prop.workloads_examined} workload(s)."
+            )
+            lines.append(
+                " The router therefore CANNOT self-optimise yet: quality is "
+                "unmeasured on every call, and ranking without it would be "
+                "guessing. Enabling quality scoring is the prerequisite."
+            )
+        elif prop.workloads_unrankable:
+            lines.append(
+                f" No cheaper qualified routing identified — incumbent is "
+                f"optimal for {prop.workloads_examined - prop.workloads_unrankable} "
+                f"ranked workload(s); {prop.workloads_unrankable} workload(s) "
+                f"could not be ranked for lack of measured quality."
+            )
+        else:
+            lines.append(" No cheaper qualified routing identified — incumbent is optimal.")
         return "\n".join(lines)
     for c in prop.candidates:
         lines.append(f"  [{c.workload}] {c.incumbent_model} -> {c.recommended_model}")
