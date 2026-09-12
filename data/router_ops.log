@@ -1,0 +1,44 @@
+Rolling up 3 day(s) ending 2026-09-12:
+  2026-09-10 rolled up (10 model/workload rows)
+  2026-09-11 rolled up (22 model/workload rows)
+  2026-09-12 rolled up (4 model/workload rows)
+
+Deleted 0 of 32 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-13)
+REFUSED: refusing to purge 32 day(s) with no committed rollup: 2026-05-14, 2026-05-16, 2026-05-17, 2026-05-18, 2026-05-19...
+VACUUM: not needed
+
+Unit cost — since 2026-09-09
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-flash:cloud    session_compression     19200       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  session_compression      6981       0.00    0.00000      n/a
+glm-5.3:cloud              session_compression      4597       0.00    0.00000      n/a
+glm-5.2:cloud              session_compression      2923       0.00    0.00000      n/a
+gpt-5.5                    session_compression       679       0.00    0.00000      n/a
+deepseek-v4-pro            session_compression       213       0.00    0.00000      n/a
+gpt-5.6-sol                session_compression       133       0.00    0.00000      n/a
+glm-5.3:cloud              normal_chat                62       0.00    0.00000      n/a
+gpt-5.5                    normal_chat                53       0.00    0.00000      n/a
+deepseek-v4-pro            normal_chat                43       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                27       0.00    0.00000      n/a
+glm-5.2:cloud              normal_chat                16       0.00    0.00000      n/a
+qwen3.5                    normal_chat                15       0.00    0.00000      n/a
+gpt-5.6-luna               normal_chat                11       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  normal_chat                10       0.00    0.00000      n/a
+qwen3.5                    session_compression        10       0.00    0.00000      n/a
+llama3.1:8b                session_compression         8       0.00    0.00000      n/a
+gpt-5.6-terra              normal_chat                 4       0.00    0.00000      n/a
+dolphin3                   normal_chat                 3       0.00    0.00000      n/a
+gpt-5.6-sol                normal_chat                 3       0.00    0.00000      n/a
+deepseek-v4-flash:cloud    normal_chat                 2       0.00    0.00000      n/a
+glm-5.3-flash              normal_chat                 2       0.00    0.00000      n/a
+gpt-5.6-terra              session_compression         1       0.00    0.00000      n/a
+gpt-6-astra                normal_chat                 1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              34997       0.00
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+  No cheaper qualified routing identified — incumbent is optimal.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)

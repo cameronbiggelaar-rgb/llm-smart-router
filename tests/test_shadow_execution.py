@@ -18,8 +18,10 @@ the production spend figure is overstated.
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -340,7 +342,159 @@ def test_experiment_declares_optional_provider():
     assert e2.provider == "ollama-cloud"
 
 
+# ── pricing must be seeded, or cost evidence never accrues ───────────────────
+
+
+def test_endpoint_connection_seeds_model_pricing():
+    """A connection created by the endpoint must be able to price a call.
+
+    Otherwise every row logs cost_unknown=1 forever — including shadow rows,
+    which exist precisely to produce cost evidence about a candidate.
+    """
+    import biggie_llm_endpoint as ep
+
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "seed.db")
+    c = sqlite3.connect(db)
+    rollup.migrate(c)
+    c.close()
+
+    saved = (ep._sqlite_conn, ep._sqlite_lock)
+    try:
+        ep._sqlite_conn = None
+        ep._sqlite_lock = None
+        real_connect = sqlite3.connect
+        sqlite3.connect = lambda *a, **k: real_connect(db)
+        try:
+            conn2 = ep._get_db_connection()
+        finally:
+            sqlite3.connect = real_connect
+
+        priced = conn2.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0]
+        assert priced > 0, "endpoint must seed model_pricing on first connection"
+    finally:
+        ep._sqlite_conn, ep._sqlite_lock = saved
+
+
 # ── migrated must mean writable ───────────────────────────────────────────────
+
+# ── four bugs found against live traffic ─────────────────────────────────────
+
+
+def test_shadow_does_not_stamp_the_production_row(monkeypatch):
+    """The incumbent row is NOT a shadow observation.
+
+    Live bug: apply_experiment set is_shadow=True for shadow mode, and the
+    endpoint copies those fields onto the row it logs for the incumbent's real
+    call. A genuine 3.07s production call got stamped is_shadow=1, which both
+    inflates the shadow bucket and removes real spend from production totals.
+    """
+    exp = _exp()
+    served, obs = ep.apply_experiment(
+        "deepseek-v4.1-flash:cloud", exp,
+        workload_type="session_compression", request_id="r1",
+    )
+    assert served == "deepseek-v4.1-flash:cloud"
+    assert obs["experiment_arm"] == "shadow"
+    assert obs["is_shadow"] is False, "the incumbent's row is not a shadow call"
+
+
+def test_shadow_row_keeps_the_real_workload_so_it_can_be_compared(monkeypatch):
+    """Shadow evidence must land in the same workload bucket as the incumbent,
+    otherwise incumbent-vs-candidate comparison is impossible. Separation is by
+    is_shadow, not by inventing a 'shadow' workload."""
+
+    async def fake_proxy(backend, messages, body):
+        return {"choices": [{"message": {"content": "summary"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+    monkeypatch.setattr(ep, "proxy_to_backend", fake_proxy)
+    rows = []
+    asyncio.run(ep.run_shadow_experiment(
+        _exp(), backend={"provider": "ollama-cloud", "base_url": "http://x"},
+        messages=[{"role": "user", "content": "long text"}],
+        request_body={"stream": False}, request_id="r1",
+        incumbent_model="deepseek-v4.1-flash:cloud",
+        workload_type="session_compression", on_row=rows.append,
+    ))
+    assert rows[0]["workload_type"] == "session_compression"
+    assert rows[0]["is_shadow"] is True
+
+
+def test_shadow_tool_call_is_a_response_not_a_failure(monkeypatch):
+    """A candidate that answers with tool_calls has responded.
+
+    Live bug: real compression payloads carry tools, so glm-5.3-flash answered
+    finish_reason='tool_calls' with empty content, and the executor recorded
+    success=0 / error='shadow_empty'. That is wrong twice over: it calls a
+    well-formed response a failure, and it hides WHY there is no scoreable
+    summary.
+    """
+
+    async def fake_proxy(backend, messages, body):
+        return {"choices": [{"message": {"tool_calls": [{"id": "c1"}]}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
+
+    monkeypatch.setattr(ep, "proxy_to_backend", fake_proxy)
+    rows = []
+    asyncio.run(ep.run_shadow_experiment(
+        _exp(), backend={"provider": "ollama-cloud", "base_url": "http://x"},
+        messages=[{"role": "user", "content": "long text"}],
+        request_body={"stream": False}, request_id="r1", on_row=rows.append,
+    ))
+    row = rows[0]
+    assert row["success"] is True, "a tool_calls response is a response"
+    assert row["saw_tool_calls"] is True
+    assert row["quality_score"] is None, "no summary means nothing to score"
+
+
+def test_unit_cost_excludes_shadow_spend_by_default():
+    """Shadow calls cost real money but are not production spend. A report that
+    adds them together overstates what the router actually spends serving.
+    """
+    tmp = tempfile.mkdtemp()
+    c = sqlite3.connect(os.path.join(tmp, "uc.db"))
+    rollup.migrate(c)
+    for shadow in (0, 1):
+        c.execute(
+            "INSERT INTO router_logs (timestamp, model_used, workload_type, is_shadow, "
+            "cost_usd, cost_unknown, input_tokens, output_tokens, latency_seconds, success) "
+            "VALUES ('2026-09-01T00:00:00', 'm', 'session_compression', ?, 1.0, 0, 10, 5, 1.0, 1)",
+            (shadow,),
+        )
+    c.commit()
+
+    import unit_economics
+
+    prod = unit_economics.unit_cost(c, since="2026-09-01")
+    assert sum(r.cost_usd for r in prod) == 1.0, "production must exclude shadow spend"
+    both = unit_economics.unit_cost(c, since="2026-09-01", include_shadow=True)
+    assert sum(r.cost_usd for r in both) == 2.0
+
+
+def test_optimiser_ignores_unpromoted_shadow_evidence():
+    """Ranking production routing must not treat an un-promoted candidate's
+    shadow rows as if they were serving production traffic."""
+    tmp = tempfile.mkdtemp()
+    c = sqlite3.connect(os.path.join(tmp, "opt.db"))
+    rollup.migrate(c)
+    # A model that only ever ran as a shadow candidate, and one that serves.
+    for model, shadow in (("serving", 0), ("cand", 1)):
+        c.execute(
+            "INSERT INTO daily_findings (day, workload_type, model, call_type, calls, "
+            "cost_usd, quality_avg, quality_n, is_shadow) VALUES "
+            "('2026-09-01','session_compression',?,'session_compression',100,1.0,0.9,100,?)",
+            (model, shadow),
+        )
+    c.commit()
+
+    import optimiser
+
+    default = optimiser.rank_models(c, "session_compression", days=30)
+    assert [r.model for r in default] == ["serving"], "shadow-only model must not rank"
+    both = optimiser.rank_models(c, "session_compression", days=30, include_shadow=True)
+    assert sorted(r.model for r in both) == ["cand", "serving"]
+
 
 def test_migrated_db_accepts_the_endpoints_insert(conn, monkeypatch):
     """A DB that has only ever been through rollup.migrate() must accept the

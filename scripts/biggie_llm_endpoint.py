@@ -74,7 +74,7 @@ from feature_extractor import (
 )
 from compression import compress_messages
 from compression_sampler import capture_compression_sample
-from unit_economics import cost_of_call
+from unit_economics import cost_of_call, seed_prices
 from traffic_split import (
     Experiment,
     load_experiments,
@@ -160,6 +160,7 @@ _COST_OBS_COLUMNS = {
     "experiment": "TEXT NOT NULL DEFAULT ''",
     "experiment_arm": "TEXT NOT NULL DEFAULT ''",
     "is_shadow": "INTEGER NOT NULL DEFAULT 0",
+    "finish_reason": "TEXT NOT NULL DEFAULT ''",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -371,7 +372,12 @@ def apply_experiment(
     obs["experiment_arm"] = "shadow" if experiment.is_shadow else arm
 
     if experiment.is_shadow:
-        obs["is_shadow"] = True
+        # NOTE: is_shadow stays False here on purpose. This row records the
+        # INCUMBENT's real production call, which is not a shadow observation;
+        # the candidate's own call is logged separately by
+        # run_shadow_experiment(). Setting it here put genuine production
+        # calls into the shadow bucket (and hid real spend from production
+        # totals) once this was wired to live traffic.
         obs["shadow_model"] = experiment.model
         return selected_model, obs
 
@@ -470,6 +476,7 @@ async def run_shadow_experiment(
     request_id: str = "",
     session_id: str = "",
     incumbent_model: str = "",
+    workload_type: str = "",
     on_row: Any = None,
     conn: Any = None,
 ) -> None:
@@ -515,6 +522,8 @@ async def run_shadow_experiment(
     in_tok = out_tok = 0
     success = True
     error_type = ""
+    finish_reason = ""
+    saw_tool_calls = False
 
     async with sem:
         try:
@@ -529,9 +538,23 @@ async def run_shadow_experiment(
                 choice = (((result or {}).get("choices") or [{}])[0] or {})
                 msg = choice.get("message") or {}
                 content = str(msg.get("content") or "")
+                finish_reason = str(choice.get("finish_reason") or "")
+                saw_tool_calls = bool(msg.get("tool_calls"))
                 if not content:
-                    success = False
-                    error_type = "shadow_empty"
+                    # An empty completion is only a FAILURE when the model
+                    # genuinely produced nothing. A model that answered with
+                    # tool_calls (common on real compression payloads, which
+                    # carry tools) or that hit a length stop has responded —
+                    # there is simply no summary text to score. Calling that a
+                    # failure misreports the candidate, and hides the reason
+                    # quality is unmeasurable.
+                    if saw_tool_calls:
+                        error_type = ""
+                    elif finish_reason == "length":
+                        error_type = "shadow_no_content_length"
+                    else:
+                        success = False
+                        error_type = "shadow_empty"
             except Exception:
                 success = False
                 error_type = "shadow_unparseable"
@@ -578,10 +601,15 @@ async def run_shadow_experiment(
         "success": success,
         "escalated": False,
         "error_type": error_type,
+        "finish_reason": finish_reason,
+        "saw_tool_calls": saw_tool_calls,
         "request_id": request_id,
         "requested_model": incumbent_model,
         "streaming": False,
-        "workload_type": "shadow",
+        # The candidate runs the SAME workload as the incumbent, so its row
+        # lands in the same bucket and can be compared against it. Shadow
+        # rows are separated by is_shadow, not by a synthetic workload name.
+        "workload_type": workload_type or "shadow",
         "final_model": candidate_model,
         "routing_reason": f"shadow:{experiment.name}",
         "cost_usd": cost_usd,
@@ -665,6 +693,15 @@ def _get_db_connection() -> Any:
         db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
         _sqlite_conn = sqlite3.connect(str(db_path))
         _ensure_log_columns(_sqlite_conn)
+        # Seed the price book here, not just in the offline CLI. Without it
+        # model_pricing stays empty and every row this process writes logs
+        # cost_unknown=1 forever — so an experiment could run for days and
+        # produce no cost evidence at all, which is the one thing it exists
+        # to produce. Idempotent, and it never overwrites an existing price.
+        try:
+            seed_prices(_sqlite_conn)
+        except Exception as e:                                  # pragma: no cover
+            logger.warning("Failed to seed model_pricing: %s", e)
     return _sqlite_conn
 
 
@@ -1523,6 +1560,7 @@ def _log_request_to_db(
     experiment: str = "",
     experiment_arm: str = "",
     is_shadow: bool = False,
+    finish_reason: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -1550,9 +1588,9 @@ def _log_request_to_db(
                 requires_tools, context_tokens, empty_stream, saw_content,
                 saw_tool_calls, final_model, routing_reason,
                 cost_usd, cost_unknown, quality_score, quality_method,
-                pricing_version, experiment, experiment_arm, is_shadow
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pricing_version, experiment, experiment_arm, is_shadow, finish_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -1588,8 +1626,9 @@ def _log_request_to_db(
                     experiment,
                     experiment_arm,
                     1 if is_shadow else 0,
-                ),
-            )
+                    finish_reason,
+                    ),
+                    )
         db.commit()
     except Exception as e:
         logger.warning("Failed to log request to DB: %s", e)
@@ -2895,7 +2934,8 @@ async def chat_completions(request: Request):
                     request_id=request_id,
                     session_id=features.get("session_id", ""),
                     incumbent_model=decision.selected_model,
-                )
+                    workload_type=workload_type,
+                    )
             )
         except RuntimeError:                                # pragma: no cover
             # No running loop — shadow is strictly best-effort and must never

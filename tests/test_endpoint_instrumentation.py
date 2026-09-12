@@ -112,14 +112,21 @@ def test_experiment_hook_split_serves_candidate(conn):
 
 
 def test_experiment_hook_shadow_keeps_incumbent_visible(conn):
-    """Shadow must NOT change what the user gets — only what we observe."""
+    """Shadow must NOT change what the user gets — only what we observe.
+
+    ``is_shadow`` must stay False on THIS row: it describes the incumbent's
+    real production call. The candidate's own call is logged separately by
+    ``run_shadow_experiment``. Stamping it here moved genuine production calls
+    (and their spend) into the shadow bucket.
+    """
     served, obs = ep.apply_experiment(
         "incumbent", _exp(mode="shadow", percent=0),
         workload_type="session_compression", request_id="r1",
     )
     assert served == "incumbent"
     assert obs["experiment_arm"] == "shadow"
-    assert obs["is_shadow"] is True
+    assert obs["is_shadow"] is False
+    assert obs["shadow_model"] == "candidate"
 
 
 def test_experiment_hook_shadow_records_candidate_for_observation(conn):

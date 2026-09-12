@@ -32,6 +32,7 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     "is_shadow": "INTEGER NOT NULL DEFAULT 0",
     "quality_score": "REAL",
     "quality_method": "TEXT NOT NULL DEFAULT ''",
+    "finish_reason": "TEXT NOT NULL DEFAULT ''",
 }
 
 # ── New tables ────────────────────────────────────────────────────────────────
@@ -237,7 +238,8 @@ def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
                 saw_content INTEGER NOT NULL DEFAULT 0,
                 saw_tool_calls INTEGER NOT NULL DEFAULT 0,
                 final_model TEXT NOT NULL DEFAULT '',
-                routing_reason TEXT NOT NULL DEFAULT ''
+                routing_reason TEXT NOT NULL DEFAULT '',
+                finish_reason TEXT NOT NULL DEFAULT ''
             )"""
         )
 

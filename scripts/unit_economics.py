@@ -224,7 +224,10 @@ def _default_conn() -> sqlite3.Connection:
 
 
 def unit_cost(
-    conn: sqlite3.Connection, since: str, until: Optional[str] = None
+    conn: sqlite3.Connection,
+    since: str,
+    until: Optional[str] = None,
+    include_shadow: bool = False,
 ) -> List[UnitCostRow]:
     """Aggregate cost, volume and quality per (model, call_type) in a window.
 
@@ -232,6 +235,11 @@ def unit_cost(
     session_compression, ...). Timestamps are ISO strings, compared on the date
     portion so a window of ``since='2026-09-01', until='2026-09-02'`` covers
     exactly that one day.
+
+    Shadow rows are excluded by default. A shadow call spends real money, but
+    it is experiment spend rather than what the router spends to serve
+    production — adding the two reports a cost the router never incurred for
+    the work it did. Pass ``include_shadow=True`` for total experiment spend.
     """
     sql = """
         SELECT
@@ -249,6 +257,8 @@ def unit_cost(
         WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
     """
     params: List[Any] = [since]
+    if not include_shadow:
+        sql += " AND COALESCE(is_shadow, 0) = 0"
     if until is not None:
         sql += " AND substr(timestamp, 1, 10) <= substr(?, 1, 10)"
         params.append(until)

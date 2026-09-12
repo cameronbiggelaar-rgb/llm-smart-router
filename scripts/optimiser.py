@@ -92,11 +92,17 @@ def rank_models(
     days: int = 14,
     quality_floor: float = DEFAULT_QUALITY_FLOOR,
     min_samples: int = MIN_SAMPLES,
+    include_shadow: bool = False,
 ) -> List[RankedModel]:
     """Rank eligible models for ``workload``, cheapest cost-per-quality first.
 
     Eligibility requires: >= ``min_samples`` calls, measured quality, and
     ``quality_avg >= quality_floor``.
+
+    Shadow rows are excluded by default: a candidate under observation is not
+    serving production, so ranking it as if it were would propose a routing
+    change backed by traffic that never arrived. Promotion is a separate,
+    explicit decision — pass ``include_shadow=True`` to evaluate it.
     """
     since = _window(days)
     rows = conn.execute(
@@ -109,10 +115,11 @@ def rank_models(
                COUNT(DISTINCT day)   AS days_with_data
         FROM daily_findings
         WHERE workload_type = ? AND day >= ?
+        """ + ("" if include_shadow else " AND COALESCE(is_shadow, 0) = 0") + """
         GROUP BY model
         """,
         (workload, since),
-    ).fetchall()
+        ).fetchall()
 
     ranked: List[RankedModel] = []
     for model, calls, cost, quality_avg, quality_n, days_with_data in rows:
