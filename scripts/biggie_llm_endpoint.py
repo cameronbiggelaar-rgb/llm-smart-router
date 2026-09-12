@@ -1588,7 +1588,7 @@ def _log_request_to_db(
     final_model: str = "",
     routing_reason: str = "",
     cost_usd: float = 0.0,
-    cost_unknown: int = 1,
+    cost_unknown: Optional[int] = None,
     quality_score: Optional[float] = None,
     quality_method: str = "",
     pricing_version: str = "",
@@ -1604,14 +1604,29 @@ def _log_request_to_db(
     router's behaviour on streaming is observable (FIX 3). No prompt bodies or
     secrets are stored.
 
-    ``cost_unknown`` defaults to 1: an un-priced call is recorded as *unknown*,
-    never as a confident zero, so cost rollups can exclude it rather than
-    understate spend.
+    ``cost_unknown`` is resolved here rather than trusted from the caller. It
+    previously defaulted to 1, which meant any call site that forgot to pass a
+    cost logged the request cost-blind — on production that silently hid 952
+    ``session_compression`` calls (68.4M tokens, the busiest workload in the
+    system). The safe behaviour is now the default behaviour: when the caller
+    does not supply a cost, this computes one from the price book. An explicit
+    caller-supplied cost (a shadow candidate priced separately) is respected.
+    A genuinely unpriced model is still recorded as *unknown*, never as a
+    confident zero, so rollups can exclude it rather than understate spend.
     """
     try:
         from datetime import datetime, timezone
 
         db = _get_db_connection()
+        if cost_unknown is None:
+            # Caller did not state a cost: compute it. Never guess silently.
+            _computed, _computed_unknown = compute_cost_fields(
+                model_used, input_tokens, output_tokens, conn=db
+            )
+            _resolved_cost, _resolved_cost_unknown = float(_computed), int(_computed_unknown)
+        else:
+            _resolved_cost = float(cost_usd or 0.0)
+            _resolved_cost_unknown = 1 if cost_unknown else 0
         with _get_sqlite_lock():
             db.execute(
                 """INSERT INTO router_logs (
@@ -1653,8 +1668,8 @@ def _log_request_to_db(
                     1 if saw_tool_calls else 0,
                     final_model or model_used,
                     routing_reason,
-                    float(cost_usd or 0.0),
-                    1 if cost_unknown else 0,
+                    _resolved_cost,
+                    _resolved_cost_unknown,
                     quality_score,
                     quality_method,
                     pricing_version,

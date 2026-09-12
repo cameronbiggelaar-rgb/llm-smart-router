@@ -204,7 +204,20 @@ def test_log_request_to_db_persists_cost_and_quality(conn, monkeypatch):
 
 
 def test_log_request_to_db_defaults_are_safe(conn, monkeypatch):
-    """Omitting the new fields must still insert cleanly (back-compat)."""
+    """Omitting the new fields must still insert cleanly (back-compat).
+
+    NOTE (B12): this test previously asserted ``cost_unknown == 1`` when the
+    caller omitted the cost fields, describing that as "unknown cost by default,
+    never a fake 0". That contract was itself the defect — it declared a
+    knowable cost unknowable. On production it silently hid 952
+    session_compression calls (68.4M tokens, the busiest workload) from every
+    spend rollup, because none of those call sites passed a cost and the logger
+    defaulted to "unknown" rather than pricing the call it had already been
+    given the tokens for.
+
+    The corrected contract: an omitted cost is *computed* from the price book.
+    "Unknown" is reserved for a model that genuinely has no price.
+    """
     monkeypatch.setattr(ep, "_get_db_connection", lambda: conn)
     ep._ensure_log_columns(conn)
     ep._log_request_to_db(
@@ -218,11 +231,35 @@ def test_log_request_to_db_defaults_are_safe(conn, monkeypatch):
         routing_time_ms=1,
     )
     row = conn.execute(
-        "SELECT cost_unknown, quality_score, is_shadow FROM router_logs"
+        "SELECT cost_unknown, cost_usd, quality_score, is_shadow FROM router_logs"
     ).fetchone()
-    assert row[0] == 1          # unknown cost by default, never a fake 0
-    assert row[1] is None       # unmeasured, not zero
-    assert row[2] == 0
+    assert row[0] == 0          # a knowable cost is priced, not declared unknown
+    assert row[1] > 0           # and the priced amount is real
+    assert row[2] is None       # unmeasured quality, not zero
+    assert row[3] == 0
+
+
+def test_log_request_to_db_marks_a_genuinely_unpriced_model_unknown(conn, monkeypatch):
+    """'Unknown' must still exist for models with no price on record.
+
+    Guarding the other direction: pricing everything by default must not turn an
+    unknowable cost into a confident zero.
+    """
+    monkeypatch.setattr(ep, "_get_db_connection", lambda: conn)
+    ep._ensure_log_columns(conn)
+    ep._log_request_to_db(
+        model_used="model-with-no-price-zzz",
+        provider="nowhere",
+        task_type="qa",
+        complexity_score=0.1,
+        input_tokens=10,
+        output_tokens=5,
+        latency_seconds=0.2,
+        routing_time_ms=1,
+    )
+    row = conn.execute("SELECT cost_unknown, cost_usd FROM router_logs").fetchone()
+    assert row[0] == 1, "an unpriced model must be flagged unknown, not billed at 0"
+    assert row[1] == 0.0
 
 
 def test_ensure_log_columns_adds_every_new_column(conn):
