@@ -683,6 +683,28 @@ def _get_httpx_client() -> httpx.AsyncClient:
     return _httpx_client
 
 
+def _router_db_path() -> Path:
+    """Resolve the router_logs path, overridable via ``BIGGIE_ROUTER_DB``.
+
+    The override exists because the hardcoded path made the production
+    initialisation path untestable: a test could not point the real code at a
+    throwaway database, so every test replaced ``_get_db_connection`` outright
+    and the real schema creation + price seeding never ran under test. Two
+    defects reached production through exactly that gap.
+
+    It also prevents a repeat of a real accident: an exploratory probe that
+    meant to use a temp DB silently wrote stub rows into production, because
+    overriding the path was impossible.
+
+    With no override set this returns the historical production path
+    byte-for-byte, so live behaviour is unchanged.
+    """
+    override = os.environ.get("BIGGIE_ROUTER_DB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
+
+
 def _get_db_connection() -> Any:
     """Get or create a persistent SQLite connection."""
     global _sqlite_conn, _sqlite_lock
@@ -690,8 +712,21 @@ def _get_db_connection() -> Any:
         import sqlite3
         import threading
         _sqlite_lock = threading.Lock()
-        db_path = Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"
+        db_path = _router_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         _sqlite_conn = sqlite3.connect(str(db_path))
+        # Ensure the full schema exists in-process, not only when someone
+        # previously ran the CLI. Without this, a DB that has never been
+        # migrated by `router_ops` has no model_pricing/daily_findings tables:
+        # cost capture silently degrades to cost_unknown=1 forever and the
+        # rollup has nowhere to write. `migrate` is idempotent and additive, so
+        # running it against the live production DB is a no-op.
+        try:
+            import rollup
+
+            rollup.migrate(_sqlite_conn)
+        except Exception as e:                                  # pragma: no cover
+            logger.warning("Failed to migrate router schema: %s", e)
         _ensure_log_columns(_sqlite_conn)
         # Seed the price book here, not just in the offline CLI. Without it
         # model_pricing stays empty and every row this process writes logs
@@ -3286,7 +3321,7 @@ async def compression_report():
     """Get compression effectiveness report from recent requests."""
     try:
         import sqlite3
-        db = sqlite3.connect(str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db"))
+        db = sqlite3.connect(str(_router_db_path()))
         rows = db.execute("""
             SELECT compression_level, COUNT(*) as calls,
                    ROUND(AVG(compression_savings_pct), 1) as avg_savings,
