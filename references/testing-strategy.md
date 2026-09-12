@@ -87,6 +87,33 @@ incumbent already wins". Test both branches.
 `.github/workflows/tests.yml` running the suite on push, so the suite is a gate
 rather than a habit.
 
+## Outcomes
+
+| batch | result |
+|---|---|
+| B11 | DB path overridable via `BIGGIE_ROUTER_DB`, defaulting to production. **Found + fixed defect 6**: `_get_db_connection` never called `rollup.migrate()`, so any DB not previously migrated by the CLI silently lacked `model_pricing` and every rollup table. Production worked only because someone had run the CLI first. |
+| B12 | `scripts/preflight.py` — 16 end-to-end checks against a throwaway DB. On its **first run** it found **defect 7**: prices were seeded and the price book was correct, yet a logged call still recorded `cost_unknown=1`, because `_log_request_to_db` defaulted `cost_unknown=1` and never computed cost itself. **4 of 5 real call sites omit cost fields** → 952 compression calls (68.4M tokens, the busiest workload) were cost-blind. Fixed by making the safe behaviour the default: the logger computes cost when the caller does not state one; `cost_unknown=None` means "compute", an explicit caller value is respected, and a genuinely unpriced model is still flagged unknown. |
+| B13 | Static parity contracts. A call site passing a keyword the logger does not accept (`finish_reason`) is now impossible to merge. Also pins a **real, unfixed analytics gap**: `saw_tool_calls` is written per request but absent from `daily_findings` — the exact signal that produced the glm-5.3-flash verdict is invisible to every rollup report. |
+| B14 | The optimiser no longer claims optimality it cannot support. `Proposal` carries `workloads_examined` / `workloads_unrankable` as data. On real production data it now reports: *"No model has measured quality, so nothing is eligible to be ranked — checked 2 workload(s). The router therefore CANNOT self-optimise yet."* Previously it said "incumbent is optimal". |
+| B15 | Streaming cost gap pinned with measured numbers: 114,618 completion rows carry $17,438.92 with zero output tokens recorded. |
+| CI | `.github/workflows/tests.yml` runs pytest **and** preflight on every push. |
+
+Suite: 266 → **293 tests**, all green. Preflight: **16/16**.
+
+### The pattern worth keeping
+
+Every defect found this round was in a *seam*, not in a function:
+
+* the seam between the test fixture's DB and production's DB (B11, B13)
+* the seam between the price book and the logger's default (B12)
+* the seam between a call site and the logger's signature (B13)
+* the seam between what is recorded and what is rolled up (B13, B15)
+* the seam between what the optimiser concluded and what the data supported (B14)
+
+Unit tests that inject a fake at the seam cannot see the seam. That is why
+**preflight is mandatory in CI and must never be skipped**: it is the only check
+that drives the code path production actually runs.
+
 ## Non-goals
 
 * Not replacing the existing unit tests — they are fine at what they do.
@@ -98,3 +125,9 @@ rather than a habit.
 Every batch: failing test first, then the fix, then commit. Run the full suite
 before each commit. If a batch reveals that an earlier "fix" was wrong, correct
 it in a test rather than in prose.
+
+Two tests here assert the *defective* state on purpose (the streaming
+output-token hardcode, and the `saw_tool_calls` rollup gap). That is
+deliberate: a known gap that is written down fails loudly when it is fixed, and
+cannot be quietly forgotten. Their docstrings say exactly what to do when they
+fail.

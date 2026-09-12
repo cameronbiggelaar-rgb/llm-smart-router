@@ -255,19 +255,50 @@ The endpoint re-reads it within ~30s. The candidate must already be a discovered
 
 ### Operating facts (measured on production data)
 
-- Every call is priced inline and written to `router_logs.cost_usd` with `cost_unknown` and `pricing_version`.
+- Every call is priced inline and written to `router_logs.cost_usd` with `cost_unknown` and `pricing_version`. The logger computes the cost itself when the caller does not pass one, so a call site cannot go cost-blind by omission.
 - The optimiser **refuses to propose without quality evidence** (`quality_n` from `daily_findings`). With no measured quality there is no evidence a cheaper model is safe, so nothing is proposed — that is the correct answer, not a bug. Populate quality via `mode: shadow` runs scored with `quality.py`.
 - **Retention refuses to purge any day without a committed rollup** — a crash mid-rollup must never destroy unrolled raw rows. Purge is dry-run unless `--yes`.
 
-## Pitfalls
+### Before enabling ANYTHING against live traffic
 
-- **`cost_unknown` defaults to 1, not 0.** The `router_logs` migration adds `cost_unknown DEFAULT 1` because every pre-existing row has no cost data. Defaulting to 0 would claim 231k legacy rows were "priced at $0" — indistinguishable from free models. Preserve this default when touching the schema.
+```bash
+cd ~/.hermes/skills/llm-smart-router
+python3 scripts/preflight.py   # 16 end-to-end checks, throwaway DB, never touches prod
+```
+
+Preflight drives the real production code path (real init, real price seeding, real logger, real HTTP requests) against a throwaway DB. It exists because a single live enablement surfaced four defects that 266 unit tests did not catch. **Do not enable a shadow or split experiment if preflight fails.** CI runs it on every push (`.github/workflows/tests.yml`), alongside pytest.
+
+Override the DB path with `BIGGIE_ROUTER_DB=/tmp/x.db` to point any of this at a throwaway file.
+
+### Is self-optimisation live or manual?
+
+Manual to *start*, and it cannot currently start at all. Precisely:
+
+| layer | status |
+|---|---|
+| cost accounting / rollup | **automatic** — timer `biggie-router-ops.timer` rolls up daily and writes findings |
+| logging health audit | **automatic** (`router_ops.py maintain`) |
+| optimiser (`propose`) | **propose-only, never applies.** Writes `candidate_routing.yaml`; **zero production code reads that file** (verified). Promotion is a human edit. |
+| traffic split / canary | **manual, config-driven** — `experiments.yaml` is the only interface, hot-reloaded within ~30s. Ships disabled. |
+| shadow experiments | **automatic once enabled** — but only for a candidate that works |
+| quality evidence | **not being generated.** All 70 scored rows are shadow rows; **zero production rows are scored.** |
+
+The blocker is the last row. Ranking needs measured quality, quality is only scored inside the shadow path, and shadow needs a working candidate. So the loop is currently **open**: the router measures cost and reports honestly that it cannot rank anything.
+
+### Pitfalls
+
+- **`cost_unknown` must default to `None` (compute it), not `1`.** Defaulting to 1 meant any call site that forgot the cost fields logged the request cost-blind — on production that silently hid 952 `session_compression` calls (68.4M tokens, the busiest workload) from every spend rollup. An omitted cost is now *computed*; "unknown" is reserved for a model that genuinely has no price. Guarded by `tests/test_cost_capture_parity.py` and `tests/test_streaming_cost_gap.py`.
+- **A test that asserts the defective behaviour is a defect too.** `test_log_request_to_db_defaults_are_safe` asserted `cost_unknown == 1` as "safe", which is what locked the bug in. When fixing a contract, grep for tests that assert the old one.
+- **`_ensure_log_columns` only ALTERs an existing table.** It cannot create `router_logs`. The endpoint's real init calls `rollup.migrate()` first; without that, a fresh DB has no `model_pricing` or `daily_findings` and cost capture degrades silently.
 - **`estimated_cost_usd` in `router_logs` is dead.** It was never written by the endpoint (all 231k rows were 0.0). Cost now lives in `cost_usd` + `cost_unknown` + `pricing_version`. Do not report spend from `estimated_cost_usd`.
-- **Backfilled costs are reconstructed, not measured.** They carry `pricing_version='backfill:<date>'`; filter `pricing_version LIKE 'backfill%'` to separate them. Rows with no output tokens (streaming) understate output cost — the backfill reports how many.
+- **Backfilled costs are reconstructed, not measured.** They carry `pricing_version='backfill:<date>'`; filter `pricing_version LIKE 'backfill%'` to separate them.
+- **Streaming completions record zero output tokens.** Both streaming completion loggers hardcode `output_tokens=0`, so 114,618 completed streaming rows carry $17,438.92 with no output cost counted (route-start rows legitimately have none — don't conflate them). Measured understatement is small (+1.6% compression, +13.5% chat) but it is *unlabelled*: the row reads as measured. Pinned by `tests/test_streaming_cost_gap.py`, whose docstring says what to do when it is fixed.
+- **`saw_tool_calls` is not rolled up.** Written per request, absent from `daily_findings`, so the signal that produced the glm-5.3-flash verdict (tool_calls with no content when tools are offered) is invisible to every rollup report. Pinned in `tests/test_static_contracts.py`.
+- **The optimiser's empty report has three meanings** (no traffic / nothing measured / incumbent genuinely wins). `Proposal.workloads_examined` + `workloads_unrankable` carry which one as data; do not parse the English.
 - **The optimiser never edits `routing_table.yaml`.** It writes `candidate_routing.yaml` with `applied: false`; promotion is a human edit.
 - **`aiter_lines()` is single-use:** capture the iterator once in preflight and reuse it. Calling it again on the same httpx response returns nothing/empty.
 - **state.db is large (~2GB):** The collector queries with `mode=ro` (read-only) and uses indexed queries. It only reads sessions newer than the last collection timestamp.
-- **Missing model prices:** Unknown models get $0 cost. Add them to `MODEL_REGISTRY` in `models.py` (never edit the derived `DEFAULT_MODEL_COSTS` / `MODEL_COST_ORDER` directly).
+- **Missing model prices:** Unknown models get `cost_unknown=1` and `cost_usd=0.0`. Add them to the price book via `unit_economics.seed_prices`.
 - **Task classification is heuristic:** The keyword-based classifier is a starting point. Phase 2 will replace it with a trained model.
 - **Cron runs silently:** The `no_agent` cron job only reports errors. Check `cronjob list` for status.
 - **Runtime DB artifacts:** `biggie_router.db`, `data/*.db-shm`, `data/*.db-wal` are gitignored — never commit them.
