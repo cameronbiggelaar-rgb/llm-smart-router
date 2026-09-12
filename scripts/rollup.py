@@ -23,6 +23,26 @@ from typing import Dict, List, Mapping, Optional
 # name -> SQL type/constraint fragment. Kept as an ordered mapping so the
 # migration is deterministic and testable.
 
+# ── Which rows are billable events ──────────────────────────────────────────
+#
+# A streaming request writes TWO rows: a start marker
+# (``error_type='streaming_in_progress'``) and a completion row, both carrying
+# the full input token count. The marker exists so an abandoned stream stays
+# visible (``_find_abandoned_streams`` depends on it) and is an in-flight
+# marker, not a second trip to the vendor.
+#
+# Summing the table naively therefore counts every streaming request twice.
+# Measured on production: one day read $1,395.25 raw against $755.27 once each
+# request was counted once (1.85x).
+#
+# Every aggregator must apply this predicate. Keeping it in one place is the
+# point: three call sites with three hand-written copies is exactly how the
+# drift that produced this defect starts.
+# ``COALESCE`` matters: ``NULL != 'streaming_in_progress'`` evaluates to NULL,
+# not TRUE, so a NULL error_type would silently drop the row from every
+# aggregate. Rows written before the column existed have exactly that shape.
+BILLABLE_ROW_SQL = "COALESCE(error_type, '') != 'streaming_in_progress'"
+
 NEW_LOG_COLUMNS: Mapping[str, str] = {
     "cost_usd": "REAL NOT NULL DEFAULT 0",
     "cost_unknown": "INTEGER NOT NULL DEFAULT 1",
@@ -372,10 +392,11 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
             is_shadow
         FROM router_logs
         WHERE substr(timestamp, 1, 10) = substr(?, 1, 10)
+          AND """ + BILLABLE_ROW_SQL + """
         GROUP BY workload_type, model_used, is_shadow
         """,
         (day,),
-    ).fetchall()
+        ).fetchall()
 
     if not rows:
         # Still record the watermark: the day is legitimately empty, and

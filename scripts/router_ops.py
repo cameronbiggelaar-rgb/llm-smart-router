@@ -134,26 +134,31 @@ def cmd_audit(conn, args) -> int:
     """Logging/audit health: is the log capturing what the optimiser needs?"""
     since = (date.today() - timedelta(days=args.days)).isoformat()
     total = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ?", (since,)
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND " + BILLABLE_ROW_SQL, (since,)
     ).fetchone()[0]
     unknown = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 1",
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 1 "
+        "AND " + BILLABLE_ROW_SQL,
         (since,),
     ).fetchone()[0]
     priced = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 0",
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 0 "
+        "AND " + BILLABLE_ROW_SQL,
         (since,),
     ).fetchone()[0]
     q = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND quality_score IS NOT NULL",
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND quality_score IS NOT NULL "
+        "AND " + BILLABLE_ROW_SQL,
         (since,),
     ).fetchone()[0]
     exp = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND experiment != ''",
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND experiment != '' "
+        "AND " + BILLABLE_ROW_SQL,
         (since,),
     ).fetchone()[0]
     no_cost = conn.execute(
-        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 0 AND cost_usd = 0",
+        "SELECT COUNT(*) FROM router_logs WHERE timestamp >= ? AND cost_unknown = 0 "
+        "AND cost_usd = 0 AND " + BILLABLE_ROW_SQL,
         (since,),
     ).fetchone()[0]
     print(f"Logging audit — since {since}")

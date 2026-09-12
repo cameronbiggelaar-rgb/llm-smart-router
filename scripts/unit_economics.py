@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, List, Optional
 
+from rollup import BILLABLE_ROW_SQL
+
 # Provider suffixes that may appear in logged model names.
 _PROVIDER_SUFFIXES = (":cloud", ":local", ":ollama")
 
@@ -255,7 +257,8 @@ def unit_cost(
             COUNT(quality_score)                      AS quality_n
         FROM router_logs
         WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
-    """
+          AND {billable}
+        """.format(billable=BILLABLE_ROW_SQL)
     params: List[Any] = [since]
     if not include_shadow:
         sql += " AND COALESCE(is_shadow, 0) = 0"

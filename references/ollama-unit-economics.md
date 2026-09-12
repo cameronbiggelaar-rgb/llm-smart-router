@@ -567,3 +567,56 @@ Caveats that keep this honest:
 Cost of the experiment: $2.86 for 188 candidate calls ($0.0155/call). At the
 observed compression rate a shadow run mirrors ~$180/day, so an experiment whose
 question is answered should be switched off rather than left enabled.
+
+## Reconciling the ledger against the vendor invoice (2026-09-12)
+
+The Ollama dashboard and the router ledger disagreed by **51x** on the same
+traffic. Working the difference down produced four measured defects, all of
+which had been invisible because every test injected its own database and none
+compared the total against an external source of truth.
+
+### The reconciliation that found everything
+
+    vendor (week to date)        $76.86
+    our ledger (same window)   $3,525.50
+    ratio                          51.5x
+
+Two independent errors, both directionally the same (overstatement):
+
+| cause | effect | fix |
+|---|---|---|
+| every streaming request logged twice, both rows carrying the full token count | **1.86x** on 97.99% of rows (all streaming traffic) | `rollup.BILLABLE_ROW_SQL`; markers explicitly unpriced |
+| price book vs `ollama.com/pricing` | glm-5.3/5.2 7% high, deepseek-v4-pro 3.03x high, qwen3.5:397b absent | pinned by test; correction is the operator's call |
+| no cached-input rate column | inputs billed at fresh rate; vendor's effective glm-5.3 rate was ~$0.41/1M vs $1.40 fresh — consistent with ~88% cache hits | structural; needs a third price column |
+| `input_tokens` is a `chars//4` estimate of the **pre-compression** messages | bills the size before compression, not what was sent | not yet addressed |
+
+### Why "streaming is logged twice" is worse than it looks
+
+The start marker (`error_type='streaming_in_progress'`) is deliberately written
+so an abandoned stream stays visible — `_find_abandoned_streams` depends on it.
+The completion row repeats the same token counts. So `SUM()` over the table
+counts every streaming request twice, and streaming is 97.99% of rows.
+
+The dangerous part is the interaction with B12. B12 made the logger compute a
+cost whenever a caller omits one. The start marker omits cost fields. So the
+B12 fix, on restart, would have made the double-count **live** rather than a
+historical artifact of a backfill. That is why the fix has two independent
+guards — the marker is explicitly non-billable, *and* aggregation counts only
+billable rows. Either alone is one edit away from regressing.
+
+### Reconciliation is the test that was missing
+
+None of these were logic errors in the sense unit tests catch. Every function
+did exactly what it said. What was absent was a check that the *total* agrees
+with the vendor's invoice. Any future change to pricing or logging should be
+validated by re-reconciling against the dashboard, not only by the suite.
+
+### Residual, deliberately unfixed
+
+* **Cached-input pricing** — needs a `cached_input_usd_per_1m` column and a
+  cache-hit signal from upstream. Largest remaining overstatement on
+  cache-heavy workloads.
+* **Pre-compression token estimates** — `context_tokens` is computed before
+  compression, so the ledger overstates what was sent.
+* **Streaming output tokens** — completions log `output_tokens=0`
+  (see `test_streaming_cost_gap.py`); understates, opposite direction, small.

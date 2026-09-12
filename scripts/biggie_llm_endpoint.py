@@ -1618,7 +1618,14 @@ def _log_request_to_db(
         from datetime import datetime, timezone
 
         db = _get_db_connection()
-        if cost_unknown is None:
+        if error_type == "streaming_in_progress":
+            # In-flight start marker, not a billable event. A streaming request
+            # writes this marker AND a completion row carrying the same token
+            # counts; pricing both counts one request twice. The marker exists
+            # so an abandoned stream stays visible, so it must stay in the
+            # table — but it must never carry money.
+            _resolved_cost, _resolved_cost_unknown = 0.0, 0
+        elif cost_unknown is None:
             # Caller did not state a cost: compute it. Never guess silently.
             _computed, _computed_unknown = compute_cost_fields(
                 model_used, input_tokens, output_tokens, conn=db
