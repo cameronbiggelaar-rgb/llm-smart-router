@@ -63,6 +63,12 @@ class Experiment:
     match_min_tier: int = 0
     started: str = ""
     notes: str = ""
+    # Optional provider for the candidate. A model under test is usually NOT in
+    # the production fallback chain — registering it there just to make an
+    # experiment work could start serving real traffic, which is the exact thing
+    # shadow exists to avoid. When set, shadow resolves the candidate through
+    # this provider instead of the routing backends.
+    provider: str = ""
 
     @property
     def is_shadow(self) -> bool:
@@ -115,6 +121,7 @@ def build_experiment(raw: Dict[str, Any]) -> Optional[Experiment]:
         match_min_tier=min_tier,
         started=str(raw.get("started") or ""),
         notes=str(raw.get("notes") or ""),
+        provider=str(raw.get("provider") or "").strip(),
     )
 
 

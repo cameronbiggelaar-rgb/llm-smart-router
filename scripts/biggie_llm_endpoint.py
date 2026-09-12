@@ -16,6 +16,7 @@ Configurable routing profile:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -377,6 +378,228 @@ def apply_experiment(
     if arm == "treatment":
         return experiment.model, obs
     return selected_model, obs
+
+
+# ── Shadow execution ──────────────────────────────────────────────────────────
+# A shadow experiment is only worth anything if the candidate is ACTUALLY
+# called. Before this existed, "shadow" merely stamped rows with is_shadow=1
+# while the candidate was never exercised — which would have produced tens of
+# thousands of rows claiming observational coverage of a model that never ran.
+# Shadow calls are real spend, so they are bounded and labelled.
+
+_SHADOW_MAX_CONCURRENCY = 2
+_SHADOW_TIMEOUT_SECONDS = 90.0
+_shadow_semaphore = None
+
+
+def _get_shadow_semaphore():
+    """Bound concurrent shadow calls so an experiment cannot starve production.
+
+    Built lazily inside the running loop: constructing a Semaphore at import
+    time binds it to the wrong event loop and the first await then fails.
+    """
+    global _shadow_semaphore
+    if _shadow_semaphore is None:
+        _shadow_semaphore = asyncio.Semaphore(_SHADOW_MAX_CONCURRENCY)
+    return _shadow_semaphore
+
+
+def _resolve_candidate_backend(
+    model_name: str,
+    provider: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Find the backend config for an experiment's candidate model.
+
+    Resolution order:
+      1. the experiment's own ``provider`` (preferred — the candidate usually
+         is not in production routing, and adding it there to make an
+         experiment work could start serving real traffic);
+      2. the discovered routing backends, tolerating the ":cloud"/":local"
+         suffix difference between the routing name and the config key.
+    """
+    if provider:
+        try:
+            hermes = load_hermes_config()
+        except Exception as e:                              # pragma: no cover
+            logger.warning("Shadow: could not load config for provider %s: %s", provider, e)
+            hermes = {}
+        pconf = (hermes.get("providers") or {}).get(provider) or {}
+        api_key_env = pconf.get("api_key_env", "")
+        api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        if not api_key:
+            key_env = BUILTIN_PROVIDER_KEYS.get(provider, "")
+            if key_env:
+                api_key = os.environ.get(key_env, "")
+        base_url = pconf.get("base_url") or BUILTIN_PROVIDER_URLS.get(provider, "")
+        if base_url:
+            return {
+                "provider": provider,
+                "base_url": base_url,
+                "api_key": api_key,
+                "backend_model": re.sub(r":(cloud|local|ollama)$", "", model_name),
+            }
+        logger.warning("Shadow: provider %s has no base_url; falling back", provider)
+
+    try:
+        backends = discover_backends()
+    except Exception as e:                                  # pragma: no cover
+        logger.warning("Shadow: could not discover backends: %s", e)
+        return None
+    if model_name in backends:
+        return backends[model_name]
+    stem = re.sub(r":(cloud|local|ollama)$", "", model_name)
+    for key, info in backends.items():
+        if re.sub(r":(cloud|local|ollama)$", "", key) == stem:
+            return info
+    return None
+
+
+def _shadow_default_row(row: Dict[str, Any]) -> None:
+    """Persist a shadow observation. Never raises."""
+    try:
+        _log_request_to_db(**row)
+    except Exception as e:                                  # pragma: no cover
+        logger.warning("Shadow: failed to log observation: %s", e)
+
+
+async def run_shadow_experiment(
+    experiment: Any,
+    backend: Optional[Dict[str, Any]] = None,
+    messages: Optional[List[Dict[str, Any]]] = None,
+    request_body: Optional[Dict[str, Any]] = None,
+    request_id: str = "",
+    session_id: str = "",
+    incumbent_model: str = "",
+    on_row: Any = None,
+    conn: Any = None,
+) -> None:
+    """Call the experiment's candidate on this request and record the result.
+
+    Returns ``None`` — always. The candidate's output is deliberately
+    discarded: shadow must never change what the user receives, which is the
+    only property that makes it safe to run against live traffic.
+
+    Guarantees, each covered by a test:
+      * the candidate is genuinely invoked (otherwise the data is fiction);
+      * the call is forced non-streaming (a stream we discard would hang);
+      * cost is attributed to the candidate model, not the incumbent;
+      * a candidate failure is recorded as a failure and never propagates.
+    """
+    if experiment is None or not getattr(experiment, "enabled", False):
+        return
+    if not getattr(experiment, "is_shadow", False):
+        return
+
+    if backend is None:
+        backend = _resolve_candidate_backend(
+            experiment.model, getattr(experiment, "provider", "")
+        )
+        if backend is None:
+            logger.warning(
+                "Shadow: no backend found for candidate %s — skipping", experiment.model
+            )
+            return
+
+    candidate_model = experiment.model
+    body = dict(request_body or {})
+    # Force a non-streaming call: we discard the output, and an unconsumed
+    # stream would hold the connection until timeout.
+    body["stream"] = False
+    body.pop("stream_options", None)
+    if messages is not None:
+        body["messages"] = messages
+
+    sem = _get_shadow_semaphore()
+    t0 = time.time()
+    content = ""
+    in_tok = out_tok = 0
+    success = True
+    error_type = ""
+
+    async with sem:
+        try:
+            result = await asyncio.wait_for(
+                proxy_to_backend(backend, list(messages or []), body),
+                timeout=_SHADOW_TIMEOUT_SECONDS,
+            )
+            try:
+                usage = (result or {}).get("usage", {}) or {}
+                in_tok = int(usage.get("prompt_tokens") or 0)
+                out_tok = int(usage.get("completion_tokens") or 0)
+                choice = (((result or {}).get("choices") or [{}])[0] or {})
+                msg = choice.get("message") or {}
+                content = str(msg.get("content") or "")
+                if not content:
+                    success = False
+                    error_type = "shadow_empty"
+            except Exception:
+                success = False
+                error_type = "shadow_unparseable"
+        except asyncio.TimeoutError:
+            success = False
+            error_type = "shadow_timeout"
+        except Exception as e:
+            success = False
+            error_type = f"shadow_error:{type(e).__name__}"
+
+    latency = time.time() - t0
+
+    # Quality is scored only when we have both a source and a candidate answer;
+    # an unscored observation must stay NULL rather than default to a number.
+    quality_score = None
+    quality_method = ""
+    if content and messages:
+        try:
+            from quality import score_summary
+
+            source = "\n".join(
+                str(m.get("content") or "")
+                for m in messages
+                if isinstance(m, dict) and m.get("role") == "user"
+            )
+            if source.strip():
+                qs = score_summary(source, content)
+                quality_score = float(qs.score)
+                quality_method = qs.method
+        except Exception as e:                              # pragma: no cover
+            logger.debug("Shadow: quality scoring failed: %s", e)
+
+    cost_usd, cost_unknown = compute_cost_fields(candidate_model, in_tok, out_tok, conn=conn)
+
+    row: Dict[str, Any] = {
+        "model_used": candidate_model,
+        "provider": backend.get("provider", ""),
+        "task_type": "shadow",
+        "complexity_score": 0.0,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "latency_seconds": latency,
+        "routing_time_ms": 0,
+        "success": success,
+        "escalated": False,
+        "error_type": error_type,
+        "request_id": request_id,
+        "requested_model": incumbent_model,
+        "streaming": False,
+        "workload_type": "shadow",
+        "final_model": candidate_model,
+        "routing_reason": f"shadow:{experiment.name}",
+        "cost_usd": cost_usd,
+        "cost_unknown": cost_unknown,
+        "quality_score": quality_score,
+        "quality_method": quality_method,
+        "pricing_version": _pricing_version(),
+        "experiment": getattr(experiment, "name", ""),
+        "experiment_arm": "shadow",
+        "is_shadow": True,
+    }
+
+    try:
+        (on_row or _shadow_default_row)(row)
+    except Exception as e:                                  # pragma: no cover
+        logger.warning("Shadow: on_row callback failed: %s", e)
+
+    return None
 
 
 def _experiment_matches(experiment: Experiment, workload_type: str, tier: int = 0) -> bool:
@@ -2656,6 +2879,29 @@ async def chat_completions(request: Request):
                 _exp_obs.get("experiment"), decision.selected_model, decision.selected_model,
             )
             _obs["experiment_arm"] = "control"
+
+    # ── Shadow execution ─────────────────────────────────────────────────────
+    # Fire the candidate call for real, discard its output, and record it as its
+    # own row. The user's response is untouched — that is the only property that
+    # makes running an experiment against live traffic safe. Concurrency and
+    # timeout are bounded so a slow candidate cannot stall production.
+    if _experiment is not None and getattr(_experiment, "is_shadow", False):
+        try:
+            asyncio.create_task(
+                run_shadow_experiment(
+                    _experiment,
+                    messages=compressed_messages,
+                    request_body=body,
+                    request_id=request_id,
+                    session_id=features.get("session_id", ""),
+                    incumbent_model=decision.selected_model,
+                )
+            )
+        except RuntimeError:                                # pragma: no cover
+            # No running loop — shadow is strictly best-effort and must never
+            # break a request.
+            logger.debug("Shadow: no event loop available; skipping")
+
     try:
         if want_stream:
             # Streaming requests are observable too: record the route at start,

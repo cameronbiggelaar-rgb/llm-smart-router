@@ -34,7 +34,13 @@ experiments:
   # offline A/B. Shadow gives real-load numbers before any traffic is moved.
   - name: glm53flash-compression-shadow
     enabled: false
+    started: '2026-09-12'
     model: glm-5.3-flash
+    # The candidate is deliberately NOT in the production fallback chain.
+    # Adding it there to make this experiment work could start serving real
+    # traffic — exactly what shadow exists to avoid — so the experiment
+    # declares its own provider instead.
+    provider: ollama-cloud
     mode: shadow
     match:
       workload: [session_compression]

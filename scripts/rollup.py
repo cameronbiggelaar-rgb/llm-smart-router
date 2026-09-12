@@ -74,7 +74,11 @@ CREATE TABLE IF NOT EXISTS daily_findings (
     latency_p95 REAL NOT NULL DEFAULT 0,
     quality_avg REAL,
     quality_n INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, workload_type, model, call_type)
+    -- Shadow calls are real spend but NOT production traffic. Keeping the flag
+    -- on the finding is what lets a reader exclude them from a spend figure;
+    -- folding them in silently overstates production cost.
+    is_shadow INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, workload_type, model, call_type, is_shadow)
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_findings_day ON daily_findings(day);
@@ -108,6 +112,71 @@ def new_tables_present(conn: sqlite3.Connection) -> Dict[str, bool]:
         name: _table_exists(conn, name)
         for name in ("model_pricing", "experiments", "daily_findings", "rollup_state")
     }
+
+
+def _migrate_daily_findings_shadow(conn: sqlite3.Connection) -> int:
+    """Bring an existing ``daily_findings`` up to the shadow-aware shape.
+
+    ``is_shadow`` is part of the primary key, because the same model can
+    legitimately be both the serving model and an experiment's candidate on the
+    same day for the same workload — one row each, and they must not collide.
+
+    SQLite cannot ALTER a primary key, so the table is rebuilt and the existing
+    rows copied across (stamped ``is_shadow=0``, which is what they are). This is
+    the only safe option: ``daily_findings`` is a derived table, but purge may
+    have already deleted the raw rows behind older days, so it is NOT always
+    recomputable — the history must be carried over rather than re-rolled.
+
+    Idempotent. Returns 1 if the table was rebuilt, else 0.
+    """
+    if not _table_exists(conn, "daily_findings"):
+        return 0
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_findings)")}
+    pk_cols = [
+        r[1] for r in conn.execute("PRAGMA table_info(daily_findings)") if r[5]
+    ]
+    if "is_shadow" in cols and "is_shadow" in pk_cols:
+        return 0
+
+    conn.execute(
+        """CREATE TABLE daily_findings_shadow_migration (
+            day TEXT NOT NULL,
+            workload_type TEXT NOT NULL,
+            model TEXT NOT NULL,
+            call_type TEXT NOT NULL DEFAULT '',
+            calls INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            cost_unknown_calls INTEGER NOT NULL DEFAULT 0,
+            success_calls INTEGER NOT NULL DEFAULT 0,
+            escalated_calls INTEGER NOT NULL DEFAULT 0,
+            latency_p50 REAL NOT NULL DEFAULT 0,
+            latency_p95 REAL NOT NULL DEFAULT 0,
+            quality_avg REAL,
+            quality_n INTEGER NOT NULL DEFAULT 0,
+            is_shadow INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (day, workload_type, model, call_type, is_shadow)
+        )"""
+    )
+    shadow_expr = "is_shadow" if "is_shadow" in cols else "0"
+    conn.execute(
+        f"""INSERT INTO daily_findings_shadow_migration
+            (day, workload_type, model, call_type, calls, input_tokens,
+             output_tokens, cost_usd, cost_unknown_calls, success_calls,
+             escalated_calls, latency_p50, latency_p95, quality_avg, quality_n,
+             is_shadow)
+            SELECT day, workload_type, model, call_type, calls, input_tokens,
+                   output_tokens, cost_usd, cost_unknown_calls, success_calls,
+                   escalated_calls, latency_p50, latency_p95, quality_avg, quality_n,
+                   {shadow_expr}
+            FROM daily_findings"""
+    )
+    conn.execute("DROP TABLE daily_findings")
+    conn.execute("ALTER TABLE daily_findings_shadow_migration RENAME TO daily_findings")
+    conn.commit()
+    return 1
 
 
 def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
@@ -152,7 +221,23 @@ def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
                 request_id TEXT NOT NULL DEFAULT '',
                 requested_model TEXT NOT NULL DEFAULT '',
                 streaming INTEGER NOT NULL DEFAULT 0,
-                workload_type TEXT NOT NULL DEFAULT ''
+                workload_type TEXT NOT NULL DEFAULT '',
+                -- Columns the endpoint's INSERT needs. The endpoint also
+                -- self-heals these at first write, but a DB that has only ever
+                -- been through migrate() must accept a row on its own —
+                -- otherwise "migrated" and "writable" silently disagree and the
+                -- logging path fails with "no column named ..." while the
+                -- request itself still succeeds.
+                compression_level TEXT NOT NULL DEFAULT '',
+                compression_savings_pct REAL NOT NULL DEFAULT 0,
+                compression_time_ms REAL NOT NULL DEFAULT 0,
+                requires_tools INTEGER NOT NULL DEFAULT 0,
+                context_tokens INTEGER NOT NULL DEFAULT 0,
+                empty_stream INTEGER NOT NULL DEFAULT 0,
+                saw_content INTEGER NOT NULL DEFAULT 0,
+                saw_tool_calls INTEGER NOT NULL DEFAULT 0,
+                final_model TEXT NOT NULL DEFAULT '',
+                routing_reason TEXT NOT NULL DEFAULT ''
             )"""
         )
 
@@ -163,9 +248,11 @@ def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
             conn.execute(f"ALTER TABLE router_logs ADD COLUMN {name} {ddl}")
             added_columns += 1
 
+    added_findings_columns = _migrate_daily_findings_shadow(conn)
+
     conn.executescript(NEW_TABLES_SQL)
     conn.commit()
-    return {"added_columns": added_columns}
+    return {"added_columns": added_columns, "added_findings_columns": added_findings_columns}
 
 
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
@@ -279,10 +366,11 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
             COALESCE(SUM(success), 0),
             COALESCE(SUM(escalated), 0),
             AVG(quality_score),
-            COUNT(quality_score)
+            COUNT(quality_score),
+            is_shadow
         FROM router_logs
         WHERE substr(timestamp, 1, 10) = substr(?, 1, 10)
-        GROUP BY workload_type, model_used
+        GROUP BY workload_type, model_used, is_shadow
         """,
         (day,),
     ).fetchall()
@@ -300,28 +388,33 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
     written = 0
     for r in rows:
         (workload_type, model, call_type, calls, in_tok, out_tok, cost,
-         unknown_calls, success_calls, escalated_calls, q_avg, q_n) = r
+         unknown_calls, success_calls, escalated_calls, q_avg, q_n, is_shadow) = r
+        is_shadow = int(is_shadow or 0)
+        # Latency percentiles must be computed over the same shadow/non-shadow
+        # slice, or a slow candidate would appear to slow production down.
         latencies = [
             float(x[0])
             for x in conn.execute(
                 "SELECT latency_seconds FROM router_logs "
                 "WHERE substr(timestamp,1,10)=substr(?,1,10) AND model_used=? "
                 "AND COALESCE(NULLIF(workload_type,''),'unknown')=? "
+                "AND is_shadow=? "
                 "AND latency_seconds > 0 ORDER BY latency_seconds",
-                (day, model, workload_type),
+                (day, model, workload_type, is_shadow),
             )
         ]
         conn.execute(
             "INSERT INTO daily_findings (day, workload_type, model, call_type, calls, "
             "input_tokens, output_tokens, cost_usd, cost_unknown_calls, success_calls, "
-            "escalated_calls, latency_p50, latency_p95, quality_avg, quality_n) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "escalated_calls, latency_p50, latency_p95, quality_avg, quality_n, is_shadow) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 day, workload_type, model, call_type, int(calls),
                 int(in_tok), int(out_tok), float(cost), int(unknown_calls),
                 int(success_calls), int(escalated_calls),
                 _percentile(latencies, 50.0), _percentile(latencies, 95.0),
                 float(q_avg) if q_avg is not None else None, int(q_n or 0),
+                is_shadow,
             ),
         )
         written += 1
