@@ -511,3 +511,59 @@ Verification: `biggie-llm-endpoint.service` is active; `/health` is OK; systemd 
 
 `glm-5.3-flash` remains an opportunity rather than an active route: Ollama lists it at $0.15 input / $0.50 output per 1M tokens with a 1M context and claims it beats GLM-5.2 on coding/agentic benchmarks, but the local Hermes config currently exposes only `glm-5.3:cloud` and `glm-5.2:cloud`, not `glm-5.3-flash:cloud`.
 
+## Shadow experiment result: glm-5.3-flash fails on real compression payloads
+
+The offline A/B (above) measured glm-5.3-flash on the assembled production
+prompt and found it 1.48x costlier and 6.8x slower. Running it as a **shadow
+experiment against live traffic** produced a categorical result the offline
+harness could not: on the shape the endpoint actually sends, the candidate
+returns **no summary at all** when tools are offered.
+
+Measured 2026-09-12 over 188 candidate calls / 602 experiment rows ($2.86):
+
+- assembled production prompt (201,279 chars), tools offered:
+  `deepseek-v4.1-flash` finish=stop, **35,038 chars**;
+  `glm-5.3-flash` finish=length, **0 chars**
+- assembled production prompt, no tools: incumbent 32,440 chars;
+  candidate 25,127 chars
+- live shadow calls: 174 of 181 `finish_reason=tool_calls`; only 67 of 181
+  produced a scoreable quality figure
+
+The first line is the decisive one: given production's real compression request
+with the request's tools present, the candidate consumes its entire 16,384-token
+budget and emits zero visible content, while the incumbent returns 35,038 chars
+on the same payload. `finish=length` with 0 chars means the budget is spent
+before any answer appears, so the call cannot serve compression at all.
+
+Caveats that keep this honest:
+
+- **Do not use the 253-message sample as a discriminator.** On that raw
+  multi-message shape BOTH models returned `tool_calls` with empty content, so it
+  separates nothing. Only the assembled single-user-message prompt — what
+  `context_compressor.py:3186` actually sends — discriminates.
+- 5 of the live shadow calls did finish with `stop`, so the candidate is not
+  universally broken; it is specifically unable to serve large compression
+  requests that carry tools.
+- This is an observational shadow result on one payload class, not a full
+  benchmark. It is decisive for compression, the only use case tested.
+
+### Operational findings that only appear when it runs for real
+
+1. **`model_pricing` was never seeded by the endpoint.** Every row logged
+   `cost_unknown=1` forever, so a live experiment produced real spend with no
+   cost evidence. `_get_db_connection()` now seeds prices at first use.
+2. **A production row must never be stamped `is_shadow=1`.** The first live
+   enablement put 34 genuine incumbent calls into the shadow bucket. Repaired by
+   clearing the flag — they are real production calls, and deleting them would
+   understate production permanently. 17 candidate rows with unrecoverable
+   semantics were quarantined rather than fabricated.
+3. **`tool_calls` is a response, not a failure.** Recording it as `success=0`
+   misreported the candidate as broken. `finish_reason`/`saw_tool_calls` are now
+   recorded so an unscoreable answer is explicable instead of silent.
+4. **Shadow spend must be reported separately.** `unit_cost` and
+   `optimiser.rank_models` exclude shadow rows by default, so production cost is
+   not overstated and an un-promoted candidate is not ranked as if serving.
+
+Cost of the experiment: $2.86 for 188 candidate calls ($0.0155/call). At the
+observed compression rate a shadow run mirrors ~$180/day, so an experiment whose
+question is answered should be switched off rather than left enabled.

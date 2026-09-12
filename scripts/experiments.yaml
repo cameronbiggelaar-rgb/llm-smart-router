@@ -33,7 +33,7 @@ experiments:
   # input and cheaper on output, but was measured slower and more verbose in the
   # offline A/B. Shadow gives real-load numbers before any traffic is moved.
   - name: glm53flash-compression-shadow
-    enabled: true
+    enabled: false
     started: '2026-09-12'
     model: glm-5.3-flash
     # The candidate is deliberately NOT in the production fallback chain.
