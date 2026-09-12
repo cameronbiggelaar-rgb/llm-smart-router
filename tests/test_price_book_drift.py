@@ -158,3 +158,49 @@ def db():
     rollup.migrate(conn)
     yield conn
     conn.close()
+
+
+# --------------------------------------------------------------------------
+# 5. subscription models priced as if metered
+# --------------------------------------------------------------------------
+
+def test_subscription_providers_are_priced_as_metered():
+    """Pin the third overstatement: subscription models billed at API rates.
+
+    ``models.py`` documents the pricing model as "All models are flat-
+    subscription or free" — ChatGPT $20/mo, Ollama Cloud $100/mo, local free —
+    and describes the registry numbers as RELATIVE COMPUTE UNITS, not dollars.
+
+    But ``unit_economics`` sums them as USD. So every ``openai-codex`` call is
+    logged with a dollar cost that was never charged: on 6 days of production
+    that is $1,094.09 of phantom spend, against a $20/mo subscription.
+
+    Measured: metered providers (ollama-cloud) accounted for $2,019.92 of
+    ledger spend against a $76.86 vendor invoice. The subscription lanes added
+    a further $1,094.09 that no invoice will ever contain.
+
+    This test pins the current behaviour. Fixing it means splitting the two
+    concepts — a per-token dollar cost for metered providers, and a budget-unit
+    consumption figure for subscription ones — which changes every existing
+    report, so it is an operator decision.
+    """
+    import models
+
+    # The registry's own docstring says these are not dollars.
+    src = (SCRIPTS_DIR / "models.py").read_text()
+    assert "RELATIVE COMPUTE UNITS" in src, (
+        "models.py no longer describes its numbers as compute units — if they "
+        "are now true dollars, delete this test and re-check subscription lanes"
+    )
+
+    # Yet a subscription provider carries a non-zero dollar price.
+    subscription_models = [
+        n for n, cfg in models.MODEL_REGISTRY.items()
+        if cfg.get("provider") == "openai-codex"
+    ]
+    assert subscription_models, "no subscription models found — has the provider label changed?"
+    priced = [n for n in subscription_models if models.MODEL_REGISTRY[n]["input"] > 0]
+    assert priced, (
+        "subscription models now have zero input price — if that is a deliberate "
+        "fix, delete this test; phantom subscription spend is resolved"
+    )
