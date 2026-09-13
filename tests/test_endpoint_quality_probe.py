@@ -139,7 +139,7 @@ def test_streaming_path_passes_the_callback_through(monkeypatch):
 
     captured = {}
 
-    async def fake_resume(pf, backend, messages, body, on_complete=None, on_summary=None):
+    async def fake_resume(pf, backend, messages, body, on_complete=None, on_summary=None, stats=None):
         captured["on_summary"] = on_summary
         if False:
             yield ""

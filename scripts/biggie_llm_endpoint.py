@@ -785,6 +785,17 @@ BUILTIN_PROVIDER_KEYS = {
     "minimax": "MINIMAX_API_KEY",
 }
 
+# Providers that accept ``stream_options={"include_usage": True}`` on a streamed
+# chat completion and answer with a final usage-bearing chunk. Verified against
+# ollama.com: without the flag NO streamed chunk carries usage, with it exactly
+# one does (``choices: []``, ``usage: {prompt_tokens, completion_tokens}``).
+#
+# This is a gate, not a courtesy: a backend that does not implement the
+# parameter may reject the request outright, so asking blindly would turn a
+# cost-capture improvement into a streaming outage. Any provider not listed here
+# simply keeps the previous behaviour (usage unavailable -> cost_unknown).
+STREAM_USAGE_CAPABLE_PROVIDERS = frozenset({"ollama-cloud"})
+
 # Routing profile: cheap, goldilocks, expensive
 ROUTING_PROFILE = os.environ.get("BIGGIE_ROUTING_PROFILE", "goldilocks").lower()
 
@@ -1240,6 +1251,42 @@ def _get_usage_tokens(response: dict, direction: str) -> int:
     return usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
 
 
+def _sse_usage_tokens(data: str) -> Tuple[int, int]:
+    """Extract ``(prompt_tokens, completion_tokens)`` from one SSE data line.
+
+    A streaming request reports usage — if the caller asks for it
+    (``stream_options.include_usage``) — in a FINAL chunk that carries an EMPTY
+    ``choices`` list, e.g.::
+
+        {"choices": [], "usage": {"prompt_tokens": 32, "completion_tokens": 7}}
+
+    That empty-choices shape is why this is a separate parser rather than a
+    branch inside a delta reader: every delta parser indexes ``choices[0]``,
+    which would discard exactly the payload carrying the token counts.
+
+    Returns ``(0, 0)`` for any chunk without usage — a normal content delta,
+    ``[DONE]``, or malformed JSON. Never raises: usage capture is diagnostic and
+    must not break a stream.
+    """
+    if not data or data == "[DONE]":
+        return 0, 0
+    try:
+        obj = json.loads(data)
+    except (ValueError, TypeError):
+        return 0, 0
+    if not isinstance(obj, dict):
+        return 0, 0
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0
+    prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    try:
+        return int(prompt or 0), int(completion or 0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return 0, 0
+
+
 def _response_has_empty_content(response: Any) -> bool:
     """Return True if a chat-completion response has empty assistant content.
 
@@ -1623,7 +1670,8 @@ def _log_request_to_db(
             # writes this marker AND a completion row carrying the same token
             # counts; pricing both counts one request twice. The marker exists
             # so an abandoned stream stays visible, so it must stay in the
-            # table — but it must never carry money.
+            # table until its completion supersedes it — but it must never
+            # carry money.
             _resolved_cost, _resolved_cost_unknown = 0.0, 0
         elif cost_unknown is None:
             # Caller did not state a cost: compute it. Never guess silently.
@@ -1635,6 +1683,29 @@ def _log_request_to_db(
             _resolved_cost = float(cost_usd or 0.0)
             _resolved_cost_unknown = 1 if cost_unknown else 0
         with _get_sqlite_lock():
+            if error_type != "streaming_in_progress" and request_id:
+                # Supersede this request's in-flight start marker.
+                #
+                # A streaming request logs a marker at route time so an abandoned
+                # stream stays visible, then logs this completion row. Leaving both
+                # made EVERY consumer responsible for remembering to exclude the
+                # marker (rollup.BILLABLE_ROW_SQL), and 48.7% of the table was
+                # markers. Removing the marker here — at the moment it is
+                # superseded — keeps the crash-recovery property (a marker with no
+                # completion is never touched, so _find_abandoned_streams still sees
+                # it) while making the table itself honest: one row per request.
+                #
+                # `request_id` must be truthy. Production rows share an empty
+                # request_id; deleting on equality would match all of them and wipe
+                # unrelated in-flight markers.
+                try:
+                    db.execute(
+                        "DELETE FROM router_logs WHERE request_id = ? "
+                        "AND error_type = 'streaming_in_progress'",
+                        (request_id,),
+                    )
+                except Exception as e:  # pragma: no cover - never break logging
+                    logger.warning("Failed to supersede stream marker: %s", e)
             db.execute(
                 """INSERT INTO router_logs (
                 timestamp, session_id, model_used, provider, task_type,
@@ -2184,6 +2255,17 @@ async def _preflight_openai_stream(
         if param in body:
             out[param] = body[param]
 
+    # Ask the backend to report token usage, so a streaming completion can
+    # record a MEASURED cost instead of the input-only figure it used to log
+    # (output_tokens was hardcoded to 0 on this path). Merge rather than
+    # replace: a caller-supplied stream_options may carry other keys.
+    if provider in STREAM_USAGE_CAPABLE_PROVIDERS:
+        _opts = dict(body.get("stream_options") or {})
+        _opts.setdefault("include_usage", True)
+        out["stream_options"] = _opts
+    elif "stream_options" in body:
+        out["stream_options"] = body["stream_options"]
+
     # Forward tool schemas so the model can emit structured tool_calls.
     if body.get("tools"):
         out["tools"] = body["tools"]
@@ -2329,6 +2411,7 @@ async def _resume_stream(
     request_body: Dict[str, Any],
     on_complete: Optional[Callable[[], None]] = None,
     on_summary: Optional[Callable[[str], None]] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[str]:
     """Replay buffered preflight events, then continue the SAME backend connection.
 
@@ -2337,6 +2420,13 @@ async def _resume_stream(
     connection, no regeneration, no token-split misalignment, no extra latency.
     Never emits a clean ``[DONE]`` for an empty preflight — empty streams are
     escalated by the caller, not returned as degenerate success.
+
+    Token usage arrives as a final chunk with an EMPTY ``choices`` list, so it
+    must be harvested here (while the bytes pass through) rather than left to a
+    delta parser that indexes ``choices[0]``. Captured counts land in ``stats``
+    for the completion logger; when they are absent the logger must record an
+    honest ``cost_unknown`` rather than an input-only figure presented as
+    measured.
     """
     resp = pf.response
     try:
@@ -2355,6 +2445,11 @@ async def _resume_stream(
         for evt in pf.buffered:
             if evt.startswith("data: "):
                 accumulated += _sse_content_text(evt[6:])
+                if stats is not None:
+                    _pin, _pout = _sse_usage_tokens(evt[6:])
+                    if _pin or _pout:
+                        stats["usage_input_tokens"] = _pin
+                        stats["usage_output_tokens"] = _pout
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
         # call silently drops the rest of the stream).
@@ -2369,6 +2464,11 @@ async def _resume_stream(
                         break
                     yield f"data: {data}\n\n"
                     accumulated += _sse_content_text(data)
+                    if stats is not None:
+                        _uin, _uout = _sse_usage_tokens(data)
+                        if _uin or _uout:
+                            stats["usage_input_tokens"] = _uin
+                            stats["usage_output_tokens"] = _uout
             await resp.aclose()
         # Scan once at the end of the stream. Repeatedly re-regexing the growing
         # buffer per delta is pointless latency; a single scan after stream close
@@ -2596,6 +2696,14 @@ async def _non_streaming_fallback_to_sse(
             stats["saw_tool_calls"] = saw_tool_calls
             stats["degraded_to_non_streaming"] = True
             stats["final_model"] = candidate_name or backend_model
+            # A non-streaming response DOES carry usage, so capture it here —
+            # this is a real measured count, not the input-only fallback the
+            # streaming loggers used to record.
+            _fin = _get_usage_tokens(result, "input")
+            _fout = _get_usage_tokens(result, "output")
+            if _fin or _fout:
+                stats["usage_input_tokens"] = _fin
+                stats["usage_output_tokens"] = _fout
             stats["final_provider"] = provider
         return StreamingResponse(
             _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
@@ -2659,6 +2767,13 @@ async def proxy_to_backend_streaming(
         if stats is not None:
             stats["saw_content"] = saw_content
             stats["saw_tool_calls"] = saw_tool_calls
+            # This branch wraps a real non-streaming response, so its usage is
+            # available and must be captured for the completion logger.
+            _lin = _get_usage_tokens(result, "input")
+            _lout = _get_usage_tokens(result, "output")
+            if _lin or _lout:
+                stats["usage_input_tokens"] = _lin
+                stats["usage_output_tokens"] = _lout
         return StreamingResponse(
             _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
             media_type="text/event-stream",
@@ -2691,7 +2806,8 @@ async def proxy_to_backend_streaming(
         stats["saw_content"] = pf.saw_content
         stats["saw_tool_calls"] = pf.saw_tool_calls
     return StreamingResponse(
-        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete, on_summary=on_summary),
+        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete,
+                       on_summary=on_summary, stats=stats),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -3080,13 +3196,32 @@ async def chat_completions(request: Request):
 
             def _log_stream_complete():
                 elapsed = time.time() - started["t"]
+                # Token usage is whatever the stream reported (captured in
+                # _resume_stream from the final usage chunk).
+                #
+                # When the backend reported usage, omit both cost fields so the logger
+                # computes a fully measured cost. When it did NOT, record the input-only
+                # estimate but pass cost_unknown explicitly — an input-only figure must
+                # never be read as a complete measured cost (B15). Both fields are passed
+                # together: a lone cost_unknown would zero the estimate.
+                _cap_in = int(_stream_stats.get("usage_input_tokens") or 0)
+                _cap_out = int(_stream_stats.get("usage_output_tokens") or 0)
+                _usage_seen = bool(_cap_in or _cap_out)
+                _cost_kw = {}
+                if not _usage_seen:
+                    _p_cost, _ = compute_cost_fields(
+                        decision.selected_model,
+                        _cap_in or features.get("context_tokens", 0),
+                        0,
+                    )
+                    _cost_kw = {"cost_usd": _p_cost, "cost_unknown": 1}
                 _log_request_to_db(
                     model_used=decision.selected_model,
                     provider=backend.get("provider", ""),
                     task_type=routed_task_type,
                     complexity_score=features["complexity_score"],
-                    input_tokens=features.get("context_tokens", 0),
-                    output_tokens=0,
+                    input_tokens=_cap_in or features.get("context_tokens", 0),
+                    output_tokens=_cap_out,
                     latency_seconds=elapsed,
                     routing_time_ms=round(routing_time * 1000),
                     success=True,
@@ -3098,6 +3233,7 @@ async def chat_completions(request: Request):
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     routing_reason=decision.reason,
+                    **_cost_kw,
                     **_obs,
                 )
 
@@ -3296,13 +3432,28 @@ async def chat_completions(request: Request):
 
             def _log_escalated_stream_complete():
                 elapsed = time.time() - started["t"]
+                # Same rule as the primary streaming logger: use the stream's reported
+                # usage when present, otherwise record the input-only estimate WITH
+                # cost_unknown set, so a partial figure is never read as measured.
+                _cap_in = int(_stream_stats.get("usage_input_tokens") or 0)
+                _cap_out = int(_stream_stats.get("usage_output_tokens") or 0)
+                _usage_seen = bool(_cap_in or _cap_out)
+                _final_model = _stream_stats.get("final_model", escalation.selected_model)
+                _cost_kw = {}
+                if not _usage_seen:
+                    _p_cost, _ = compute_cost_fields(
+                        _final_model,
+                        _cap_in or features.get("context_tokens", 0),
+                        0,
+                    )
+                    _cost_kw = {"cost_usd": _p_cost, "cost_unknown": 1}
                 _log_request_to_db(
-                    model_used=_stream_stats.get("final_model", escalation.selected_model),
+                    model_used=_final_model,
                     provider=_stream_stats.get("final_provider", backend.get("provider", "")),
                     task_type=routed_task_type,
                     complexity_score=features["complexity_score"],
-                    input_tokens=features.get("context_tokens", 0),
-                    output_tokens=0,
+                    input_tokens=_cap_in or features.get("context_tokens", 0),
+                    output_tokens=_cap_out,
                     latency_seconds=elapsed,
                     routing_time_ms=round(routing_time * 1000),
                     success=True,
@@ -3313,8 +3464,9 @@ async def chat_completions(request: Request):
                     compression_time_ms=compression_stats["compression_time_ms"],
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
-                    final_model=_stream_stats.get("final_model", escalation.selected_model),
+                    final_model=_final_model,
                     routing_reason=escalation.reason,
+                    **_cost_kw,
                     **_obs,
                 )
 
