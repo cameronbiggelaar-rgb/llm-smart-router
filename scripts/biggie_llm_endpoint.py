@@ -2076,6 +2076,17 @@ async def proxy_to_backend(
 
 
 @dataclass
+class _StreamChannelStats:
+    """Bounded observability for text channels in one streamed response."""
+
+    content_chars: int = 0
+    reasoning_chars: int = 0
+    tool_call_deltas: int = 0
+    content_tail: str = ""
+    reasoning_tail: str = ""
+
+
+@dataclass
 class _StreamPreflight:
     """Result of a bounded stream preflight, before committing a downstream response.
 
@@ -2134,14 +2145,12 @@ def _sse_delta_parts(data: str) -> Tuple[bool, bool, bool]:
 
 
 def _sse_content_text(data: str) -> str:
-    """Extract the text content from one SSE ``data:`` payload.
+    """Extract the text content from one SSE ``data:`` payload."""
+    return _sse_channel_text(data, "content")
 
-    Returns only the streamed content delta(s) as string, concatenated across
-    choices. Tool-call deltas and non-content fields are ignored. Empty string
-    when the payload carries no content (or is unparsable / terminal). This is
-    the raw accumulation source for mid-stream degeneration detection — it must
-    NOT be fed back into the client path.
-    """
+
+def _sse_channel_text(data: str, key: str) -> str:
+    """Extract text from one streamed delta channel (``content``/``reasoning``)."""
     if data == "[DONE]":
         return ""
     try:
@@ -2157,10 +2166,43 @@ def _sse_content_text(data: str) -> str:
         delta = ch.get("delta") or {}
         if not isinstance(delta, dict):
             continue
-        c = delta.get("content")
+        c = delta.get(key)
         if isinstance(c, str) and c:
             parts.append(c)
     return "".join(parts)
+
+
+def _sse_tool_call_delta_count(data: str) -> int:
+    """Count structured tool-call deltas in one SSE payload."""
+    if data == "[DONE]":
+        return 0
+    try:
+        evt = json.loads(data)
+    except (json.JSONDecodeError, AttributeError):
+        return 0
+    if not isinstance(evt, dict):
+        return 0
+    n = 0
+    for ch in evt.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta") or {}
+        if isinstance(delta, dict) and delta.get("tool_calls"):
+            n += 1
+    return n
+
+
+def _update_stream_channel_stats(stats: _StreamChannelStats, data: str) -> None:
+    """Update bounded channel counters from one streamed SSE payload."""
+    content = _sse_channel_text(data, "content")
+    reasoning = _sse_channel_text(data, "reasoning")
+    stats.content_chars += len(content)
+    stats.reasoning_chars += len(reasoning)
+    stats.tool_call_deltas += _sse_tool_call_delta_count(data)
+    if content:
+        stats.content_tail = (stats.content_tail + content)[-400:]
+    if reasoning:
+        stats.reasoning_tail = (stats.reasoning_tail + reasoning)[-400:]
 
 
 def _alert_stream_degeneration(
@@ -2216,19 +2258,21 @@ async def _preflight_openai_stream(
     backend: Dict[str, Any],
     messages: List[Dict[str, Any]],
     body: Dict[str, Any],
+    workload_type: str = "",
 ) -> _StreamPreflight:
     """Probe a streaming backend connection and buffer until a decision.
 
     Buffers upstream SSE events until one of:
-      A. first meaningful content delta      -> status "ok"
-      B. first structured tool-call delta    -> status "ok"
-      C. upstream error                      -> status "error"
-      D. [DONE] with no prior content        -> status "empty"
+    A. first meaningful content delta -> status "ok"
+    B. first structured tool-call delta -> status "ok" for tool-capable workloads,
+       but a tool-call-only ``session_compression`` stream is treated as empty
+    C. upstream error -> status "error"
+    D. [DONE] with no prior content -> status "empty"
 
-    The probe connection is CLOSED in all cases. For a healthy stream (A/B) the
-    caller re-opens a FRESH connection for the actual downstream stream (httpx
-    responses can only be consumed once). For C/D the caller escalates
-    server-side.
+    The probe connection is KEPT OPEN for a healthy stream. The downstream
+    response resumes the same iterator, so no content is lost and no second
+    backend request can produce a token-split mismatch. For empty/error streams
+    the caller escalates server-side before returning anything to the client.
     """
     base_url = backend.get("base_url", "")
     api_key = backend.get("api_key", "")
@@ -2318,11 +2362,17 @@ async def _preflight_openai_stream(
                     pf.saw_content = True
                 if saw_tool:
                     pf.saw_tool_calls = True
-                if saw_content or saw_tool:
-                    pf.status = "ok"
-                    pf.buffered = buffered
-                    pf.response = resp
-                    return pf
+                if saw_content or (saw_tool and workload_type != "session_compression"):
+                 pf.status = "ok"
+                 pf.buffered = buffered
+                 pf.response = resp
+                 return pf
+                if saw_tool and workload_type == "session_compression":
+                 pf.status = "empty"
+                 pf.error = "Backend emitted tool-call-only stream for session_compression"
+                 pf.buffered = buffered
+                 await resp.aclose()
+                 return pf
                 if is_terminal:
                     if data == "[DONE]":
                         pf.status = "empty"
@@ -2401,13 +2451,14 @@ async def _open_fresh_stream(
 
 
 async def _resume_stream(
-    pf: _StreamPreflight,
-    backend: Dict[str, Any],
-    messages: List[Dict[str, Any]],
-    request_body: Dict[str, Any],
-    on_complete: Optional[Callable[[], None]] = None,
-    on_summary: Optional[Callable[[str], None]] = None,
-    stats: Optional[Dict[str, Any]] = None,
+ pf: _StreamPreflight,
+ backend: Dict[str, Any],
+ messages: List[Dict[str, Any]],
+ request_body: Dict[str, Any],
+ on_complete: Optional[Callable[[], None]] = None,
+ on_summary: Optional[Callable[[str], None]] = None,
+ stats: Optional[Dict[str, Any]] = None,
+ trace_channels: bool = False,
 ) -> AsyncIterator[str]:
     """Replay buffered preflight events, then continue the SAME backend connection.
 
@@ -2438,14 +2489,18 @@ async def _resume_stream(
         # forwarded unchanged and the alert (recovery_log + ERROR log) captures
         # the full context for future debugging.
         accumulated = pf.accumulated
+        channel_stats = _StreamChannelStats() if trace_channels else None
         for evt in pf.buffered:
-            if evt.startswith("data: "):
-                accumulated += _sse_content_text(evt[6:])
-                if stats is not None:
-                    _pin, _pout = _sse_usage_tokens(evt[6:])
-                    if _pin or _pout:
-                        stats["usage_input_tokens"] = _pin
-                        stats["usage_output_tokens"] = _pout
+         if evt.startswith("data: "):
+          data = evt[6:]
+          accumulated += _sse_content_text(data)
+          if channel_stats is not None:
+           _update_stream_channel_stats(channel_stats, data)
+          if stats is not None:
+           _pin, _pout = _sse_usage_tokens(data)
+           if _pin or _pout:
+            stats["usage_input_tokens"] = _pin
+            stats["usage_output_tokens"] = _pout
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
         # call silently drops the rest of the stream).
@@ -2459,6 +2514,8 @@ async def _resume_stream(
                         yield f"data: {data}\n\n"
                         break
                     yield f"data: {data}\n\n"
+                    if channel_stats is not None:
+                     _update_stream_channel_stats(channel_stats, data)
                     accumulated += _sse_content_text(data)
                     if stats is not None:
                         _uin, _uout = _sse_usage_tokens(data)
@@ -2469,6 +2526,17 @@ async def _resume_stream(
         # Scan once at the end of the stream. Repeatedly re-regexing the growing
         # buffer per delta is pointless latency; a single scan after stream close
         # still catches the degenerate output that reached the client.
+        if channel_stats is not None:
+         logger.error(
+          "session_compression_channel_trace model=%s provider=%s content_chars=%s reasoning_chars=%s tool_call_deltas=%s content_tail=%r reasoning_tail=%r",
+          pf.backend_model,
+          pf.provider,
+          channel_stats.content_chars,
+          channel_stats.reasoning_chars,
+          channel_stats.tool_call_deltas,
+          channel_stats.content_tail,
+          channel_stats.reasoning_tail,
+         )
         pattern = _scan_stream_content(accumulated)
         if pattern:
             _alert_stream_degeneration(
@@ -2746,7 +2814,8 @@ async def proxy_to_backend_streaming(
         raise HTTPException(status_code=502, detail=f"No base_url for backend")
 
     # Local Ollama and Codex do not support true SSE streaming here — call the
-    # non-streaming path and wrap. Empty results escalate (no degenerate success).
+    # non-streaming path and wrap. Empty or tool-call-only session-compression
+    # results escalate (no degenerate success).
     if provider in ("local", "openai-codex"):
         result = await proxy_to_backend(backend, messages, request_body)
         if _response_has_empty_content(result):
@@ -2760,16 +2829,25 @@ async def proxy_to_backend_streaming(
                 detail=f"Backend {backend_model} returned empty content",
             )
         saw_content, saw_tool_calls = _response_delta_parts(result)
+        if request_body.get("_workload_type") == "session_compression" and saw_tool_calls and not saw_content:
+            logger.warning(
+                "Backend %s returned tool-call-only content for session_compression, escalating",
+                backend_model,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {backend_model} returned tool-call-only session compression",
+            )
         if stats is not None:
             stats["saw_content"] = saw_content
             stats["saw_tool_calls"] = saw_tool_calls
-            # This branch wraps a real non-streaming response, so its usage is
-            # available and must be captured for the completion logger.
-            _lin = _get_usage_tokens(result, "input")
-            _lout = _get_usage_tokens(result, "output")
-            if _lin or _lout:
-                stats["usage_input_tokens"] = _lin
-                stats["usage_output_tokens"] = _lout
+        # This branch wraps a real non-streaming response, so its usage is
+        # available and must be captured for the completion logger.
+        _lin = _get_usage_tokens(result, "input")
+        _lout = _get_usage_tokens(result, "output")
+        if _lin or _lout:
+            stats["usage_input_tokens"] = _lin
+            stats["usage_output_tokens"] = _lout
         return StreamingResponse(
             _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
             media_type="text/event-stream",
@@ -2777,7 +2855,9 @@ async def proxy_to_backend_streaming(
         )
 
     # OpenAI-compatible streaming path: bounded preflight, then commit.
-    pf = await _preflight_openai_stream(backend, messages, request_body)
+    pf = await _preflight_openai_stream(
+     backend, messages, request_body, workload_type=request_body.get("_workload_type", "")
+    )
 
     if pf.status == "error":
         logger.error(
@@ -2802,10 +2882,13 @@ async def proxy_to_backend_streaming(
         stats["saw_content"] = pf.saw_content
         stats["saw_tool_calls"] = pf.saw_tool_calls
     return StreamingResponse(
-        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete,
-                       on_summary=on_summary, stats=stats),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+     _resume_stream(
+      pf, backend, messages, request_body, on_complete=on_complete,
+      on_summary=on_summary, stats=stats,
+      trace_channels=request_body.get("_trace_session_compression_channels") is True,
+     ),
+     media_type="text/event-stream",
+     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -2895,6 +2978,11 @@ async def chat_completions(request: Request):
     # Extract features from the prompt and classify first-class workload.
     features = extract_features_from_messages(messages)
     workload_type = detect_workload_type(messages, body, dict(request.headers))
+    body["_workload_type"] = workload_type
+    body["_trace_session_compression_channels"] = (
+     workload_type == "session_compression"
+     and os.environ.get("BIGGIE_TRACE_SESSION_COMPRESSION_CHANNELS", "") == "1"
+    )
     routed_task_type = "session_compression" if workload_type == "session_compression" else features["task_type"]
 
     # Check limp-home

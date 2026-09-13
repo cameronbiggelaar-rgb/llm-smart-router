@@ -139,7 +139,10 @@ def test_streaming_path_passes_the_callback_through(monkeypatch):
 
     captured = {}
 
-    async def fake_resume(pf, backend, messages, body, on_complete=None, on_summary=None, stats=None):
+    async def fake_resume(
+        pf, backend, messages, body, on_complete=None, on_summary=None,
+        stats=None, trace_channels=False,
+    ):
         captured["on_summary"] = on_summary
         if False:
             yield ""
@@ -156,7 +159,7 @@ def test_streaming_path_passes_the_callback_through(monkeypatch):
         provider = "ollama-cloud"
         backend_model = "deepseek-v4.1-flash"
 
-    async def fake_preflight(backend, messages, body):
+    async def fake_preflight(backend, messages, body, workload_type=""):
         return FakePF()
 
     monkeypatch.setattr(ep, "_preflight_openai_stream", fake_preflight)
