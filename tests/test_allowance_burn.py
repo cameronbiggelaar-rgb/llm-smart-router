@@ -198,3 +198,91 @@ def test_report_states_that_a_projection_is_not_an_invoice():
     rendered = a.format_report(report)
     assert "not an invoice" in rendered
     assert "projected_from_snapshot" in rendered
+
+
+# --------------------------------------------------------------------------
+# Regression: the CLI's ledger query must use the SAME billable definition as
+# the rest of the codebase (`rollup.BILLABLE_ROW_SQL`) - billable work is
+# excluded by "streaming_in_progress" and ONLY that, since a streaming request
+# writes a start marker plus a completion row and both are real rows.
+#
+# An extra `cost_unknown = 0` here looked harmless and passed every unit test,
+# but silently dropped 5.2pct of billable tokens (2,442 rows / 147M tokens in
+# the last 7 days - the rows repaired by the cost backfill, which are billable
+# work with a reconstructed price) and biased avg-input by +1.41pct. That bias
+# feeds the marginal rate, so the projection drifted off the dashboard - the
+# exact false positive this report exists to avoid.
+# --------------------------------------------------------------------------
+
+
+def _ledger_db(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "logs.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE router_logs (
+               timestamp TEXT, input_tokens INTEGER, request_id TEXT,
+               error_type TEXT, cost_unknown INTEGER DEFAULT 0)"""
+    )
+    rows = [
+        # ordinary billable completion
+        ("2026-09-12T01:00:00", 1000, "r1", None, 0),
+        # backfilled billable row: real work, price reconstructed later
+        ("2026-09-12T01:01:00", 2000, "r2", None, 1),
+        # streaming start marker: NOT billable, must be excluded
+        ("2026-09-12T01:02:00", 9999, "r3", "streaming_in_progress", 0),
+    ]
+    conn.executemany("INSERT INTO router_logs VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    return conn
+
+
+def test_ledger_query_keeps_backfilled_billable_rows(tmp_path):
+    """A cost_unknown=1 row is billable work - the backfill repaired its price."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(SCRIPTS_DIR))
+    import router_ops
+
+    conn = _ledger_db(tmp_path)
+    _since, avg_in, total_in, _reqs = router_ops._ledger_burn_inputs(conn, 3650)
+    assert total_in == 3000, (
+        "backfilled (cost_unknown=1) billable tokens must be counted; "
+        f"got {total_in}"
+    )
+    assert avg_in == pytest.approx(1500.0)
+
+
+def test_ledger_query_excludes_streaming_markers(tmp_path):
+    """The one exclusion is the streaming start marker, not the price state."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(SCRIPTS_DIR))
+    import router_ops
+
+    conn = _ledger_db(tmp_path)
+    _since, avg_in, total_in, _reqs = router_ops._ledger_burn_inputs(conn, 3650)
+    assert total_in < 9999, "the streaming_in_progress marker must not count"
+    assert avg_in == pytest.approx(1500.0)
+
+
+def test_ledger_query_matches_the_canonical_billable_definition(tmp_path):
+    """Pin the CLI filter to rollup.BILLABLE_ROW_SQL so they cannot drift apart."""
+    import sqlite3  # noqa: F401
+    import sys as _sys
+
+    _sys.path.insert(0, str(SCRIPTS_DIR))
+    import router_ops
+    from rollup import BILLABLE_ROW_SQL
+
+    conn = _ledger_db(tmp_path)
+    _since, _avg, total_in, _reqs = router_ops._ledger_burn_inputs(conn, 3650)
+    expected = conn.execute(
+        "SELECT SUM(input_tokens) FROM router_logs WHERE input_tokens > 0 AND "
+        + BILLABLE_ROW_SQL
+    ).fetchone()[0]
+    assert total_in == expected, (
+        "allowance ledger volume must equal the codebase's canonical billable "
+        "volume; the two definitions have drifted"
+    )

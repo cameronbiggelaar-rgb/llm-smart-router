@@ -248,7 +248,6 @@ def _ledger_burn_inputs(conn: sqlite3.Connection, days: int):
         FROM router_logs
         WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
           AND input_tokens > 0
-          AND COALESCE(cost_unknown, 0) = 0
           AND COALESCE(error_type, '') != 'streaming_in_progress'
         """,
         (since,),
