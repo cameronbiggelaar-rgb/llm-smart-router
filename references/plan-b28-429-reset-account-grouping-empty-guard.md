@@ -50,7 +50,32 @@ cap, and stop the empty-content guard from false-alarming on legit
 
 ## Process
 
-- TDD batch-by-batch: RED → GREEN → commit per batch, each batch its own test
-  file.
+- TDD batch-by-batch: RED → GREEN → commit per batch, each batch its own test file.
 - Focused tests, then full suite, then preflight before restart.
 - No live restart until all three are green and the user is told.
+
+## Result (2026-09-13, committed)
+
+All three shipped; full suite 461 → **495 passed**, working tree clean.
+
+- `afc3e5f` — B28 (this batch, 13 files) + `738579b` — B27 channel-trace work
+  split out so each batch is bisectable.
+- Batch 1: `mark_rate_limited(retry_after_s=, resets_at_s=)`,
+  `_extract_429_reset_time()`, all 6 `_handle_backend_status` call sites now
+  pass `error_text` + `headers`.
+- Batch 2: `models.ACCOUNT_QUOTA_PROVIDERS` / `model_account()`,
+  `router.get_model_account()` / `mark_account_rate_limited()`,
+  `_extract_429_account_cap()`, escalation skips capped accounts.
+- Batch 3: `_empty_content_reason()` — `length` no longer escalates.
+- Found while testing: `_normalize_model_name` strips the `:cloud` suffix, so
+  `minimax-m2.7:cloud` never resolved an account; `get_model_account()` now
+  tries the exact registry name first. Also: an unregistered failing model was
+  not itself held on an account cap (only its registered siblings were).
+- **Live process still runs pre-B28 code** (`MainPID=316924`, started before
+  these commits). Not restarted deliberately — restart is the user's call.
+
+### Deferred (unchanged)
+
+- In-memory/DB drift fix (`--recover` vs live `_MODEL_STATUSES`) → needs an
+  admin endpoint or SIGHUP reload.
+- Health-vs-routing observability metric.
