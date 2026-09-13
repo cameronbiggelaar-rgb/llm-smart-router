@@ -251,35 +251,57 @@ if "dolphin3" not in _MODEL_STATUSES:
     _save_model_state(_MODEL_STATUSES["dolphin3"])
 
 
-def mark_rate_limited(model: str) -> None:
-    """Mark a model as rate-limited with exponential backoff.
+def mark_rate_limited(
+    model: str,
+    retry_after_s: Optional[float] = None,
+    resets_at_s: Optional[float] = None,
+    count_failure: bool = True,
+) -> None:
+    """Mark a model as rate-limited.
 
-    First failure: 1 min cooldown
-    Second: 2 min
-    Third: 4 min
-    ...
-    Cap: 1 hour
+    Cooldown source, in priority order:
+      1. ``resets_at_s``   — absolute unix epoch the upstream said it recovers
+      2. ``retry_after_s`` — upstream relative delay in seconds
+      3. exponential backoff 60s * 2^(failures-1), capped at 1 hour
+
+    An explicit upstream reset time is AUTHORITATIVE and is not clamped to the
+    1-hour backoff cap: an account-wide quota (e.g. ChatGPT Plus
+    ``usage_limit_reached``) can reset hours out, and retrying before it only
+    burns the whole model family against the same wall.
     """
     status = _MODEL_STATUSES.get(model)
     if not status:
         return
 
-    status.consecutive_failures += 1
+    if count_failure:
+        status.consecutive_failures += 1
     status.last_error = "rate_limit"
 
-    # Exponential backoff: 60s * 2^(failures-1), capped at 1 hour
-    cooldown = min(
-        RATE_LIMIT_COOLDOWN_BASE * (2 ** (status.consecutive_failures - 1)),
-        RATE_LIMIT_COOLDOWN_MAX,
-    )
-    status.rate_limited_until = time.time() + cooldown
+    now = time.time()
+    if resets_at_s is not None and resets_at_s > now:
+        # Authoritative upstream reset time (absolute epoch). Not clamped.
+        cooldown = resets_at_s - now
+    elif retry_after_s is not None and retry_after_s > 0:
+        # Upstream relative delay, e.g. a Retry-After header.
+        cooldown = retry_after_s
+    else:
+        # Exponential backoff: 60s * 2^(failures-1), capped at 1 hour
+        cooldown = min(
+            RATE_LIMIT_COOLDOWN_BASE * (2 ** (max(status.consecutive_failures, 1) - 1)),
+            RATE_LIMIT_COOLDOWN_MAX,
+        )
+    status.rate_limited_until = now + cooldown
     status.available = False
 
     _save_model_state(status)
     _log_recovery_event(model, "rate_limited",
                         f"cooldown={cooldown}s, failures={status.consecutive_failures}")
-    logger.warning("Model %s rate-limited for %ds (failure #%d)",
-                   model, cooldown, status.consecutive_failures)
+    if count_failure:
+        logger.warning("Model %s rate-limited for %ds (failure #%d)",
+                       model, cooldown, status.consecutive_failures)
+    else:
+        logger.warning("Model %s rate-limited for %ds (account cap, not a per-model failure)",
+                       model, cooldown)
 
 
 def mark_credential_expired(model: str, detail: str = "") -> None:
@@ -385,6 +407,76 @@ def is_model_available(model: str) -> bool:
             _save_model_state(status)
 
     return status.available
+
+
+def get_model_account(model: str) -> str:
+    """Return the billing/quota account a model draws on ("" if none).
+
+    A 429 from a quota-bearing account caps EVERY model on it, so escalation
+    must treat the group as one unit rather than walking the family into the
+    same wall.
+    """
+    from models import model_account
+    # Exact registry name first: _normalize_model_name strips ":cloud"-style
+    # suffixes, which are part of some registry keys (minimax-m2.7:cloud).
+    for candidate in (model, _normalize_model_name(model)):
+        acct = model_account(candidate)
+        if acct:
+            return acct
+    # Unknown-but-registered models: fall back to provider, but only when that
+    # provider is a known quota-bearing account.
+    try:
+        from models import ACCOUNT_QUOTA_PROVIDERS
+        provider = _get_provider(model)
+        return provider if provider in ACCOUNT_QUOTA_PROVIDERS else ""
+    except Exception:
+        return ""
+
+
+def models_in_account(account: str) -> List[str]:
+    """All registered models drawing on the given billing account."""
+    if not account:
+        return []
+    return [m for m in MODEL_COST_ORDER if get_model_account(m) == account]
+
+
+def mark_account_rate_limited(
+    account: str,
+    retry_after_s: Optional[float] = None,
+    resets_at_s: Optional[float] = None,
+) -> List[str]:
+    """Mark every model on an account as rate-limited by one account-wide cap.
+
+    Returns the affected model names. Local/quoteless models are never
+    affected. A single account-cap event must NOT inflate each sibling's
+    consecutive_failure count — that is what drove gpt-5.5 to 75 failures —
+    so siblings are marked rate-limited without counting a per-model failure.
+    """
+    affected: List[str] = []
+    for model in models_in_account(account):
+        status = _MODEL_STATUSES.get(model)
+        if not status:
+            status = ModelStatus(model=model)
+            _MODEL_STATUSES[model] = status
+        mark_rate_limited(
+            model,
+            retry_after_s=retry_after_s,
+            resets_at_s=resets_at_s,
+            count_failure=False,
+        )
+        affected.append(model)
+
+    if affected:
+        logger.warning(
+            "Account %s rate-limited by upstream cap — %d models held: %s",
+            account, len(affected), ", ".join(affected),
+        )
+        _log_recovery_event(
+            account, "account_rate_limited",
+            f"models={len(affected)}, retry_after={retry_after_s}, "
+            f"resets_at={resets_at_s}",
+        )
+    return affected
 
 
 def get_available_models() -> List[str]:
@@ -971,7 +1063,14 @@ def escalate_on_failure(
     status = _MODEL_STATUSES.get(failed_model_key)
 
     if error_type == "rate_limit":
-        mark_rate_limited(failed_model_key)
+        # Never let a guessed backoff SHORTEN an authoritative cooldown that
+        # already came from upstream (a 429 reset time / Retry-After). Without
+        # this guard the escalation path re-marked the model with the 60s
+        # exponential floor and dropped a correct multi-hour hold.
+        _existing = _MODEL_STATUSES.get(failed_model_key)
+        if not (_existing and _existing.rate_limited_until
+                and _existing.rate_limited_until > time.time()):
+            mark_rate_limited(failed_model_key)
     elif error_type in ("malformed_tool_call", "empty_content", "degeneration"):
         # Model-output quality failures: the backend is reachable and healthy,
         # but the model emitted a malformed tool call or empty content.

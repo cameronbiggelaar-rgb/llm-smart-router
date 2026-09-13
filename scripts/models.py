@@ -199,6 +199,28 @@ MODEL_CAPABILITY_TIERS: Dict[str, int] = {
     name: cfg["tier"] for name, cfg in MODEL_REGISTRY.items()
 }
 
+# Providers whose quota is billed/limited per ACCOUNT rather than per model.
+# A 429 from one of these means every model on that provider is capped — the
+# escalation ladder must not walk the family into the same wall. Local models
+# are not listed: no quota-bearing account is involved.
+ACCOUNT_QUOTA_PROVIDERS: frozenset = frozenset({
+    "openai-codex",
+    "ollama-cloud",
+})
+
+
+def model_account(model: str) -> str:
+    """Return the billing/quota account a model draws on ("" if none).
+
+    Account == provider for every quota-bearing provider, derived from
+    MODEL_REGISTRY so it can never drift from the model table.
+    """
+    cfg = MODEL_REGISTRY.get(model)
+    if not cfg:
+        return ""
+    provider = cfg.get("provider", "")
+    return provider if provider in ACCOUNT_QUOTA_PROVIDERS else ""
+
 
 
 # ── SQLite Schema ─────────────────────────────────────────────────────────────

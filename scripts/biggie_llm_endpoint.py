@@ -57,6 +57,8 @@ from router import (
     check_limp_home_status,
     get_recovery_summary,
     mark_rate_limited,
+    mark_account_rate_limited,
+    get_model_account,
     mark_credential_expired,
     log_recovery_event,
     mark_available,
@@ -173,19 +175,157 @@ _experiments_cache: Optional[List[Experiment]] = None
 _experiments_cache_time: float = 0.0
 
 
+def _extract_429_reset_time(
+    error_text: str = "", headers: Optional[Any] = None
+) -> Optional[float]:
+    """Extract an explicit unix-epoch reset time from a 429 response.
+
+    Returns the absolute epoch the upstream says the quota recovers, or None
+    when the upstream gave no explicit time (caller then uses backoff).
+
+    Sources, in order:
+      1. ``Retry-After`` header (integer seconds or HTTP-date)
+      2. JSON body ``resets_at`` / ``reset_at`` / ``resetsAt`` (epoch seconds)
+
+    Why this matters: a blind exponential backoff (cap 1h) retries an
+    account-wide quota cap (e.g. ChatGPT Plus ``usage_limit_reached``) hours
+    before it resets, burning every model on the same account and driving
+    consecutive_failures into the 70s.
+    """
+    # 1. Retry-After header
+    if headers:
+        raw = None
+        try:
+            raw = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            raw = None
+        if raw:
+            raw = str(raw).strip()
+            if raw.isdigit():
+                return time.time() + float(raw)
+            try:
+                import email.utils as _eu
+                parsed = _eu.parsedate_to_datetime(raw)
+                if parsed is not None:
+                    return parsed.timestamp()
+            except Exception:
+                pass
+
+    # 2. JSON body epoch
+    if not error_text:
+        return None
+    try:
+        data = json.loads(error_text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    candidates = []
+    err = data.get("error")
+    if isinstance(err, dict):
+        candidates.append(err)
+    candidates.append(data)
+
+    for scope in candidates:
+        for key in ("resets_at", "reset_at", "resetsAt", "reset_time"):
+            val = scope.get(key)
+            if val is None:
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                continue
+            # Guard against millisecond epochs.
+            if num > 1e12:
+                num /= 1000.0
+            if num > time.time():
+                return num
+    return None
+
+
+def _extract_429_account_cap(error_text: str = "") -> bool:
+    """True when a 429 is an ACCOUNT-wide cap, not a per-model throttle.
+
+    Two upstream shapes here mean "this whole billing account is capped":
+      * ChatGPT Plus / Codex: ``usage_limit_reached`` or a ``plan_type``
+        quota message — every gpt-5.x model draws on the same Plus account.
+      * ollama-cloud: "usage credits auto reload monthly max reached" —
+        every ollama-cloud model draws on the same credit balance.
+
+    A plain per-model rate limit ("rate limit exceeded", TPM throttle) is NOT
+    an account cap and must keep the narrow per-model handling.
+    """
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+
+    # ollama-cloud credit cap
+    if "usage credits" in lowered and (
+        "monthly max" in lowered or "add usage credits" in lowered
+    ):
+        return True
+
+    # Codex / ChatGPT account quota
+    try:
+        data = json.loads(error_text)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        err = data.get("error") if isinstance(data.get("error"), dict) else data
+        if isinstance(err, dict):
+            code = str(err.get("code") or "").lower()
+            etype = str(err.get("type") or "").lower()
+            if code in ("usage_limit_reached", "insufficient_quota") or etype in (
+                "usage_limit_reached",
+                "insufficient_quota",
+            ):
+                return True
+            if err.get("plan_type"):
+                return True
+    # Non-JSON / truncated bodies still carry the marker.
+    if "usage_limit_reached" in lowered or "insufficient_quota" in lowered:
+        return True
+    return False
+
+
 def _handle_backend_status(
-    provider: str, backend_model: str, status: int, error_text: str = ""
+    provider: str, backend_model: str, status: int, error_text: str = "",
+    headers: Optional[Any] = None,
 ) -> None:
     """Classify a non-2xx backend response and record the failure state.
 
-    - 429 -> mark_rate_limited (transient; recovers on its own)
+    - 429 -> mark_rate_limited (transient; recovers on its own). An explicit
+      upstream reset time (Retry-After header or a ``resets_at`` epoch in the
+      body) is honoured instead of blind exponential backoff. When the 429 is
+      an ACCOUNT-wide cap, every model on that account is held, so the
+      escalation ladder cannot walk the family into the same wall.
     - 401/403 -> mark_credential_expired on the codex provider (needs human
       re-auth; surfaces as a distinct 'credential_expired' event instead of a
       generic 'error' / silent circuit trip)
     - everything else -> left to normal escalation / circuit breaker
     """
     if status == 429:
-        mark_rate_limited(backend_model)
+        reset_at = _extract_429_reset_time(error_text, headers)
+        if _extract_429_account_cap(error_text):
+            account = get_model_account(backend_model) or provider
+            affected = mark_account_rate_limited(account, resets_at_s=reset_at)
+            logger.error(
+                "Account-wide 429 cap on %s (%s) — held %d models: %s",
+                account, backend_model, len(affected), ", ".join(affected),
+            )
+            # The failing model must always be held, even when it is not a
+            # registrable member of the account (unknown/new backend name).
+            if backend_model not in affected:
+                if reset_at is not None:
+                    mark_rate_limited(backend_model, resets_at_s=reset_at)
+                else:
+                    mark_rate_limited(backend_model)
+            return
+        if reset_at is not None:
+            mark_rate_limited(backend_model, resets_at_s=reset_at)
+        else:
+            mark_rate_limited(backend_model)
     elif status in (401, 403) and provider == "openai-codex":
         mark_credential_expired(
             backend_model,
@@ -1283,6 +1423,25 @@ def _sse_usage_tokens(data: str) -> Tuple[int, int]:
         return 0, 0
 
 
+def _empty_content_reason(response: Any) -> str:
+    """Return why a response is NOT a defect, else "" (it is empty).
+
+    Only ``length`` qualifies: the model was mid-generation and the token
+    budget ran out, so blank content is a caller budget problem rather than a
+    backend defect. Every other finish_reason (including an absent one, or
+    ``tool_calls`` with no tool_calls payload) stays conservative and is
+    treated as empty.
+    """
+    if not isinstance(response, dict):
+        return ""
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    if choices[0].get("finish_reason") == "length":
+        return "length"
+    return ""
+
+
 def _response_has_empty_content(response: Any) -> bool:
     """Return True if a chat-completion response has empty assistant content.
 
@@ -1295,7 +1454,15 @@ def _response_has_empty_content(response: Any) -> bool:
     A response that carries structured ``tool_calls`` is NOT empty even when
     ``content`` is blank — the model produced a real action for the client to
     execute. Such responses must not be escalated.
+
+    A response whose ``finish_reason`` is ``length`` is likewise NOT empty:
+    the model was still generating when the token budget ran out, so the blank
+    content reflects the caller's ``max_tokens``, not a broken backend.
+    Escalating those produced false alarms that looked identical in the journal
+    to a genuinely degenerate backend.
     """
+    if _empty_content_reason(response) == "length":
+        return False
     if not isinstance(response, dict):
         return False
     choices = response.get("choices") or []
@@ -1867,9 +2034,13 @@ async def proxy_to_backend(
             async with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     error_text = await resp.aread()
-                    detail = f"Backend error: {error_text[:500].decode()}"
+                    decoded = error_text.decode(errors="replace")
+                    detail = f"Backend error: {decoded[:500]}"
                     logger.error("Backend %s returned %d: %s", provider, resp.status_code, detail)
-                    _handle_backend_status(provider, backend_model, resp.status_code)
+                    _handle_backend_status(
+                        provider, backend_model, resp.status_code,
+                        error_text=decoded, headers=resp.headers,
+                    )
                     raise HTTPException(status_code=502, detail=detail)
 
                 # Collect SSE events — assemble the response from stream events
@@ -1922,7 +2093,10 @@ async def proxy_to_backend(
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
             logger.error("Backend %s returned %d: %s", provider, status, detail)
-            _handle_backend_status(provider, backend_model, status)
+            _handle_backend_status(
+                provider, backend_model, status,
+                error_text=e.response.text, headers=e.response.headers,
+            )
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
             logger.error("Backend %s request failed: %s", provider, e)
@@ -2033,7 +2207,10 @@ async def proxy_to_backend(
             status = e.response.status_code
             detail = f"Backend error: {e.response.text[:500]}"
             logger.error("Backend %s returned %d: %s", provider, status, detail)
-            _handle_backend_status(provider, backend_model, status)
+            _handle_backend_status(
+                provider, backend_model, status,
+                error_text=e.response.text, headers=e.response.headers,
+            )
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
             logger.error("Backend %s request failed: %s", provider, e)
@@ -2068,7 +2245,10 @@ async def proxy_to_backend(
         status = e.response.status_code
         detail = f"Backend error: {e.response.text[:500]}"
         logger.error("Backend %s returned %d: %s", provider, status, detail)
-        _handle_backend_status(provider, backend_model, status)
+        _handle_backend_status(
+            provider, backend_model, status,
+            error_text=e.response.text, headers=e.response.headers,
+        )
         raise HTTPException(status_code=502, detail=detail)
     except httpx.RequestError as e:
         logger.error("Backend %s request failed: %s", provider, e)
@@ -2329,7 +2509,10 @@ async def _preflight_openai_stream(
         except Exception:
             error_text = ""
         await resp.aclose()
-        _handle_backend_status(provider, backend_model, resp.status_code)
+        _handle_backend_status(
+            provider, backend_model, resp.status_code,
+            error_text=error_text, headers=resp.headers,
+        )
         logger.error("Backend %s returned %d during preflight: %s", provider, resp.status_code, error_text[:500])
         return _StreamPreflight(
             status="error", backend_model=backend_model, provider=provider,
@@ -2444,7 +2627,10 @@ async def _open_fresh_stream(
         except Exception:
             error_text = ""
         await resp.aclose()
-        _handle_backend_status(provider, backend_model, resp.status_code)
+        _handle_backend_status(
+            provider, backend_model, resp.status_code,
+            error_text=error_text, headers=resp.headers,
+        )
         logger.error("Backend %s returned %d: %s", provider, resp.status_code, error_text[:500])
         raise HTTPException(status_code=502, detail=f"Backend error: {error_text[:500]}")
     return resp, url

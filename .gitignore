@@ -29,3 +29,5 @@ Thumbs.db
 .pytest_cache/
 biggie_router.db
 router_state.db
+# Manual pre-recovery backups
+data/*.db.bak-*
