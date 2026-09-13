@@ -253,8 +253,8 @@ def unit_cost(
             COALESCE(SUM(output_tokens), 0)           AS out_tok,
             COALESCE(SUM(cost_usd), 0)                AS cost_usd,
             COALESCE(SUM(cost_unknown), 0)            AS unknown_calls,
-            AVG(quality_score)                        AS quality_avg,
-            COUNT(quality_score)                      AS quality_n
+            AVG(CASE WHEN quality_method = 'fact_fidelity_v2' THEN quality_score END) AS quality_avg,
+            COUNT(CASE WHEN quality_method = 'fact_fidelity_v2' THEN quality_score END) AS quality_n
         FROM router_logs
         WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
           AND {billable}

@@ -104,13 +104,15 @@ def test_seed_prices_is_idempotent(db):
 
 # ── unit cost rollup ──────────────────────────────────────────────────────────
 
-def _log(conn, model, workload, in_tok, out_tok, cost, calls=1, quality=None, success=1):
+def _log(conn, model, workload, in_tok, out_tok, cost, calls=1, quality=None, success=1,
+        quality_method="fact_fidelity_v2"):
     for _ in range(calls):
         conn.execute(
             "INSERT INTO router_logs (timestamp, session_id, model_used, workload_type, "
-            "input_tokens, output_tokens, cost_usd, cost_unknown, success, quality_score) "
-            "VALUES ('2026-09-01T10:00:00+00:00','s',?,?,?,?,?,0,?,?)",
-            (model, workload, in_tok, out_tok, cost, success, quality),
+            "input_tokens, output_tokens, cost_usd, cost_unknown, success, "
+            "quality_score, quality_method) "
+            "VALUES ('2026-09-01T10:00:00+00:00','s',?,?,?,?,?,0,?,?,?)",
+            (model, workload, in_tok, out_tok, cost, success, quality, quality_method),
         )
     conn.commit()
 

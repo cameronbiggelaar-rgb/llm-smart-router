@@ -404,17 +404,21 @@ def quality_column(
     Rows with NULL ``quality_score`` are counted as ``unmeasured`` and excluded
     from the average — "not measured" is deliberately distinct from "measured
     bad".
+
+    Only ``fact_fidelity_v2`` rows contribute to the average. v1 rows top out
+    ~0.24 on real payloads and v2 spans 0.0-1.0, so blending them would produce a
+    number on no scale at all.
     """
     sql = """
         SELECT model_used,
                COALESCE(NULLIF(workload_type, ''), 'unknown') AS call_type,
-               COUNT(quality_score) AS measured,
+               COUNT(CASE WHEN quality_method = ? THEN quality_score END) AS measured,
                SUM(CASE WHEN quality_score IS NULL THEN 1 ELSE 0 END) AS unmeasured,
-               AVG(quality_score)  AS quality_avg
+               AVG(CASE WHEN quality_method = ? THEN quality_score END) AS quality_avg
         FROM router_logs
         WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
-    """
-    params: List[object] = [since]
+        """
+    params: List[object] = [METHOD_V2, METHOD_V2, since]
     if until is not None:
         sql += " AND substr(timestamp, 1, 10) <= substr(?, 1, 10)"
         params.append(until)

@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from quality import (  # noqa: E402
     METHOD,
+    METHOD_V2,
     extract_facts,
     quality_column,
     score_summary,
@@ -109,7 +110,7 @@ def _log(conn, model, workload, quality):
         "INSERT INTO router_logs (timestamp, session_id, model_used, workload_type, "
         "input_tokens, output_tokens, quality_score, quality_method) "
         "VALUES ('2026-09-01T10:00:00+00:00','s',?,?,100,10,?,?)",
-        (model, workload, quality, METHOD if quality is not None else ""),
+        (model, workload, quality, METHOD_V2 if quality is not None else ""),
     )
 
 
