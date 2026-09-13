@@ -387,8 +387,8 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
             COALESCE(SUM(cost_unknown), 0),
             COALESCE(SUM(success), 0),
             COALESCE(SUM(escalated), 0),
-            AVG(quality_score),
-            COUNT(quality_score),
+            AVG(CASE WHEN quality_method = 'fact_fidelity_v2' THEN quality_score END),
+            COUNT(CASE WHEN quality_method = 'fact_fidelity_v2' THEN quality_score END),
             is_shadow
         FROM router_logs
         WHERE substr(timestamp, 1, 10) = substr(?, 1, 10)

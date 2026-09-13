@@ -39,14 +39,15 @@ def db(tmp_path):
 
 
 def _day(conn, day, model, workload, calls, cost_each, quality=None, latency=1.0,
-         in_tok=1000, out_tok=100):
+        in_tok=1000, out_tok=100, quality_method="fact_fidelity_v2"):
     for _ in range(calls):
         conn.execute(
             "INSERT INTO router_logs (timestamp, session_id, model_used, workload_type, "
-            "input_tokens, output_tokens, cost_usd, latency_seconds, success, quality_score) "
-            "VALUES (?,'s',?,?,?,?,?,?,1,?)",
+            "input_tokens, output_tokens, cost_usd, latency_seconds, success, "
+            "quality_score, quality_method) "
+            "VALUES (?,'s',?,?,?,?,?,?,1,?,?)",
             (f"{day}T10:00:00+00:00", model, workload, in_tok, out_tok, cost_each,
-             latency, quality),
+             latency, quality, quality_method),
         )
     conn.commit()
     rollup_day(conn, day)

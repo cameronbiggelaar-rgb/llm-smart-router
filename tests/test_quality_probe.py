@@ -29,7 +29,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import quality_probe as qp  # noqa: E402
-from quality import METHOD, score_summary  # noqa: E402
+from quality import METHOD, METHOD_V2, score_summary, score_summary_v2  # noqa: E402
 from rollup import migrate  # noqa: E402
 
 SOURCE = "The build used 12,345 tokens and 250 files with 8,000 lines of code."
@@ -74,12 +74,13 @@ def test_score_reflects_real_coverage_difference():
 
 
 def test_probe_records_method_so_scorers_are_distinguishable(conn):
+    """The probe scores with v2 and stamps the row with v2's method name."""
     qp.record_probe(conn, "req-1", SOURCE, GOOD)
     row = conn.execute(
         "SELECT score, method FROM quality_probe WHERE request_id = 'req-1'"
     ).fetchone()
-    assert row[0] == pytest.approx(score_summary(SOURCE, GOOD).score)
-    assert row[1] == METHOD
+    assert row[0] == pytest.approx(score_summary_v2(SOURCE, GOOD).score)
+    assert row[1] == METHOD_V2
 
 
 def test_unscored_is_null_not_zero(conn):
@@ -149,7 +150,7 @@ def test_summary_metrics_aggregate_only_measured_rows(conn):
     m = qp.summary_metrics(conn)
     assert m["measured"] == 1
     assert m["unmeasured"] == 1
-    assert m["avg_score"] == pytest.approx(score_summary(SOURCE, GOOD).score)
+    assert m["avg_score"] == pytest.approx(score_summary_v2(SOURCE, GOOD).score)
 
 
 def test_no_measurements_reports_none_not_zero(conn):

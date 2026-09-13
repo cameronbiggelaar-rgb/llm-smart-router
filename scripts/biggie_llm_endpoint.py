@@ -573,11 +573,11 @@ async def run_shadow_experiment(
     quality_method = ""
     if content and messages:
         try:
-            from quality import score_summary, source_text_from_messages
+            from quality import score_summary_v2, source_text_from_messages
 
             source = source_text_from_messages(messages)
             if source.strip():
-                qs = score_summary(source, content)
+                qs = score_summary_v2(source, content)
                 quality_score = float(qs.score)
                 quality_method = qs.method
         except Exception as e:                              # pragma: no cover

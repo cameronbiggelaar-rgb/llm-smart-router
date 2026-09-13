@@ -37,14 +37,15 @@ def db(tmp_path):
 
 
 def _log(conn, day, model, workload, in_tok, out_tok, cost, latency=1.0,
-         success=1, escalated=0, quality=None, cost_unknown=0):
+        success=1, escalated=0, quality=None, cost_unknown=0,
+        quality_method="fact_fidelity_v2"):
     conn.execute(
         "INSERT INTO router_logs (timestamp, session_id, model_used, workload_type, "
         "input_tokens, output_tokens, cost_usd, cost_unknown, latency_seconds, "
-        "success, escalated, quality_score) "
-        "VALUES (?,'s',?,?,?,?,?,?,?,?,?,?)",
+        "success, escalated, quality_score, quality_method) "
+        "VALUES (?,'s',?,?,?,?,?,?,?,?,?,?,?)",
         (f"{day}T10:00:00+00:00", model, workload, in_tok, out_tok, cost,
-         cost_unknown, latency, success, escalated, quality),
+         cost_unknown, latency, success, escalated, quality, quality_method),
     )
     conn.commit()
 

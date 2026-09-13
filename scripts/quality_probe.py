@@ -39,7 +39,7 @@ import os
 import sqlite3
 from typing import Any, Dict, List, Optional
 
-from quality import METHOD, score_summary
+from quality import METHOD_V2, score_summary_v2
 
 # Share of eligible requests probed. Env-tunable so the rate is an operational
 # dial, not a code change.
@@ -138,7 +138,7 @@ def record_probe(
         coverage: Optional[float] = None
         measurable = 0
         if src.strip() and smy.strip():
-            qs = score_summary(src, smy)
+            qs = score_summary_v2(src, smy)
             score = float(qs.score)
             coverage = float(qs.coverage)
             measurable = 1
@@ -161,7 +161,7 @@ def record_probe(
                 probed_at=excluded.probed_at
             """,
             (request_id, model or "", workload or "", score, coverage,
-             METHOD if measurable else "", len(src), len(smy), measurable),
+             METHOD_V2 if measurable else "", len(src), len(smy), measurable),
         )
         conn.commit()
         return score
