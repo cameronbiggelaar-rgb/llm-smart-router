@@ -1376,10 +1376,24 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
             return model
 
     # If all preferred summariser models are unavailable, fall back to the
-    # cheapest available tier-3+ model before declaring exhaustion. Keep gpt-5.5
-    # out of the automatic compression fallback for the same capacity reason.
+    # cheapest available tier-3+ model before declaring exhaustion.
+    #
+    # The exclusion set is honoured here, not just the one hardcoded name it
+    # used to carry. Five other selection paths consult
+    # EXCLUDED_FROM_AUTO_ROUTING; this loop did not, so a model reserved for an
+    # explicit lane stayed eligible to serve production compression the moment
+    # the curated ladder thinned out. Measured: 1,400 compression calls were
+    # served by gpt-* models this loop is supposed to keep out — because it
+    # only knew to skip gpt-5.5 by name.
+    #
+    # This matters most for a newly registered candidate: registering a model
+    # is how it becomes reachable, and an experiment-only model must not be
+    # promoted into production summarisation by a fallback that never sees the
+    # exclusion list.
     for model in get_available_models():
         if model == "gpt-5.5":
+            continue
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
             continue
         if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
             return model

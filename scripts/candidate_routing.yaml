@@ -1,6 +1,6 @@
 proposal:
-  generated: '2026-09-12T09:41:09.554488+00:00'
-  days: 14
+  generated: '2026-09-13T08:12:27.099823+00:00'
+  days: 3
   quality_floor: 0.8
   min_samples: 30
   applied: false
