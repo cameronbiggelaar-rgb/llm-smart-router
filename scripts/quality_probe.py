@@ -102,13 +102,16 @@ def should_measure(request_id: str, rate: Optional[float] = None) -> bool:
 
 
 def _source_text(messages: Any) -> str:
-    if not isinstance(messages, list):
-        return ""
-    return "\n".join(
-        str(m.get("content") or "")
-        for m in messages
-        if isinstance(m, dict) and m.get("role") == "user"
-    )
+    """The scoring source: the WHOLE conversation.
+
+    Delegates to ``quality.source_text_from_messages`` so the probe, the shadow
+    path and any offline harness all score against the identical source. A
+    user-only join here (the v1 behaviour) hid 87% of the fact set and scored
+    true facts as hallucinations.
+    """
+    from quality import source_text_from_messages
+
+    return source_text_from_messages(messages)
 
 
 def record_probe(

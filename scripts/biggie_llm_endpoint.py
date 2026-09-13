@@ -573,13 +573,9 @@ async def run_shadow_experiment(
     quality_method = ""
     if content and messages:
         try:
-            from quality import score_summary
+            from quality import score_summary, source_text_from_messages
 
-            source = "\n".join(
-                str(m.get("content") or "")
-                for m in messages
-                if isinstance(m, dict) and m.get("role") == "user"
-            )
+            source = source_text_from_messages(messages)
             if source.strip():
                 qs = score_summary(source, content)
                 quality_score = float(qs.score)

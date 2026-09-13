@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 
 METHOD = "fact_coverage_v1"
 
@@ -87,6 +87,65 @@ def extract_facts(text: str) -> Set[float]:
         if value >= MIN_FACT:
             out.add(value)
     return out
+
+
+def content_to_text(content: Any) -> str:
+    """Flatten a message ``content`` field to text.
+
+    Providers send content either as a bare string or as a list of typed parts
+    (``[{"type": "text", "text": "..."}]``). Both shapes occur in captured
+    payloads, so scoring must accept both rather than silently dropping the
+    structured form.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                # Text parts carry "text"; tool results carry "content".
+                for key in ("text", "content"):
+                    val = part.get(key)
+                    if isinstance(val, str) and val:
+                        parts.append(val)
+                        break
+        return "\n".join(parts)
+    return str(content)
+
+
+def source_text_from_messages(messages: Any) -> str:
+    """Build the scoring source from EVERY message in the conversation.
+
+    This is the single definition of "what text the summary was asked to
+    compress". It must include all roles.
+
+    Why this exists: the v1 scorer was fed only ``role == "user"`` content, which
+    on a real captured payload is 19,426 of 225,862 chars. 87% of the true fact
+    set was therefore invisible, so a summary faithfully reporting a fact that
+    originated in an assistant or tool message was counted as a *hallucinated
+    number* and penalised. That inverts the metric — it rewarded summaries that
+    ignored the conversation and punished the ones that reported it.
+    """
+    if isinstance(messages, str):
+        return messages
+    if not isinstance(messages, list):
+        return ""
+    parts: List[str] = []
+    for m in messages:
+        if isinstance(m, str):
+            parts.append(m)
+            continue
+        if not isinstance(m, dict):
+            continue
+        parts.append(content_to_text(m.get("content")))
+        # A tool message's payload may sit in a separate field.
+        if isinstance(m.get("function_call"), dict):
+            parts.append(str(m["function_call"].get("arguments") or ""))
+    return "\n".join(p for p in parts if p)
 
 
 def score_summary(source: str, summary: str, reference: Optional[str] = None) -> QualityScore:
