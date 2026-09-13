@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from quality_probe import format_metrics as format_quality_metrics  # noqa: E402
 from optimiser import format_proposal, propose, write_candidate  # noqa: E402
 from rollup import (  # noqa: E402
     DEFAULT_KEEP_DAYS,
@@ -294,6 +295,12 @@ def cmd_allowance(conn, args) -> int:
     return 0
 
 
+def cmd_quality(conn, args) -> int:
+    """Show sampled compression-quality measurements."""
+    print(format_quality_metrics(conn))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -330,6 +337,9 @@ def main() -> int:
     al.add_argument("--at", default=None, help="snapshot timestamp (AEST)")
 
 
+    q = sub.add_parser("quality", help="sampled compression-quality measurements")
+    q.add_argument("--json", action="store_true")
+
     mt = sub.add_parser("maintain", help="daily job: rollup + purge + report + propose")
     mt.add_argument("--days", type=int, default=3)
     mt.add_argument("--retention", type=int, default=DEFAULT_KEEP_DAYS)
@@ -346,6 +356,7 @@ def main() -> int:
         "audit": cmd_audit,
         "backfill": cmd_backfill,
         "maintain": cmd_maintain,
+        "quality": cmd_quality,
         "allowance": cmd_allowance,
     }[args.cmd](conn, args)
 

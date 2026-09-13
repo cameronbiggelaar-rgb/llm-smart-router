@@ -2328,6 +2328,7 @@ async def _resume_stream(
     messages: List[Dict[str, Any]],
     request_body: Dict[str, Any],
     on_complete: Optional[Callable[[], None]] = None,
+    on_summary: Optional[Callable[[str], None]] = None,
 ) -> AsyncIterator[str]:
     """Replay buffered preflight events, then continue the SAME backend connection.
 
@@ -2377,6 +2378,13 @@ async def _resume_stream(
             _alert_stream_degeneration(
                 pf.provider, pf.backend_model, pattern, output_tail=accumulated[-400:],
             )
+        # The response has now been fully yielded to the client, so the
+        # accumulated summary can be scored without touching request latency.
+        if on_summary and accumulated:
+            try:
+                on_summary(accumulated)
+            except Exception as e:  # pragma: no cover - never break completion
+                logger.debug("on_summary hook failed: %s", e)
     finally:
         if resp is not None:
             try:
@@ -2385,6 +2393,51 @@ async def _resume_stream(
                 pass
         if on_complete:
             on_complete()
+
+
+def _probe_compression_quality(
+    request_id: str,
+    workload_type: str,
+    source_messages: Any,
+    summary_text: str,
+    model: str,
+) -> None:
+    """Sample and score a compression summary AFTER the response is delivered.
+
+    Called from the stream-completion path, i.e. once the client already has its
+    answer, so scoring cannot add latency to a user request. Every path is
+    exception-safe: measurement is best-effort by contract and must never turn a
+    served request into a failed one.
+
+    Only ``session_compression`` is measured - ``fact_coverage_v1`` compares
+    numbers between a source and its summary, which is meaningless for chat.
+    """
+    try:
+        from quality_probe import (
+            is_measurable_workload,
+            record_probe,
+            should_measure,
+        )
+
+        if not workload_type or not is_measurable_workload(workload_type):
+            return
+        if not summary_text or not str(summary_text).strip():
+            return
+        if not should_measure(request_id):
+            return
+        conn = _get_db_connection()
+        if conn is None:
+            return
+        record_probe(
+            conn,
+            request_id,
+            source_messages,
+            summary_text,
+            model=model,
+            workload=workload_type,
+        )
+    except Exception as e:  # pragma: no cover - measurement is best-effort
+        logger.debug("Compression quality probe skipped: %s", e)
 
 
 def _response_delta_parts(response: Any) -> Tuple[bool, bool]:
@@ -2563,6 +2616,7 @@ async def proxy_to_backend_streaming(
     request_body: Dict[str, Any],
     on_complete: Optional[Callable[[], None]] = None,
     stats: Optional[Dict[str, Any]] = None,
+    on_summary: Optional[Callable[[str], None]] = None,
 ) -> Any:
     """Proxy a chat completion request to the chosen backend with SSE streaming.
 
@@ -2637,7 +2691,7 @@ async def proxy_to_backend_streaming(
         stats["saw_content"] = pf.saw_content
         stats["saw_tool_calls"] = pf.saw_tool_calls
     return StreamingResponse(
-        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete),
+        _resume_stream(pf, backend, messages, request_body, on_complete=on_complete, on_summary=on_summary),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -3053,6 +3107,13 @@ async def chat_completions(request: Request):
                 body,
                 on_complete=_log_stream_complete,
                 stats=_stream_stats,
+                on_summary=lambda summary: _probe_compression_quality(
+                    request_id,
+                    workload_type,
+                    messages,
+                    summary,
+                    decision.selected_model,
+                )
             )
         else:
             result = await proxy_to_backend(backend, compressed_messages, body)
@@ -3264,6 +3325,13 @@ async def chat_completions(request: Request):
                     body,
                     on_complete=_log_escalated_stream_complete,
                     stats=_stream_stats,
+                    on_summary=lambda summary: _probe_compression_quality(
+                        request_id,
+                        workload_type,
+                        compressed_messages,
+                        summary,
+                        _stream_stats.get("final_model", escalation.selected_model),
+                    )
                 )
             except HTTPException as stream_exc:
                 # The initial streaming backend already failed, and the one allowed
