@@ -128,15 +128,23 @@ class FitSummary:
 #
 # Baseline: deepseek-v4-flash = 1.0 unit per 1M tokens
 #
-# Relative compute ratios:
-#   deepseek-v4-flash      1.0x  — small, fast, cheap
-#   minimax-m2.7:cloud     2.0x  — mid-size
-#   glm-5                  2.0x  — mid-size
-#   glm-5.1                2.5x  — slightly larger
-#   glm-5.3                3.0x  — larger context, more compute
-#   qwen3.5                3.5x  — Medium tier, SWE-bench 80
-#   deepseek-v3.1:671b    10.0x  — massive 671B MoE, most expensive cloud
-#   gpt-5.5               30.0x  — ChatGPT $20/mo, rate-limited, most capable
+# Relative compute ratios (unchanged by the B18 price correction — `ratio` is a
+# separate concept from the USD price columns; see the corrected table below):
+# deepseek-v4-flash 1.0x — small, fast, cheap
+# minimax-m2.7:cloud 2.0x — mid-size
+# glm-5 2.0x — mid-size
+# glm-5.1 2.5x — slightly larger
+# glm-5.3 3.0x — larger context, more compute
+# qwen3.5 3.5x — Medium tier, SWE-bench 80
+# deepseek-v3.1:671b 10.0x — massive 671B MoE, most expensive cloud
+# gpt-5.5 30.0x — ChatGPT $20/mo, rate-limited, most capable
+#
+# USD prices are the vendor's published list rates (ollama.com/pricing,
+# re-verified 2026-09-13). They are what `unit_economics` charges per call, so
+# they must match the vendor exactly — `tests/test_price_book_versioning.py`
+# enforces that. Correcting a price REQUIRES a new `date`: `seed_prices()` is
+# idempotent on `(model, effective_from)`, so editing a price at an
+# already-recorded date writes nothing and the fix silently does nothing.
 
 
 # ── Single source of truth: MODEL_REGISTRY ────────────────────────────────────
@@ -150,13 +158,13 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.47, "input": 0.22,  "output": 0.66,  "tier": 3, "date": "2026-09-12"},
     "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "tier": 3, "date": "2026-09-12"},
     "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "tier": 5.5, "date": "2026-09-12"},
-    "minimax-m2.7:cloud": {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
-    "glm-5":              {"provider": "ollama-cloud",  "ratio": 2.0,  "input": 1.00,  "output": 3.00,  "tier": 4, "date": "2026-07-01"},
-    "glm-5.1":            {"provider": "ollama-cloud",  "ratio": 2.5,  "input": 1.25,  "output": 3.75,  "tier": 5, "date": "2026-07-01"},
-    "glm-5.3":            {"provider": "ollama-cloud",  "ratio": 3.0,  "input": 1.50,  "output": 4.50,  "tier": 6, "date": "2026-08-26"},
-    "glm-5.2":            {"provider": "ollama-cloud",  "ratio": 3.0,  "input": 1.50,  "output": 4.50,  "tier": 6.5, "date": "2026-09-04"},
-    "qwen3.5":            {"provider": "ollama-cloud",  "ratio": 3.5,  "input": 1.75,  "output": 5.25,  "tier": 7, "date": "2026-08-08"},
-    "deepseek-v4-pro":    {"provider": "ollama-cloud",  "ratio": 4.0,  "input": 2.00,  "output": 6.00,  "tier": 8, "date": "2026-07-01"},
+    "minimax-m2.7:cloud": {"provider": "ollama-cloud", "ratio": 2.0, "input": 0.30, "output": 1.20, "tier": 4, "date": "2026-09-13"},
+    "glm-5": {"provider": "ollama-cloud", "ratio": 2.0, "input": 1.00, "output": 3.00, "tier": 4, "date": "2026-07-01"},
+    "glm-5.1": {"provider": "ollama-cloud", "ratio": 2.5, "input": 1.00, "output": 3.20, "tier": 5, "date": "2026-09-13"},
+    "glm-5.3": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "tier": 6, "date": "2026-09-13"},
+    "glm-5.2": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "tier": 6.5, "date": "2026-09-13"},
+    "qwen3.5": {"provider": "ollama-cloud", "ratio": 3.5, "input": 0.60, "output": 3.60, "tier": 7, "date": "2026-09-13"},
+    "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 0.66, "output": 1.98, "tier": 8, "date": "2026-09-13"},
     "deepseek-v3.1:671b": {"provider": "ollama-cloud",  "ratio": 10.0, "input": 5.00,  "output": 15.00, "tier": 9, "date": "2026-07-01"},
     "gpt-5.5":            {"provider": "openai-codex",  "ratio": 30.0, "input": 15.00, "output": 60.00, "tier": 10,"date": "2026-07-01"},
     "gpt-5.6-luna":       {"provider": "openai-codex",  "ratio": 32.0, "input": 16.00, "output": 64.00, "tier": 11,"date": "2026-09-05"},

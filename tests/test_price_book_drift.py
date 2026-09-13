@@ -63,11 +63,15 @@ VENDOR_PUBLISHED = {
     "qwen3.5:397b":       (Decimal("0.60"), None, Decimal("3.60")),
 }
 
-# The values our book currently carries, so a change is deliberate and visible.
-KNOWN_DRIFT = {
-    "glm-5.3": ("1.50", "4.50", "vendor publishes 1.40 / 4.40 — 7% high"),
-    "glm-5.2": ("1.50", "4.50", "vendor publishes 1.40 / 4.40 — 7% high"),
-    "deepseek-v4-pro": ("2.00", "6.00", "vendor publishes 0.66 / 1.98 — 3.03x high"),
+# The values our book carried BEFORE the correction. B17 found this drift; B18
+# corrected the registry to vendor rates on 2026-09-13. These are kept as the
+# historical record of what was wrong, not as expected values.
+# See tests/test_price_book_versioning.py for the corrected truth, and
+# references/price-book-correction-plan.md for the fix.
+SUPERSEDED_DRIFT = {
+    "glm-5.3": ("1.50", "4.50", "was high vs vendor 1.40 / 4.40"),
+    "glm-5.2": ("1.50", "4.50", "was high vs vendor 1.40 / 4.40"),
+    "deepseek-v4-pro": ("2.00", "6.00", "was 3.03x high vs vendor 0.66 / 1.98"),
 }
 
 
@@ -81,27 +85,53 @@ def test_price_book_has_no_silent_arithmetic_errors(db):
         assert i >= 0 and o >= 0, f"{model}: negative price"
 
 
-@pytest.mark.parametrize("model", ["glm-5.3", "glm-5.2", "deepseek-v4-pro"])
-def test_known_price_drift_is_unchanged(db, model):
-    """Pin the known drift.
+# Corrected prices in force since 2026-09-13 (vendor-verified).
+CORRECTED = {
+    "glm-5.3": ("1.40", "4.40"),
+    "glm-5.2": ("1.40", "4.40"),
+    "deepseek-v4-pro": ("0.66", "1.98"),
+}
 
-    When this fails, someone has updated the price — intentionally or not. Both
-    are worth knowing: an intentional fix should update ``KNOWN_DRIFT`` and the
-    vendor table above in the same commit, and an accidental one should be
-    reverted.
+
+@pytest.mark.parametrize("model", ["glm-5.3", "glm-5.2", "deepseek-v4-pro"])
+def test_corrected_price_matches_vendor(db, model):
+    """B17 found the drift; B18 corrected the registry. Pin the corrected truth.
+
+    When this fails, someone has changed a price. An intentional change should
+    update ``CORRECTED`` and the vendor table above in the same commit; an
+    accidental one should be reverted. The live price is the NEWEST row, since
+    the stale price stays on record as a superseded version.
     """
     unit_economics.seed_prices(db)
     row = db.execute(
-        "SELECT input_usd_per_1m, output_usd_per_1m FROM model_pricing WHERE model=?", (model,)
+        "SELECT input_usd_per_1m, output_usd_per_1m FROM model_pricing "
+        "WHERE model=? ORDER BY effective_from DESC LIMIT 1",
+        (model,),
     ).fetchone()
     assert row is not None, f"{model} has no price"
-    expected_in, expected_out, note = KNOWN_DRIFT[model]
+    expected_in, expected_out = CORRECTED[model]
     assert Decimal(str(row[0])) == Decimal(expected_in), (
-        f"{model} input price moved to {row[0]} (was {expected_in}). {note}"
+        f"{model} input price is {row[0]}, vendor publishes {expected_in}"
     )
     assert Decimal(str(row[1])) == Decimal(expected_out), (
-        f"{model} output price moved to {row[1]} (was {expected_out}). {note}"
+        f"{model} output price is {row[1]}, vendor publishes {expected_out}"
     )
+
+
+@pytest.mark.parametrize("model", ["glm-5.3", "glm-5.2", "deepseek-v4-pro"])
+def test_superseded_price_is_no_longer_in_force(db, model):
+    """The old, overstating price must not come back as the live rate."""
+    unit_economics.seed_prices(db)
+    old_in, old_out, note = SUPERSEDED_DRIFT[model]
+    row = db.execute(
+        "SELECT input_usd_per_1m, output_usd_per_1m FROM model_pricing "
+        "WHERE model=? ORDER BY effective_from DESC LIMIT 1",
+        (model,),
+    ).fetchone()
+    assert not (
+        Decimal(str(row[0])) == Decimal(old_in)
+        and Decimal(str(row[1])) == Decimal(old_out)
+    ), f"{model} is priced at the superseded {old_in}/{old_out} again ({note})"
 
 
 def test_price_book_has_no_cached_input_column():

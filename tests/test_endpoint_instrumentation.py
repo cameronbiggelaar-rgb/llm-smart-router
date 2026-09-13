@@ -31,14 +31,15 @@ def conn(tmp_path):
 
 def test_cost_fields_prices_a_known_model(conn):
     cost, unknown = ep.compute_cost_fields("glm-5.3", 1_000_000, 0, conn=conn)
-    assert cost == pytest.approx(1.50)
+    # glm-5.3 list price is $1.40/1M in (vendor-verified 2026-09-13, B18).
+    assert cost == pytest.approx(1.40)
     assert unknown == 0
 
 
 def test_cost_fields_prices_input_and_output_separately(conn):
-    # 1M in @ $1.50 + 1M out @ $4.50 = $6.00
+    # 1M in @ $1.40 + 1M out @ $4.40 = $5.80
     cost, unknown = ep.compute_cost_fields("glm-5.3", 1_000_000, 1_000_000, conn=conn)
-    assert cost == pytest.approx(6.00)
+    assert cost == pytest.approx(5.80)
     assert unknown == 0
 
 

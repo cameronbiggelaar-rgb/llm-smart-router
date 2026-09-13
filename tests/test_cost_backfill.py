@@ -41,12 +41,12 @@ def _row(conn, model, in_tok, out_tok, cost_usd=0.0, cost_unknown=1):
 
 
 def test_backfill_prices_unknown_rows_from_token_counts(conn):
-    # 1M input @ $1.50 (glm-5.3) = $1.50
+    # 1M input @ $1.40 (glm-5.3, vendor list) = $1.40
     _row(conn, "glm-5.3", 1_000_000, 0)
     res = backfill_costs(conn)
     assert res["updated"] == 1
     cost = conn.execute("SELECT cost_usd FROM router_logs").fetchone()[0]
-    assert cost == pytest.approx(1.50)
+    assert cost == pytest.approx(1.40)
 
 
 def test_backfill_marks_rows_as_reconstructed_not_measured(conn):
@@ -64,7 +64,7 @@ def test_backfill_is_idempotent(conn):
     assert first["updated"] == 1
     assert second["updated"] == 0        # nothing left to reconstruct
     cost = conn.execute("SELECT cost_usd FROM router_logs").fetchone()[0]
-    assert cost == pytest.approx(1.50)   # not doubled
+    assert cost == pytest.approx(1.40)  # not doubled (glm-5.3 vendor list)
 
 
 def test_backfill_never_touches_already_priced_rows(conn):

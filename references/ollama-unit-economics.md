@@ -1,6 +1,6 @@
 # Ollama Cloud unit economics — measured Sep 2026
 
-## Model pricing (per 1M tokens, list) — re-verified against ollama.com/pricing 2026-09-12
+## Model pricing (per 1M tokens, list) — re-verified against ollama.com/pricing 2026-09-13
 
 | Model | Input/1M | Cached in | Output/1M | Context |
 |---|---|---|---|---|
@@ -9,14 +9,19 @@
 | **glm-5.3** | **$1.40** | $0.26 | **$4.40** | 1M |
 | **glm-5.2** | **$1.40** | $0.26 | **$4.40** | 1M |
 | **glm-5.3-flash** | **$0.15** | $0.03 | **$0.50** | 1M (vision/tools/thinking) |
+| glm-5.1 | $1.00 | $0.20 | $3.20 | 1M |
+| minimax-m2.7 | $0.30 | $0.06 | $1.20 | 1M |
+| qwen3.5:397b | $0.60 | — | $3.60 | 1M |
 | deepseek-v4.1-flash | not listed | — | — | 1M (library page exists) |
 
-⚠️ **The router's `models.py` prices are stale and overstate cost by 1.5-2.5x.**
-`models.py` carries v4-flash at $0.50 in (live $0.22) and glm-5.3 at $1.50 in
-(live $1.40). Ratios derived from them (v4-flash 1.0, v4.1-flash 0.68, glm 3.0)
-are therefore only usable for *ordering*, never for dollar estimates. v4.1-flash's
-$0.34/$1.35 does not appear on the public pricing table at all — treat it as
-vendor-quoted, unverified.
+✅ **CORRECTED 2026-09-13 (B18).** The drift this section used to warn about is
+fixed: `models.py` now carries the vendor's published list rates above, and
+`tests/test_price_book_versioning.py` enforces them. Correcting a price REQUIRES
+a new `"date"` in `MODEL_REGISTRY` — `seed_prices()` is idempotent on
+`(model, effective_from)`, so editing a price at an already-recorded date writes
+zero rows and the stale price silently stays in force. Superseded rows are kept
+on record so a pre-correction call still re-prices at the rate that was in force
+when it ran.
 
 **glm-5.3 and glm-5.2 are priced IDENTICALLY** ($1.40/$4.40 input/output). Any
 per-request cost difference between them is a *context-band* effect, not a price
