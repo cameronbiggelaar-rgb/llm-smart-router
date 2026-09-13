@@ -22,7 +22,7 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +35,12 @@ from rollup import (  # noqa: E402
     purge_raw,
     rollup_day,
     vacuum_if_needed,
+)
+from allowance import (
+    Snapshot,
+    SnapshotStore,
+    burn_report,
+    format_report,
 )
 from unit_economics import backfill_costs, seed_prices, unit_cost  # noqa: E402
 
@@ -226,6 +232,68 @@ def cmd_maintain(conn, args) -> int:
     return cmd_propose(conn, argparse.Namespace(days=args.days))
 
 
+def _ledger_burn_inputs(conn: sqlite3.Connection, days: int):
+    """Average input size and billed token burn for the window.
+
+    A streaming request writes two rows (start marker + completion), so
+    AVG/SUM must run over billable rows only or every figure is inflated.
+    """
+    since = (date.today() - timedelta(days=days)).isoformat()
+    row = conn.execute(
+        """
+        SELECT AVG(input_tokens) AS avg_in,
+               SUM(input_tokens) AS total_in,
+               COUNT(DISTINCT request_id) AS reqs
+        FROM router_logs
+        WHERE substr(timestamp, 1, 10) >= substr(?, 1, 10)
+          AND input_tokens > 0
+          AND COALESCE(cost_unknown, 0) = 0
+          AND COALESCE(error_type, '') != 'streaming_in_progress'
+        """,
+        (since,),
+    ).fetchone()
+    return since, float(row[0] or 0.0), float(row[1] or 0.0), int(row[2] or 0)
+
+
+def cmd_allowance(conn, args) -> int:
+    store = SnapshotStore(Path(args.store) if args.store else None)
+
+    if args.record:
+        if args.spend is None or args.requests is None:
+            print("--record needs --spend and --requests (the dashboard figures)")
+            return 2
+        snap = Snapshot(
+            at=args.at or datetime.now().strftime("%Y-%m-%dT%H:%M"),
+            week_to_date_usd=args.spend,
+            credit_billed_requests=args.requests,
+            balance_usd=args.balance,
+        )
+        store.append(snap)
+        print(
+            f"Recorded dashboard snapshot at {snap.at}: "
+            f"${snap.week_to_date_usd} over {snap.credit_billed_requests} "
+            f"credit-billed requests"
+        )
+        return 0
+
+    since, avg_in, total_in, reqs = _ledger_burn_inputs(conn, args.days)
+    report = burn_report(
+        snapshots=store.load(),
+        ledger_avg_input_tokens=avg_in,
+        period_tokens=total_in,
+        allowance_usd=args.allowance,
+        ledger_requests=reqs,
+    )
+    if args.json:
+        print(json.dumps(
+            {"since": since, "avg_input_tokens": avg_in, "requests": reqs,
+             **report.__dict__}, indent=2, default=str))
+        return 0
+    print(f"Window: since {since} ({reqs} requests, avg {avg_in:,.0f} input tokens)")
+    print(format_report(report))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -249,6 +317,19 @@ def main() -> int:
     pu.add_argument("--batch", type=int, default=50000)
     pu.add_argument("--yes", action="store_true", help="actually delete (default is dry-run)")
 
+    al = sub.add_parser("allowance", help="allowance-burn early warning vs the vendor dashboard")
+    al.add_argument("--days", type=int, default=7)
+    al.add_argument("--json", action="store_true")
+    al.add_argument("--allowance", type=float, default=None,
+    help="plan included usage in USD (default BIGGIE_ALLOWANCE_USD or 100)")
+    al.add_argument("--store", default=None, help="snapshot store path")
+    al.add_argument("--record", action="store_true", help="record a dashboard reading")
+    al.add_argument("--spend", type=float, default=None, help="dashboard week-to-date USD")
+    al.add_argument("--requests", type=int, default=None, help="dashboard credit-billed requests")
+    al.add_argument("--balance", type=float, default=None, help="dashboard balance USD")
+    al.add_argument("--at", default=None, help="snapshot timestamp (AEST)")
+
+
     mt = sub.add_parser("maintain", help="daily job: rollup + purge + report + propose")
     mt.add_argument("--days", type=int, default=3)
     mt.add_argument("--retention", type=int, default=DEFAULT_KEEP_DAYS)
@@ -265,6 +346,7 @@ def main() -> int:
         "audit": cmd_audit,
         "backfill": cmd_backfill,
         "maintain": cmd_maintain,
+        "allowance": cmd_allowance,
     }[args.cmd](conn, args)
 
 
