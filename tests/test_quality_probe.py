@@ -34,7 +34,11 @@ from rollup import migrate  # noqa: E402
 
 SOURCE = "The build used 12,345 tokens and 250 files with 8,000 lines of code."
 GOOD = "Build: 12,345 tokens, 8,000 lines."
-POOR = "Build completed successfully."
+# POOR must be MEASURABLE-but-bad (some real facts, mostly invented), not a
+# factless prose summary: a summary with no extractable facts is *unmeasured*
+# (see tests/test_quality_unmeasurable.py), which is a different state.
+POOR = "Build: 12,345 tokens, 900,111 files, 888,222 lines."
+FACTLESS = "Build completed successfully."
 
 
 @pytest.fixture()
@@ -66,9 +70,13 @@ def test_only_compression_is_measured_by_default():
 
 
 def test_score_reflects_real_coverage_difference():
-    """A summary that drops facts must score below one that keeps them."""
+    """v1's semantics stay pinned: a summary that drops facts scores lower.
+
+    Uses the factless fixture explicitly, because v1 scored "no facts" as 0.0
+    while v2 records it as *unmeasured*. See tests/test_quality_unmeasurable.py.
+    """
     good = score_summary(SOURCE, GOOD)
-    poor = score_summary(SOURCE, POOR)
+    poor = score_summary(SOURCE, FACTLESS)
     assert good.score > poor.score
     assert poor.score == pytest.approx(0.0)
 

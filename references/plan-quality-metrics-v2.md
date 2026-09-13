@@ -122,3 +122,65 @@ and new rows remain distinguishable.
   They stay as honest evidence of what v1 did.
 * No model registration, no experiment enabled, no traffic moved.
 * No new dependency.
+
+---
+
+## OUTCOME (B26, executed)
+
+Batches ran as TDD, one test file per batch, RED -> GREEN -> commit.
+
+| # | file | commit | result |
+|---|---|---|---|
+| B26.1 | `tests/test_quality_source_completeness.py` | `2db7e4d` | 6 passed |
+| B26.2/3/4 | `tests/test_quality_fidelity_v2.py`, `..._structural_markers.py`, `..._rollup_quality_method.py` | `300ed62` | 22 passed |
+| B26.6 | `tests/test_quality_unmeasurable.py` | (this commit) | 5 passed |
+
+### Where the executed design differs from this plan
+
+1. **Method name is `fact_fidelity_v2`, not `fact_coverage_v2`.** The name should
+   say what is measured; the metric is precision x yield, not coverage.
+2. **Reference-based recall (plan item 2) was NOT built.** It cannot be: there is
+   no stored reference compression of the same source anywhere in the data, so
+   the code path would be dead. Recall is instead normalised by the summary's own
+   length budget, which achieves the same goal (usable dynamic range at any
+   source size) with no new data dependency.
+3. **`F1` (plan item 3) was NOT used.** F1 of precision and yield still lets a
+   thin summary ride high on a small denominator. The product
+   `precision x fact_yield x substance` plus `MIN_SUMMARY_FACTS` was needed to
+   stop a 3-fact stub outscoring a realistic 15-fact summary.
+4. **Rollup filtering became part of the batch, not a separate concern (B26.4).**
+   Without it the rollup would have blended v1 (ceiling ~0.24) and v2 (0-1.0)
+   rows into a meaningless mean.
+
+### Measured calibration constants
+
+| constant | value | source |
+|---|---|---|
+| `FACT_CHARS_BUDGET` | 804.0 | p25 chars/fact over 200 real compaction summaries in `state.db` |
+| `MIN_SUMMARY_FACTS` | 5 | p05 fact count over the same 200 |
+
+`FACT_CHARS_BUDGET` was 60 in the first draft. That made `fact_yield` saturate
+near 0.07 for genuine summaries, so **no model could reach the optimiser's 0.80
+floor even after the redesign** -- caught only by scoring real summaries.
+
+### Verification
+
+* 454 tests pass (was 414).
+* On 120 real production summaries v2 gives median 0.735, 32% >= 0.80.
+* `optimiser.rank_models` returns **0 models** under v1 data and can rank under
+  v2 -- the inertness is resolved by the metric, not by more traffic.
+* Scale invariance: identical-quality summary scores 0.2439 (200K source) and
+  0.6780 (68K source) under v1, and is flat under v2.
+* Fabrication safety: at equal true facts and matched length, adding 15 invented
+  figures drops the score 1.000 -> 0.500.
+
+### Two validation traps hit (both produced authoritative-looking garbage)
+
+1. **Wrong pairing.** The first source<->summary pairing scored median token
+   overlap 0.146 -- the summaries were not summaries of the paired sources, so
+   every precision figure was meaningless.
+2. **Circular source.** A later run included the summary inside its own source:
+   overlap 1.000 for all 118 pairs and precision trivially 1.0. Excluding the
+   summary from its own source is now an explicit guard in the harness.
+
+Always validate a pairing (distinctive-token overlap) before trusting a score.

@@ -139,9 +139,15 @@ def record_probe(
         measurable = 0
         if src.strip() and smy.strip():
             qs = score_summary_v2(src, smy)
-            score = float(qs.score)
-            coverage = float(qs.coverage)
-            measurable = 1
+            # A summary with no extractable facts (ordinary prose) has demonstrated
+            # nothing. Recording it as 0.0 would assert a measurement that was never
+            # made — "not measured" must never read as "measured bad", because a
+            # model whose summaries happen to be prose-only would accumulate a 0.0
+            # average and look like a bad summariser when it was never assessed.
+            if qs.summary_numbers > 0:
+                score = float(qs.score)
+                coverage = float(qs.coverage)
+                measurable = 1
 
         conn.execute(
             """
