@@ -54,11 +54,20 @@ delete-then-insert per day (idempotent), so a re-run is safe and picks up
 late-arriving rows. Verified on a copy: every day then reconciles with its raw
 rows at ratio **1.0000**.
 
-**Self-healing:** `biggie-router-ops.timer` runs
-`router_ops.py maintain --days 3` daily at 18:10, which re-rolls the last three
-days. So this class of staleness **expires on its own after ~3 days** — it is
-not permanent. Any day older than the maintain window that was cached with a
-since-fixed bug needs an explicit backfill.
+**Self-healing — partly.** `biggie-router-ops.timer` runs
+`router_ops.py maintain --days 3` daily at 18:10, which re-rolls today and the
+two preceding days. The double-count fix landed **2026-09-12 20:42**
+(`84a0159`), and the timer last ran **2026-09-12 18:47** — *before* the fix. So:
+
+- **2026-09-11 and 2026-09-12**: self-heal on the next timer run (they sit
+  inside the 3-day window).
+- **2026-09-10**: falls out of the window, so it will **never** be re-rolled
+  automatically. A day cached under a since-fixed bug needs an **explicit
+  backfill** if its history matters.
+
+This is the general rule: a stale rollup does not expire on its own once it
+leaves the maintain window. Re-roll the affected days deliberately:
+`rollup.rollup_range(conn, "2026-09-10", "2026-09-12")` — on a **copy** first.
 
 ### 2. Latent cost error in routing proposals ⚠
 
