@@ -289,6 +289,86 @@ def _extract_429_account_cap(error_text: str = "") -> bool:
     return False
 
 
+# Markers for a request/response-SCHEMA fault: the backend rejected our
+# request *shape*, so re-sending the identical request can only fail again.
+# These must never feed the retry/escalation path as if they were transient.
+#
+# Measured: before this classification, one client request carrying
+# `temperature` hit Codex 18 times (each escalation step re-sent the same
+# unsupported params). A schema fault is a code defect to fix, not a backend
+# to retry - fix the payload, do not walk the ladder.
+_DETERMINISTIC_ERROR_MARKERS = (
+    """unsupported parameter""",
+    """unsupported_parameter""",
+    """unsupported value""",
+    """unsupported_value""",
+    """unknown parameter""",
+    """unrecognized request argument""",
+    """invalid_request_error""",
+    """invalid request""",
+    """malformed""",
+    """missing required parameter""",
+    """invalid value for""",
+)
+
+
+def _is_deterministic_client_error(error_text: str = """""") -> bool:
+    """""""""True when a 4xx reflects OUR request shape, not a transient condition.
+
+    A deterministic error must not be retried: identical input produces
+    identical output, so retrying only amplifies the failure (and can trip
+    the circuit breaker on a code bug rather than a backend outage).
+
+    Deliberately conservative - anything that might be transient returns
+    False so healthy models keep recovering: 429/usage caps, 5xx, timeouts,
+    connection resets and backpressure all have their own handling.
+    """""""""
+    if not error_text:
+        return False
+    haystack = error_text.lower()
+
+    # Explicitly transient - checked FIRST so an error body that incidentally
+    # contains e.g. """invalid""" inside a rate-limit message is not misread.
+    for transient in (
+        """usage_limit_reached""",
+        """rate limit""",
+        """rate_limit""",
+        """too many requests""",
+        """high demand""",
+        """try again later""",
+        """connection reset""",
+        """timed out""",
+        """timeout""",
+        """temporarily unavailable""",
+        """overloaded""",
+        """service unavailable""",
+        """bad gateway""",
+        """gateway timeout""",
+        """internal server error""",
+    ):
+        if transient in haystack:
+            return False
+
+    return any(marker in haystack for marker in _DETERMINISTIC_ERROR_MARKERS)
+
+
+def _record_schema_error(provider: str, backend_model: str, status: int, error_text: str) -> None:
+    """Record a deterministic request-schema rejection for observability.
+
+    Uses the existing recovery_log sink so the event is durable and visible
+    alongside rate_limited / credential_expired. Best-effort: observability
+    must never turn a clear 4xx into a 5xx.
+    """
+    try:
+        log_recovery_event(
+            backend_model,
+            "schema_error",
+            f"{provider} rejected request shape (HTTP {status}): {error_text[:400]}",
+        )
+    except Exception as exc:  # pragma: no cover - observability is best-effort
+        logger.debug("schema_error record failed: %s", exc)
+
+
 def _handle_backend_status(
     provider: str, backend_model: str, status: int, error_text: str = "",
     headers: Optional[Any] = None,
@@ -303,6 +383,10 @@ def _handle_backend_status(
     - 401/403 -> mark_credential_expired on the codex provider (needs human
       re-auth; surfaces as a distinct 'credential_expired' event instead of a
       generic 'error' / silent circuit trip)
+    - deterministic 4xx (request-schema fault, e.g. Unsupported parameter)
+      -> recorded as a distinct schema_error event and explicitly NOT
+      treated as a retryable/transient failure. Identical input cannot
+      succeed on retry, so escalating only amplifies the failure.
     - everything else -> left to normal escalation / circuit breaker
     """
     if status == 429:
@@ -331,6 +415,17 @@ def _handle_backend_status(
             backend_model,
             f"{provider} credential rejected (HTTP {status}) — {_CODEX_REAUTH_HINT}",
         )
+    elif 400 <= status < 500 and _is_deterministic_client_error(error_text):
+        # Our request shape was rejected (e.g. Codex: Unsupported parameter).
+        # Retrying identical input cannot succeed, so this is explicitly NOT a
+        # transient backend failure: do not mark_rate_limited, do not touch the
+        # credential state. Logged loudly because the fix belongs in the payload.
+        logger.error(
+            "Backend %s rejected the request SHAPE for %s (HTTP %d) - "
+            "deterministic, not retryable: %s",
+            provider, backend_model, status, error_text[:300],
+        )
+        _record_schema_error(provider, backend_model, status, error_text)
 
 
 # Access tokens are short-lived; warn well before they expire so a dead
