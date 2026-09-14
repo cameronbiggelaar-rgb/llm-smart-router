@@ -1,9 +1,18 @@
 # Plan — Fix session-compression routing ratchet (B29)
 
+**Status: implemented and committed (`b95f6c2`, `9310faa`, `45b9784`, `35f772f`).
+Not live — service still runs pre-B28 code pending an explicit restart go-ahead.**
+
 ## Problem (measured, 2026-09-13 11:00 → 2026-09-14 00:00 UTC)
 
-Compression is ~85% of router traffic and ~98% of ChatGPT-plan consumption.
-Most of it is maintenance summarisation that should never touch the ChatGPT plan.
+- 1,646 session-compression calls of 1,927 total rows — **~85% of router traffic**.
+- ChatGPT plan (`openai-codex`): 524 calls, of which **515 compression / 9 real work**
+  — **~98% of plan consumption was maintenance summarisation**.
+- 203 codex compression escalations in 8h, **every one** from
+  `deepseek-v4.1-flash:cloud (empty_content)`; ~$216 imputed (list price, not billed
+  — all lanes are flat-subscription).
+- Capacity signal: gpt-5.5 at 751 consecutive failures (circuit open),
+  gpt-5.6-sol/terra/luna rate-limited — the Plus plan cap.
 
 Root cause chain:
 
@@ -18,10 +27,9 @@ Root cause chain:
 6. In `escalate_on_failure`, `requires_tools=True` hits the "most-capable tool
    model" branch → **gpt-5.6-sol** (ChatGPT plan).
 
-Measured: 203 codex compression escalations in 8h, every one from
-`deepseek-v4.1-flash:cloud (empty_content)`; $216 imputed. gpt-5.5 at 751
-consecutive failures (circuit open), gpt-5.6-sol/terra/luna rate-limited —
-the Plus plan cap, driven in large part by maintenance traffic.
+Steps 5→6 were the ratchet: an *offered* tool schema (which the summariser cannot
+use) provoked a tool-call-only reply, which was then treated as evidence that a
+tool-capable model was needed — promoting maintenance onto the scarcest resource.
 
 ## Fixes (4)
 
@@ -29,78 +37,77 @@ the Plus plan cap, driven in large part by maintenance traffic.
 
 **Target:** `scripts/router.py`.
 
-- Extract the curated ladder construction in `_select_session_compression_model`
-  into `_session_compression_ladder(context_tokens) -> List[str]` (the hardcoded
-  `preferred` list + flash-family ceiling + `MODEL_CONTEXT_CEILING` filters).
-  Keep `_select_session_compression_model` behaviour identical.
-- Add `_next_session_compression_rung(failed_model, context_tokens) -> str`:
-  return the first available ladder rung *after* the failed model; if the failed
-  model is last (or not on the ladder), return the first available rung that is
-  not the failed model. Return `""` only when the ladder is genuinely exhausted.
-- Add `workload_type: str = ""` and `context_tokens: int = 0` params to
-  `escalate_on_failure` (backward-compatible defaults). After the rate-limit /
-  quality-failure bookkeeping and limp-home handling, and BEFORE the
-  `requires_tools` branch, short-circuit when `workload_type == "session_compression"`:
-  pick `_next_session_compression_rung`; if none, return `all_exhausted` decision.
-  Compression escalation must never reach the generic tier-climb or the
-  "most-capable tool model" branch.
+- Extracted the curated ladder construction into
+  `_session_compression_ladder(context_tokens) -> List[str]`. This is now the
+  single source of truth for "which models may summarise", shared by initial
+  selection *and* escalation, so a policy change applies to retries too.
+- Added `_next_session_compression_rung(failed_model, context_tokens)`: the first
+  available rung after the failed model, else any available non-reserved rung,
+  `""` when genuinely exhausted.
+- Added `workload_type: str = ""` / `context_tokens: int = 0` params to
+  `escalate_on_failure` (backward-compatible defaults). The compression branch
+  runs **before** the `requires_tools` branch, so a tool-flagged compaction still
+  escalates on the ladder.
+- Ladder exhaustion fails **closed** (`all_exhausted`, empty selection) rather
+  than promoting onto the plan.
 
 ### Fix 2 — strip `tools` from compression requests
 
-**Target:** `scripts/biggie_llm_endpoint.py` (`/v1/chat/completions` handler,
-~L3155–3167).
+**Target:** `scripts/biggie_llm_endpoint.py`.
 
-After `detect_workload_type`, when `workload_type == "session_compression"`:
-- `body.pop("tools", None)` and `body.pop("tool_choice", None)` so the summariser
-  is not offered tools (which provokes tool-call-only responses).
-- force `requires_tools = False`.
+`_normalize_compression_request(body, workload_type)` strips `tools` and
+`tool_choice` for compression and records `_requires_tools = False`; the handler
+re-derives `requires_tools` from the normalised body. Non-compression workloads
+keep their schemas unchanged. `proxy_to_backend` builds its upstream body from
+the same mutated dict, so the strip reaches the wire (pinned by test).
 
 ### Fix 3 — tool-call-only compression retries a rung, not a promotion
 
-**Target:** `scripts/biggie_llm_endpoint.py` escalation call (~L3614).
+**Target:** `scripts/biggie_llm_endpoint.py` escalation call site.
 
-- Pass `workload_type=workload_type` and `context_tokens=features.get("context_tokens", 0)`
-  into `escalate_on_failure` so the Fix-1 branch handles compression.
-- The existing 502 for tool-call-only compression (L3018) already flows into
-  `escalate_on_failure`; with Fix 1 + Fix 2 it retries the next summariser rung.
+The call sites now pass `workload_type=workload_type` and
+`context_tokens=features.get("context_tokens", 0)`, so the Fix-1 branch handles
+compaction failures instead of the generic tool/tier climb.
 
 ### Fix 4 — reserve the ChatGPT plan from every compression path
 
 **Target:** `scripts/router.py`.
 
-- Add module constant
-  `CHATGPT_PLAN_RESERVED_FROM_COMPRESSION = {"gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}`.
-- `_build_session_compression_fallback_chain`: exclude this set (replace the
-  single `m != "gpt-5.5"` check).
-- `_select_session_compression_model` fail-open loop: exclude this set (replace
-  the `model == "gpt-5.5"` check), in addition to `EXCLUDED_FROM_AUTO_ROUTING`.
+- `CHATGPT_PLAN_RESERVED_FROM_COMPRESSION` name set.
+- **Deviation from plan (stronger):** reservation now follows the *provider*
+  (`COMPRESSION_RESERVED_PROVIDERS = {"openai-codex"}`), because the hand-listed
+  names **missed `gpt-6-astra`**, which sits on the same plan and was eligible to
+  summarise. The provider rule means a new plan model is excluded automatically.
+- **Addition:** `COMPRESSION_RESERVED_PREFIXES = ("gpt-5", "gpt-6")` covers
+  unregistered aliases reachable via `force_model`, where neither the name list
+  nor the provider mapping can see them.
+- `_build_session_compression_fallback_chain` and the fail-open loop both use
+  `_is_reserved_from_compression` (replacing the single `gpt-5.5` checks).
+- **Addition:** implemented `_validate_curated_ladder()`, which the ladder
+  docstring had been claiming existed. It raises at import time if a rung is
+  unregistered, reserved, or the ladder is empty.
 
 ## Tests (TDD, one file per batch)
 
-1. `tests/test_b29_compression_escalation.py` — Fix 1:
-   - `escalate_on_failure(workload_type="session_compression", ...)` after a
-     flash empty-content failure returns the next ladder rung (glm-5.3), never
-     a gpt-5.x model.
-   - exhausting the ladder returns `all_exhausted`.
-   - a non-compression call is unchanged (still honours `requires_tools`).
-2. `tests/test_b29_compression_tools_strip.py` — Fix 2:
-   - a compression request whose body carries `tools` yields `requires_tools=False`
-     and the tools are stripped before downstream; a normal request with `tools`
-     keeps `requires_tools=True`.
-3. `tests/test_b29_compression_capacity_reserve.py` — Fix 4:
-   - the fail-open loop and the compression fallback chain never return any
-     gpt-5.x model, even when such a model is the cheapest tier-3+ available.
+1. `tests/test_b29_compression_escalation.py` (5) — Fix 1.
+2. `tests/test_b29_compression_tools_strip.py` (5) — Fix 2, behavioural.
+3. `tests/test_b29_ladder_invariants.py` (14) — Fix 4 + ladder invariants.
+4. `tests/test_b29_wiring_contracts.py` (6) — static contracts parsed from
+   source (dropped kwarg / pre-strip flag read / unwired normalise are invisible
+   to behavioural tests), **mutation-verified**.
 
 ## Verification
 
-- Full suite green (currently 495 passed at `1a9be63`).
-- `verify` via focused scripts: compression escalation stays on the ladder;
-  gpt-5.x unreachable via compression fail-open / fallback chain.
-- **No live restart** — service still runs pre-B28 code (PID 316924); restart
-  needs explicit go-ahead and is out of scope for this batch.
+- Full suite: **525 passed**.
+- Defect reproduced and closed: the same synthetic tool-flagged compaction
+  request escalates to `gpt-5.6-sol` on the pre-B29 call signature and to
+  `deepseek-v4-flash` on the wired one.
+- Exhaustion path: every curated rung down → still a summariser, never the plan;
+  total outage → `""` + `all_exhausted=True`.
 
 ## Out of scope
 
-- Restarting `biggie-llm-endpoint.service` to load B28 + B29.
+- Restarting `biggie-llm-endpoint.service` to load B28 + B29 (needs explicit
+  go-ahead; the service is live and serving traffic).
 - Changing limp-home behaviour for compression.
 - Any change to tool-capable routing for non-compression workloads.
