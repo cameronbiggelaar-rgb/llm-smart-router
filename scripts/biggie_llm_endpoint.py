@@ -312,8 +312,8 @@ _DETERMINISTIC_ERROR_MARKERS = (
 )
 
 
-def _is_deterministic_client_error(error_text: str = """""") -> bool:
-    """""""""True when a 4xx reflects OUR request shape, not a transient condition.
+def _is_deterministic_client_error(error_text: str = "") -> bool:
+    """True when a 4xx reflects OUR request shape, not a transient condition.
 
     A deterministic error must not be retried: identical input produces
     identical output, so retrying only amplifies the failure (and can trip
@@ -322,29 +322,29 @@ def _is_deterministic_client_error(error_text: str = """""") -> bool:
     Deliberately conservative - anything that might be transient returns
     False so healthy models keep recovering: 429/usage caps, 5xx, timeouts,
     connection resets and backpressure all have their own handling.
-    """""""""
+    """
     if not error_text:
         return False
     haystack = error_text.lower()
 
     # Explicitly transient - checked FIRST so an error body that incidentally
-    # contains e.g. """invalid""" inside a rate-limit message is not misread.
+    # contains e.g. "invalid" inside a rate-limit message is not misread.
     for transient in (
-        """usage_limit_reached""",
-        """rate limit""",
-        """rate_limit""",
-        """too many requests""",
-        """high demand""",
-        """try again later""",
-        """connection reset""",
-        """timed out""",
-        """timeout""",
-        """temporarily unavailable""",
-        """overloaded""",
-        """service unavailable""",
-        """bad gateway""",
-        """gateway timeout""",
-        """internal server error""",
+        "usage_limit_reached",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "high demand",
+        "try again later",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "overloaded",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
     ):
         if transient in haystack:
             return False
