@@ -3184,7 +3184,7 @@ async def chat_completions(request: Request):
     # backend — this must dominate prompt classification / complexity routing.
     # NOTE: this is re-derived after workload classification (see below), because
     # session-compression requests inherit tool schemas they can never use.
-    requires_tools = bool(body.get("tools"))
+    requires_tools = bool(body.get("tools"))  # provisional; re-derived post-strip
 
     # Track timing
     t0 = time.time()

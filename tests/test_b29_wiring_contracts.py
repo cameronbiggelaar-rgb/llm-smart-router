@@ -160,3 +160,52 @@ def test_normalizer_contract_strips_tools_for_compression_only():
     }
     out2 = ep._normalize_compression_request(dict(other_body), "general")
     assert out2["tools"], "non-compression workloads must keep their tool schemas"
+
+
+def test_normalize_runs_before_any_proxy_forward():
+    """The strip must reach the wire: the same ``body`` dict mutated by
+    ``_normalize_compression_request`` is the one passed to
+    ``proxy_to_backend``/``proxy_to_backend_streaming``. If a later proxy call
+    built its own body from a pre-strip snapshot, tools would still reach the
+    upstream summariser and re-provoke tool-call-only responses.
+    """
+    tree = _tree()
+
+    def chat_fn():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "chat_completions":
+                return node
+        raise AssertionError("chat_completions not found")
+
+    cc = chat_fn()
+    normalize_at = None
+    normalise_assigns_body = False
+    proxy_lines = []
+    for node in ast.walk(cc):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    getattr(target, "id", "") == "body"
+                    and isinstance(node.value, ast.Call)
+                    and getattr(node.value.func, "id", "") == "_normalize_compression_request"
+                ):
+                    normalize_at = node.lineno
+                    normalise_assigns_body = True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "_normalize_compression_request" and normalize_at is None:
+                normalize_at = node.lineno
+            if node.func.id in ("proxy_to_backend", "proxy_to_backend_streaming"):
+                proxy_lines.append((node.lineno, node.func.id))
+
+    assert normalize_at is not None, "_normalize_compression_request never called"
+    assert normalise_assigns_body, (
+        "the result of _normalize_compression_request is not assigned back to "
+        "``body`` — the strip is computed and thrown away, so tool schemas still "
+        "reach the upstream summariser"
+    )
+    assert proxy_lines, "no proxy forward call found"
+    for lineno, name in proxy_lines:
+        assert lineno > normalize_at, (
+            f"{name} at line {lineno} runs before the tool-strip at line "
+            f"{normalize_at} — tools reach the upstream summariser"
+        )
