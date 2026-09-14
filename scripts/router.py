@@ -105,6 +105,27 @@ TOOL_CAPABLE_MODELS = {
 # routine work drift onto the strongest model.
 EXCLUDED_FROM_AUTO_ROUTING = {"gpt-6-astra"}
 
+# The ChatGPT plan ($20/mo) is capacity-scarce and reserved for reasoning work
+# (debugging, architecture, review). Maintenance summarisation must never spend
+# it: a 100K-token compaction burns plan capacity that a real problem then can't
+# use, and it is what drove the Plus usage cap.
+#
+# This is separate from EXCLUDED_FROM_AUTO_ROUTING, which means "reachable only
+# via an explicit lane". These models ARE in general rotation — they are merely
+# barred from the compression paths. Every compression selection/fallback path
+# must consult this set, not a single hardcoded name.
+CHATGPT_PLAN_RESERVED_FROM_COMPRESSION = {
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+}
+
+
+def _is_reserved_from_compression(model: str) -> bool:
+    """True when ``model`` must never serve session compression."""
+    return _normalize_model_name(model) in CHATGPT_PLAN_RESERVED_FROM_COMPRESSION
+
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -1043,6 +1064,8 @@ def escalate_on_failure(
     complexity_score: float = 0.0,
     error_type: str = "",
     requires_tools: bool = False,
+    workload_type: str = "",
+    context_tokens: int = 0,
 ) -> RoutingDecision:
     """Escalate to the next available model after a failure.
 
@@ -1055,6 +1078,12 @@ def escalate_on_failure(
         error_type: The type of error (e.g., 'rate_limit', 'timeout', 'error').
         requires_tools: When True, escalation must stay within proven
             tool-capable models and fail closed if none are available.
+        workload_type: The workload that failed. When ``session_compression``,
+            escalation follows the summariser ladder instead of the capability
+            ladder — see the compression branch below.
+        context_tokens: Size of the failed request. Passed to the summariser
+            ladder so per-model context ceilings (e.g. glm-5.3 at 150K) also
+            apply to retries, not just first attempts.
 
     Returns:
         RoutingDecision for the next model in the chain.
@@ -1096,6 +1125,45 @@ def escalate_on_failure(
 
     # Check if we should enter limp-home mode
     _check_limp_home()
+
+    # Compression escalation: stay on the summariser ladder.
+    #
+    # A compaction failure is a summariser problem, so the remedy is the next
+    # summariser rung — never the capability ladder and never the ChatGPT plan.
+    # Before this branch, a compression request carrying the parent session's
+    # tool schemas tripped ``requires_tools=True`` and escalated onto
+    # gpt-5.6-sol; 203 such escalations in one night came from flash's
+    # empty_content and burned ~$216 of imputed ChatGPT capacity on maintenance.
+    #
+    # ``_next_session_compression_rung`` returns "" only when every summariser
+    # rung is down; that is a deliberate fail-closed so the ChatGPT plan never
+    # absorbs compaction traffic.
+    if workload_type == "session_compression":
+        next_rung = _next_session_compression_rung(failed_model, context_tokens)
+        if next_rung:
+            return RoutingDecision(
+                selected_model=next_rung,
+                selected_provider=_get_provider(next_rung),
+                reason=(
+                    f"compression escalation from {failed_model} ({error_type}) "
+                    f"— stayed on summariser ladder, next rung {next_rung}"
+                ),
+                fallback_chain=_build_session_compression_fallback_chain(next_rung),
+                is_fallback=True,
+                original_model=failed_model,
+            )
+        return RoutingDecision(
+            selected_model="",
+            selected_provider="",
+            reason=(
+                "compression summariser ladder exhausted — failing closed rather "
+                "than promoting maintenance traffic onto the ChatGPT plan"
+            ),
+            fallback_chain=[],
+            is_fallback=True,
+            original_model=failed_model,
+            all_exhausted=True,
+        )
 
     if _LIMP_HOME_ACTIVE:
         # Tool-required work must NOT fall to a local chat model that cannot
@@ -1423,6 +1491,109 @@ def _estimate_min_tier(
     return max(1, min(min_tier, 13))
 
 
+def _session_compression_ladder(context_tokens: int = 0) -> List[str]:
+    """The curated summariser ladder, filtered for the given context size.
+
+    Single source of truth for "which models may summarise". Both the initial
+    selection and the escalation path derive from this, so a policy change
+    (a new rung, a context ceiling) applies to retries as well — previously the
+    escalation path had no knowledge of the ladder at all and promoted a failed
+    summariser onto the ChatGPT plan instead.
+
+    Each entry is validated against MODEL_REGISTRY at import time by
+    ``_validate_curated_ladder()`` so it can never reference an unregistered
+    model.
+    """
+    # Curated summariser ladder (policy subset — deliberately excludes
+    # minimax/glm-5/glm-5.1 as summarisers).
+    preferred = [
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash",
+        "glm-5.3",
+        "glm-5.2",
+        "qwen3.5",
+        "deepseek-v4-pro",
+        "deepseek-v3.1:671b",
+        # The ChatGPT plan models are deliberately absent: 100K-token summaries
+        # burn scarce plan capacity and triggered Plus usage caps. Use them for
+        # real reasoning/debugging, not maintenance summarization. Enforced
+        # centrally by CHATGPT_PLAN_RESERVED_FROM_COMPRESSION.
+    ]
+    preferred = [m for m in preferred if not _is_reserved_from_compression(m)]
+    if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
+        # Skip the whole flash family, not just the bare v4-flash tag — the
+        # ceiling guards the empty-stream problem on very large contexts, and
+        # any flash alias shares that serving path until proven otherwise.
+        preferred = [
+            m for m in preferred
+            if not _normalize_model_name(m).startswith("deepseek-v4")
+            or not _normalize_model_name(m).endswith("-flash")
+        ]
+    # Enforce per-model context ceilings: skip any model whose ceiling the
+    # current context exceeds, escalating to the next rung (glm-5.3 -> glm-5.2).
+    preferred = [
+        m for m in preferred
+        if MODEL_CONTEXT_CEILING.get(m, 0) == 0 or context_tokens <= MODEL_CONTEXT_CEILING[m]
+    ]
+    return preferred
+
+
+def _compression_fail_open() -> str:
+    """Cheapest available non-reserved summariser, or "" if none.
+
+    Shared by initial selection and escalation so both are bounded by the same
+    two rules: the ChatGPT plan is never eligible, and models reserved for an
+    explicit lane are never eligible.
+    """
+    for model in get_available_models():
+        if _is_reserved_from_compression(model):
+            continue
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+            continue
+        if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
+            return model
+    return ""
+
+
+def _next_session_compression_rung(failed_model: str, context_tokens: int = 0) -> str:
+    """Next summariser rung after ``failed_model``; "" when compression is exhausted.
+
+    This is the compression answer to escalation. A compaction failure is a
+    quality/serving problem with a *summariser*, so the remedy is another
+    summariser — never a more capable tool-calling model. Returning "" is a
+    deliberate fail-closed: the ChatGPT plan must not absorb compaction traffic
+    even when every rung is down.
+    """
+    ladder = _session_compression_ladder(context_tokens)
+    failed_key = _normalize_model_name(failed_model)
+
+    start = 0
+    for idx, model in enumerate(ladder):
+        if _normalize_model_name(model) == failed_key:
+            start = idx + 1
+            break
+
+    for model in ladder[start:]:
+        if _normalize_model_name(model) == failed_key:
+            continue
+        if is_model_available(model):
+            return model
+
+    # Every remaining rung is down. Fail open to any available non-reserved
+    # summariser (a capacity incident must not become total compaction failure),
+    # but never onto the ChatGPT plan and never back onto the failed model.
+    for model in get_available_models():
+        if _normalize_model_name(model) == failed_key:
+            continue
+        if _is_reserved_from_compression(model):
+            continue
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+            continue
+        if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
+            return model
+    return ""
+
+
 def _select_session_compression_model(context_tokens: int = 0) -> str:
     """Select a native Hermes session-compression summariser.
 
@@ -1439,38 +1610,7 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     limited at 150K (degenerates into repeated-token garbage above that), so
     larger compressions escalate to glm-5.2, the tier directly above glm-5.3.
     """
-    # Curated summariser ladder (policy subset — deliberately excludes
-    # minimax/glm-5/glm-5.1 as summarisers). Each entry is validated against
-    # MODEL_REGISTRY at import time by _validate_curated_ladder() so it can
-    # never reference an unregistered model.
-    preferred = [
-        "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
-        "glm-5.3",
-        "glm-5.2",
-        "qwen3.5",
-        "deepseek-v4-pro",
-        "deepseek-v3.1:671b",
-        # Deliberately exclude gpt-5.5 from routine compression: 100K-token
-        # summaries burn scarce ChatGPT capacity and triggered Plus usage caps.
-        # Use gpt-5.5 for real reasoning/debugging, not maintenance summarization.
-    ]
-    if FLASH_MAX_CONTEXT_TOKENS > 0 and context_tokens > FLASH_MAX_CONTEXT_TOKENS:
-        # Skip the whole flash family, not just the bare v4-flash tag — the
-        # ceiling guards the empty-stream problem on very large contexts, and
-        # any flash alias shares that serving path until proven otherwise.
-        preferred = [
-            m for m in preferred
-            if not _normalize_model_name(m).startswith("deepseek-v4")
-            or not _normalize_model_name(m).endswith("-flash")
-        ]
-    # Enforce per-model context ceilings: skip any model whose ceiling the
-    # current context exceeds, escalating to the next rung (glm-5.3 -> glm-5.2).
-    preferred = [
-        m for m in preferred
-        if MODEL_CONTEXT_CEILING.get(m, 0) == 0 or context_tokens <= MODEL_CONTEXT_CEILING[m]
-    ]
-    for model in preferred:
+    for model in _session_compression_ladder(context_tokens):
         if is_model_available(model):
             return model
 
@@ -1489,14 +1629,11 @@ def _select_session_compression_model(context_tokens: int = 0) -> str:
     # is how it becomes reachable, and an experiment-only model must not be
     # promoted into production summarisation by a fallback that never sees the
     # exclusion list.
-    for model in get_available_models():
-        if model == "gpt-5.5":
-            continue
-        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
-            continue
-        if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
-            return model
-    return ""
+    #
+    # Both rules now live in _compression_fail_open(): the ChatGPT plan is
+    # never eligible here either, so the plan cannot absorb compaction traffic
+    # via this path.
+    return _compression_fail_open()
 
 
 def _select_model(min_tier: int) -> str:
@@ -1556,10 +1693,14 @@ def _build_session_compression_fallback_chain(current_model: str) -> List[str]:
     """Build session-compression fallbacks while preserving ChatGPT capacity.
 
     Compression prompts can be 100K+ tokens; do not automatically escalate
-    them to gpt-5.5, because that burns scarce ChatGPT usage on maintenance
-    summarization. Keep gpt-5.5 for ordinary capability/tool routing.
+    them onto the ChatGPT plan, because that burns scarce plan usage on
+    maintenance summarization. Keep the plan's models for ordinary
+    capability/tool routing and reasoning work.
     """
-    return [m for m in _build_fallback_chain(current_model) if m != "gpt-5.5"]
+    return [
+        m for m in _build_fallback_chain(current_model)
+        if not _is_reserved_from_compression(m)
+    ]
 
 
 def _get_provider(model: str) -> str:
