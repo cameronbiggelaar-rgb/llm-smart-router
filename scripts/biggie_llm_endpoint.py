@@ -1993,6 +1993,20 @@ def _codex_input_from_responses_items(responses_input: list) -> list:
     return codex_input
 
 
+# Parameters the ChatGPT Codex ``/responses`` endpoint rejects outright.
+#
+# Codex answers any of these with ``400 Unsupported parameter: <name>``. The
+# codex branch used to forward sampling knobs into the Responses body via a
+# "forward if present" loop (mirroring the Ollama/OpenAI-compatible branches),
+# which deterministically broke every Codex request that carried a
+# ``temperature``. Because the escalation ladder re-sends the same params to the
+# same rejecting endpoint, one client request produced 18 upstream 400s.
+#
+# Sampling knobs are simply not part of the Responses contract: the correct
+# Codex body is model + input + store + stream (plus optional tools).
+CODEX_UNSUPPORTED_PARAMS = frozenset(('temperature', 'top_p', 'top_k', 'stop', 'frequency_penalty', 'presence_penalty', 'max_tokens', 'max_output_tokens', 'max_completion_tokens', 'seed', 'logprobs', 'top_logprobs', 'n', 'logit_bias', 'user'))
+
+
 async def proxy_to_backend(
     backend: Dict[str, Any],
     messages: List[Dict[str, Any]],
@@ -2040,9 +2054,11 @@ async def proxy_to_backend(
             "stream": True,
         }
 
-        for param in ("temperature", "top_p", "stop", "frequency_penalty", "presence_penalty"):
-            if param in request_body:
-                body[param] = request_body[param]
+        # NOTE: deliberately NO sampling-parameter forwarding here.
+        # Codex rejects temperature/top_p/stop/penalties/max_* with
+        # `400 Unsupported parameter`. See CODEX_UNSUPPORTED_PARAMS above and
+        # references/plan-b30-codex-param-strip-breaker.md. Backends that do
+        # accept these params keep their own forwarding loops further below.
 
         # Forward tool schemas so the model can call terminal/file tools.
         # Convert chat-completions tool schemas to Responses function-tool
