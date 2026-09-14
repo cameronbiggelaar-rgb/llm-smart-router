@@ -119,12 +119,43 @@ CHATGPT_PLAN_RESERVED_FROM_COMPRESSION = {
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6-astra",
 }
+
+# The ChatGPT plan is a fixed $20/mo subscription with a hard usage cap, so its
+# capacity is the scarcest resource in the estate. Reserve it by *provider*, not
+# just by the hand-listed names above: a new plan model added to MODEL_REGISTRY
+# must be excluded from maintenance summarisation automatically, without anyone
+# remembering to edit this file.
+COMPRESSION_RESERVED_PROVIDERS = {"openai-codex"}
+
+# Defence in depth for names that are not in MODEL_REGISTRY (so the provider rule
+# above cannot see them). Normal routing only ever selects registered models, but
+# ``force_model`` can name an arbitrary string; a plan-family alias must not
+# become a compression target just because it is absent from the registry.
+COMPRESSION_RESERVED_PREFIXES = ("gpt-5", "gpt-6")
 
 
 def _is_reserved_from_compression(model: str) -> bool:
-    """True when ``model`` must never serve session compression."""
-    return _normalize_model_name(model) in CHATGPT_PLAN_RESERVED_FROM_COMPRESSION
+    """True when ``model`` must never serve session compression.
+
+    Three overlapping rules, cheapest first: an explicit name, the reserved
+    provider (the durable rule for registered models), and a plan-family prefix
+    for unregistered aliases. Overlap is deliberate — the name list and prefix
+    rule exist so a registry or provider-mapping change cannot silently reopen
+    the scarce ChatGPT capacity to maintenance traffic.
+    """
+    if not model:
+        return False
+    normalized = _normalize_model_name(model)
+    if normalized in CHATGPT_PLAN_RESERVED_FROM_COMPRESSION:
+        return True
+    try:
+        if _get_provider(model) in COMPRESSION_RESERVED_PROVIDERS:
+            return True
+    except Exception:
+        pass
+    return any(normalized.startswith(prefix) for prefix in COMPRESSION_RESERVED_PREFIXES)
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -1536,6 +1567,42 @@ def _session_compression_ladder(context_tokens: int = 0) -> List[str]:
         if MODEL_CONTEXT_CEILING.get(m, 0) == 0 or context_tokens <= MODEL_CONTEXT_CEILING[m]
     ]
     return preferred
+
+
+def _validate_curated_ladder() -> None:
+    """Fail fast if the curated summariser ladder references an unregistered model.
+
+    The ladder is hand-maintained policy, so a typo (or a model renamed in
+    MODEL_REGISTRY) would silently shrink the summariser pool — and because
+    escalation derives from the same ladder, it would shrink the retry pool too.
+    Raising at import time turns that into an immediate, loud failure.
+
+    Also asserts the ChatGPT plan is absent, so a future edit cannot quietly
+    reintroduce plan models as summarisers.
+    """
+    from models import MODEL_REGISTRY
+
+    if not MODEL_REGISTRY:  # import-order guard: registry not populated yet
+        return
+
+    ladder = _session_compression_ladder(0)
+    unknown = [m for m in ladder if m not in MODEL_REGISTRY]
+    if unknown:
+        raise AssertionError(
+            f"session-compression ladder references unregistered model(s): {unknown}"
+        )
+
+    leaked = [m for m in ladder if _is_reserved_from_compression(m)]
+    if leaked:
+        raise AssertionError(
+            f"session-compression ladder contains ChatGPT-plan-reserved model(s): {leaked}"
+        )
+
+    if not ladder:
+        raise AssertionError("session-compression ladder is empty")
+
+
+_validate_curated_ladder()
 
 
 def _compression_fail_open() -> str:
