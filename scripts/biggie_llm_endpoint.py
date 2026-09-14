@@ -17,6 +17,7 @@ Configurable routing profile:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -163,6 +164,11 @@ _COST_OBS_COLUMNS = {
     "experiment_arm": "TEXT NOT NULL DEFAULT ''",
     "is_shadow": "INTEGER NOT NULL DEFAULT 0",
     "finish_reason": "TEXT NOT NULL DEFAULT ''",
+    # Cache observability (B31 change 4). Before this column existed there was
+    # NO record of prompt-cache hits anywhere in the DB, so the ~50x discount
+    # that the provider was actually granting was unmeasurable, and every cached
+    # token was billed at the full input rate in our own cost figures.
+    "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -514,6 +520,7 @@ def compute_cost_fields(
     input_tokens: Any,
     output_tokens: Any,
     conn: Any = None,
+    cached_input_tokens: Any = 0,
 ) -> Tuple[float, int]:
     """Return ``(cost_usd, cost_unknown)`` for one call.
 
@@ -534,7 +541,11 @@ def compute_cost_fields(
     try:
         if conn is None:
             conn = _get_db_connection()
-        amount = cost_of_call(model, in_tok, out_tok, conn=conn)
+        amount = cost_of_call(
+            model, in_tok, out_tok,
+            cached_input_tokens=int(cached_input_tokens or 0),
+            conn=conn,
+        )
     except Exception as e:                                  # pragma: no cover
         logger.debug("cost_of_call failed for %s: %s", model, e)
         return 0.0, 1
@@ -1503,6 +1514,107 @@ def compression_level_for_workload(
 
 
 # ── Request logging ────────────────────────────────────────────────────────────
+
+# ── Compression budget guard ───────────────────────────────────────────────────
+#
+# Why this exists
+# ---------------
+# Measured 2026-09-14 (24h): 6,059 `session_compression` calls carrying
+# 798,171,007 input tokens — 99.6% of ALL router input — against 3,360,284
+# tokens of real chat. Every one was a DISTINCT request (6,068 of 6,068
+# request_ids unique, so not retry amplification). Live logs show the loop:
+# `Session hygiene: compressed 650 -> 650 msgs` — 237 of 697 compactions
+# removed ZERO messages and 265 did not reduce tokens at all, because the
+# configured threshold sat below the incompressible floor (system prompt +
+# tool schemas). The pass cannot get under the line, so the next turn compacts
+# again, forever.
+#
+# The loop lives in Hermes core and its hygiene `threshold_pct` is hardcoded,
+# so containment belongs here: count compactions per session in a rolling
+# window, and past the cap degrade to "route cheap + label" — never reject.
+# Rejecting would wedge the calling session with no way to shrink.
+COMPRESSION_GUARD_ENABLED = True
+COMPRESSION_GUARD_PER_SESSION_MAX = 40
+COMPRESSION_GUARD_WINDOW_SECONDS = 3600
+COMPRESSION_GUARD_OVERFLOW_WORKLOAD = "session_compression_overflow"
+COMPRESSION_GUARD_OVERFLOW_ERROR = "compression_budget_exceeded"
+COMPRESSION_GUARD_KEY_PREFIX_CHARS = 512
+
+# session key -> list of monotonic call timestamps (rolling window)
+_COMPRESSION_GUARD_STATE: Dict[str, List[float]] = {}
+
+
+def _compression_guard_now() -> float:
+    """Monotonic clock, so window arithmetic is immune to wall-clock jumps."""
+    return time.monotonic()
+
+
+def _compression_session_key(messages: Any, session_id: str = "") -> str:
+    """Identify the calling session without relying on a session_id.
+
+    Every compaction row in `router_logs` has a BLANK session_id (verified:
+    `session_compression||4929`), so the key must be derived from the prompt.
+    The prefix is stable across turns for a given session (the original context
+    is re-sent each time) and distinct between sessions, which is exactly what a
+    rolling per-session cap needs.
+
+    Never raises: guard bookkeeping must not be able to break a live request.
+    """
+    try:
+        sid = str(session_id or "").strip()
+        if sid:
+            return f"sid:{sid}"
+        text = ""
+        if isinstance(messages, list):
+            parts: List[str] = []
+            for m in messages:
+                if isinstance(m, dict):
+                    parts.append(_message_text(m.get("content", "")))
+                elif isinstance(m, str):
+                    parts.append(m)
+                if sum(len(p) for p in parts) >= COMPRESSION_GUARD_KEY_PREFIX_CHARS:
+                    break
+            text = "\n".join(parts)
+        elif isinstance(messages, str):
+            text = messages
+        prefix = text[:COMPRESSION_GUARD_KEY_PREFIX_CHARS]
+        return "pfx:" + hashlib.sha256(prefix.encode("utf-8", "replace")).hexdigest()[:32]
+    except Exception:  # pragma: no cover - defensive, must never raise
+        return "pfx:unkeyable"
+
+
+def _compression_call_count(session_key: str, now: Optional[float] = None) -> int:
+    """Count calls inside the rolling window, pruning expired entries."""
+    if not COMPRESSION_GUARD_ENABLED:
+        return 0
+    now = _compression_guard_now() if now is None else now
+    cutoff = now - COMPRESSION_GUARD_WINDOW_SECONDS
+    stamps = [t for t in _COMPRESSION_GUARD_STATE.get(session_key, []) if t > cutoff]
+    if stamps:
+        _COMPRESSION_GUARD_STATE[session_key] = stamps
+    else:
+        _COMPRESSION_GUARD_STATE.pop(session_key, None)
+    return len(stamps)
+
+
+def _compression_guard_allows(session_key: str) -> bool:
+    """Record one compaction attempt; return False once the cap is exceeded.
+
+    A False return means "this is a runaway, stop treating it as a compaction",
+    NOT "reject the request". The caller still serves it.
+    """
+    if not COMPRESSION_GUARD_ENABLED:
+        return True
+    try:
+        now = _compression_guard_now()
+        count = _compression_call_count(session_key, now=now)
+        if count >= COMPRESSION_GUARD_PER_SESSION_MAX:
+            return False
+        _COMPRESSION_GUARD_STATE.setdefault(session_key, []).append(now)
+        return True
+    except Exception:  # pragma: no cover - defensive, must never raise
+        return True
+
 
 def _get_usage_tokens(response: dict, direction: str) -> int:
     """Extract token counts from an OpenAI-compatible response."""
@@ -3313,6 +3425,34 @@ async def chat_completions(request: Request):
     # classified as tool-requiring.
     body = _normalize_compression_request(body, workload_type)
     requires_tools = body.get("_requires_tools", bool(body.get("tools")))
+
+    # Compression budget guard (B31 change 3). A session that has already made
+    # more than COMPRESSION_GUARD_PER_SESSION_MAX compaction calls inside the
+    # rolling window is in the no-op churn loop (see the guard's docstring):
+    # the request is STILL SERVED, but it stops being treated as a compaction —
+    # relabelled so the churn is visible, and routed away from the compaction
+    # lane so a runaway cannot keep buying a paid summariser.
+    if workload_type == "session_compression":
+        _guard_key = _compression_session_key(
+            messages,
+            session_id=str(body.get("session_id") or body.get("user") or ""),
+        )
+        if not _compression_guard_allows(_guard_key):
+            logger.warning(
+                "Compression budget exceeded for session %s — serving without "
+                "compaction treatment (possible no-op compaction loop)",
+                _guard_key,
+            )
+            log_recovery_event(
+                "compression-guard",
+                COMPRESSION_GUARD_OVERFLOW_ERROR,
+                f"session={_guard_key} cap={COMPRESSION_GUARD_PER_SESSION_MAX}"
+                f"/{COMPRESSION_GUARD_WINDOW_SECONDS}s",
+            )
+            body["_compression_guard_overflow"] = True
+            body["_compression_guard_key"] = _guard_key
+            workload_type = COMPRESSION_GUARD_OVERFLOW_WORKLOAD
+
     body["_trace_session_compression_channels"] = (
      workload_type == "session_compression"
      and os.environ.get("BIGGIE_TRACE_SESSION_COMPRESSION_CHANNELS", "") == "1"
