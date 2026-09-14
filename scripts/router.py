@@ -441,6 +441,12 @@ def is_model_available(model: str) -> bool:
         # But if circuit is also clear, restore
         if status.circuit_open_until <= now:
             status.available = True
+            # Expiry grants a FRESH failure budget. Without this reset the
+            # poisoned counter persists: one new failure re-trips the breaker
+            # instantly and the model is starved to a single attempt per
+            # cooldown window (observed: gpt-5.5 at 4,046 consecutive
+            # failures while its breaker "cycled" every 30 minutes).
+            status.consecutive_failures = 0
             _save_model_state(status)
             _log_recovery_event(model, "recovered", "rate limit expired")
             logger.info("Model %s rate limit expired — restored to available", model)
@@ -452,6 +458,11 @@ def is_model_available(model: str) -> bool:
         status.circuit_open_until = 0.0
         if status.rate_limited_until <= now:
             status.available = True
+            # Same fresh-budget guarantee as the rate-limit path above:
+            # an expired breaker must re-arm with a clean counter so the
+            # model gets a genuine retry budget instead of re-tripping on
+            # its first post-recovery failure.
+            status.consecutive_failures = 0
             _save_model_state(status)
             _log_recovery_event(model, "recovered", "circuit breaker expired")
             logger.info("Model %s circuit breaker expired — restored to available", model)
