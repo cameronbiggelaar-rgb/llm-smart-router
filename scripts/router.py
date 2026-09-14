@@ -914,7 +914,14 @@ def route_task(
     # though the summariser is not expected to call tools. Treat compaction as a
     # first-class maintenance workload BEFORE the tool-capability gate, otherwise
     # these huge prompts can still burn gpt-5.5 simply because tools are present.
-    if workload_type == "session_compression" or task_type == "session_compression":
+    # "session_compression_overflow" is the endpoint's runaway-churn label (see
+    # biggie_llm_endpoint's compression budget guard). It MUST route exactly like
+    # a compaction: compaction prompts inherit tool schemas from the parent
+    # session, so if the overflow label fell through to the tool-capability gate
+    # below it would FAIL CLOSED and wedge the very session the guard is trying
+    # to protect. Labelled differently for reporting, routed identically.
+    if workload_type in ("session_compression", "session_compression_overflow") or \
+            task_type in ("session_compression", "session_compression_overflow"):
         selected = _select_session_compression_model(context_tokens=context_tokens)
         if not selected:
             return RoutingDecision(
@@ -1180,7 +1187,9 @@ def escalate_on_failure(
     # ``_next_session_compression_rung`` returns "" only when every summariser
     # rung is down; that is a deliberate fail-closed so the ChatGPT plan never
     # absorbs compaction traffic.
-    if workload_type == "session_compression":
+    # The overflow label escalates on the summariser ladder too, for the same
+    # reason it routes there: it IS a compaction, just a budget-exceeded one.
+    if workload_type in ("session_compression", "session_compression_overflow"):
         next_rung = _next_session_compression_rung(failed_model, context_tokens)
         if next_rung:
             return RoutingDecision(

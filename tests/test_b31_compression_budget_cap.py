@@ -189,3 +189,43 @@ def test_guard_is_wired_into_the_request_path():
     # The overflow label must be applied to the workload, not just computed.
     assert "COMPRESSION_GUARD_OVERFLOW_WORKLOAD" in src
     assert "_compression_guard_overflow" in src
+
+
+# ── The overflow label must ROUTE like a compaction, not fall through ─────────
+
+def test_overflow_label_routes_as_compression_not_tool_gate():
+    """A budget-exceeded compaction must not FAIL CLOSED.
+
+    The endpoint relabels a runaway compaction `session_compression_overflow`.
+    Compaction prompts inherit the parent session's tool schemas, so if that
+    label missed the session_compression branch it would fall through to the
+    tool-capability gate and fail closed when no tool model is free — wedging
+    the very session the guard exists to protect. This pins the routing.
+    """
+    import inspect
+
+    import router
+
+    src = inspect.getsource(router)
+    assert "session_compression_overflow" in src, (
+        "router must recognise the overflow label"
+    )
+    # It must appear in BOTH the routing branch and the escalation branch.
+    assert src.count("session_compression_overflow") >= 4, (
+        "the overflow label must be handled in both the route and escalate paths"
+    )
+
+
+def test_overflow_label_uses_the_summariser_ladder():
+    """It must escalate on the summariser ladder, never the ChatGPT plan."""
+    import inspect
+
+    import router
+
+    src = inspect.getsource(router)
+    idx = src.find("session_compression_overflow")
+    assert idx != -1
+    window = src[max(0, idx - 400): idx + 2000]
+    assert "_next_session_compression_rung" in window or "_select_session_compression_model" in window, (
+        "the overflow label must stay on the summariser ladder"
+    )
