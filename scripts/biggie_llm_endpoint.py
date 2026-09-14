@@ -1281,6 +1281,36 @@ def _estimate_context_tokens(messages: List[Dict[str, Any]]) -> int:
     return max(1, chars // 4)
 
 
+def _normalize_compression_request(
+    body: Dict[str, Any], workload_type: str
+) -> Dict[str, Any]:
+    """Strip tool affordances from a session-compression request.
+
+    A native Hermes compaction request inherits the *parent session's* tool
+    schemas, but a summariser never calls a tool. Leaving the schemas in place
+    has two harmful effects:
+
+    1. ``requires_tools`` becomes True for a workload that cannot use tools,
+       which unlocks the tool-capability route and, on failure, the
+       "most-capable tool model" escalation branch — i.e. the ChatGPT plan.
+    2. Offered tools *provoke* tool-call-only responses from summarisers that
+       should be emitting prose, which is itself the failure that triggers the
+       escalation in the first place.
+
+    Mutates and returns ``body`` in place. ``_requires_tools`` is recorded so the
+    handler derives the flag from the normalised body rather than re-reading the
+    original schema list.
+    """
+    if workload_type != "session_compression":
+        body["_requires_tools"] = bool(body.get("tools"))
+        return body
+
+    body.pop("tools", None)
+    body.pop("tool_choice", None)
+    body["_requires_tools"] = False
+    return body
+
+
 def detect_workload_type(
     messages: List[Dict[str, Any]],
     body: Dict[str, Any],
@@ -3152,6 +3182,8 @@ async def chat_completions(request: Request):
     want_stream = bool(body.get("stream", False))
     # A request that carries OpenAI tool schemas requires a proven tool-capable
     # backend — this must dominate prompt classification / complexity routing.
+    # NOTE: this is re-derived after workload classification (see below), because
+    # session-compression requests inherit tool schemas they can never use.
     requires_tools = bool(body.get("tools"))
 
     # Track timing
@@ -3165,6 +3197,11 @@ async def chat_completions(request: Request):
     features = extract_features_from_messages(messages)
     workload_type = detect_workload_type(messages, body, dict(request.headers))
     body["_workload_type"] = workload_type
+    # Strip tool affordances from compression (Fix 2) and derive the flag from
+    # the normalised body so a summariser is never offered tools and never
+    # classified as tool-requiring.
+    body = _normalize_compression_request(body, workload_type)
+    requires_tools = body.get("_requires_tools", bool(body.get("tools")))
     body["_trace_session_compression_channels"] = (
      workload_type == "session_compression"
      and os.environ.get("BIGGIE_TRACE_SESSION_COMPRESSION_CHANNELS", "") == "1"
@@ -3616,6 +3653,12 @@ async def chat_completions(request: Request):
             complexity_score=features["complexity_score"],
             error_type=fail_type,
             requires_tools=requires_tools,
+            # Classify the escalation as compression so it retries the next
+            # summariser rung instead of promoting to the ChatGPT plan. Without
+            # this, a compaction failure climbs the generic tool/tier ladder and
+            # lands on the most-capable tool model.
+            workload_type=workload_type,
+            context_tokens=features.get("context_tokens", 0),
         )
 
         if not escalation.selected_model:
