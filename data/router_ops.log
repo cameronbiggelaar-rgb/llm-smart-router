@@ -93,3 +93,61 @@ Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
  The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
 
 Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-14:
+  2026-09-12 rolled up (14 model/workload rows)
+  2026-09-13 rolled up (22 model/workload rows)
+  2026-09-14 rolled up (20 model/workload rows)
+
+Deleted 0 of 34 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-15)
+REFUSED: refusing to purge 34 day(s) with no committed rollup: 2026-05-14, 2026-05-16, 2026-05-17, 2026-05-18, 2026-05-19...
+VACUUM: not needed
+
+Unit cost — since 2026-09-11
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.5                    session_compression       579     719.97    1.24347      n/a
+gpt-5.6-sol                session_compression       336     411.15    1.22366      n/a
+deepseek-v4.1-flash:cloud  session_compression     10863     123.91    0.01141      n/a
+glm-5.3:cloud              session_compression       613     113.67    0.18543      n/a
+deepseek-v4-pro            session_compression      1113      79.78    0.07168      n/a
+glm-5.2:cloud              session_compression       310      52.19    0.16836      n/a
+glm-5.3                    session_compression       133      26.42    0.19867      n/a
+deepseek-v4-flash:cloud    session_compression      2710      25.88    0.00955      n/a
+gpt-5.6-terra              session_compression        13      11.71    0.90071      n/a
+glm-5.3:cloud              normal_chat                69       7.59    0.11007      n/a
+qwen3.5                    normal_chat               354       6.71    0.01896      n/a
+gpt-5.5                    normal_chat                24       6.19    0.25780      n/a
+gpt-5.6-luna               session_compression         2       3.55    1.77498      n/a
+glm-5.2:cloud              normal_chat                17       2.81    0.16511      n/a
+gpt-5.6-luna               normal_chat                 6       2.32    0.38675      n/a
+deepseek-v4-pro            normal_chat               195       2.16    0.01107      n/a
+gpt-5.6-sol                normal_chat                 3       1.11    0.37054      n/a
+gpt-5.6-terra              normal_chat                 3       1.05    0.34997      n/a
+deepseek-v4.1-flash:cloud  normal_chat                14       0.03    0.00215      n/a
+gpt-6-astra                normal_chat                 1       0.02    0.01834      n/a
+glm-5.3-flash              normal_chat                 2       0.00    0.00220      n/a
+deepseek-v4-flash:cloud    normal_chat                 8       0.00    0.00033      n/a
+glm-5.3                    normal_chat                 1       0.00    0.00010      n/a
+llama3.1:8b                normal_chat               126       0.00    0.00000      n/a
+biggie-router              unknown                    20       0.00    0.00000      n/a
+dolphin3                   normal_chat                14       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  unknown                    11       0.00    0.00000      n/a
+llama3.1:8b                session_compression        10       0.00    0.00000      n/a
+biggie-router              unknown                     5       0.00    0.00000      n/a
+biggie-router              unknown                     4       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+deepseek-v4-pro            unknown                     1       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  unknown                     1       0.00    0.00000      n/a
+glm-5.3                    unknown                     1       0.00    0.00000      n/a
+llama3.1:8b                unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              17568    1598.23
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)

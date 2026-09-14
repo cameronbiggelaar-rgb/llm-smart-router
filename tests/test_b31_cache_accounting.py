@@ -259,3 +259,63 @@ def test_cached_tokens_is_wired_into_the_request_path():
     assert "cached_input_tokens=_cached_tok" in src, (
         "the request path must pass the cache count into cost computation"
     )
+
+
+# ── Streaming must capture the cache too (the path production actually uses) ──
+
+def test_all_usage_capture_sites_have_a_cached_sibling():
+    """Every token-capture site must also capture cached tokens.
+
+    The first version of this fix wired only the NON-streaming path. Live
+    production traffic is almost entirely `streaming=1`, so the column stayed
+    0 while the agent log showed `cache=151194/152277` on the same requests —
+    the fix looked applied and measured nothing. Each `usage_input_tokens`
+    assignment must have a `usage_cached_tokens` sibling within a few lines.
+    """
+    import re
+
+    src = _module_source(ep)
+    lines = src.splitlines()
+    sites = [i for i, l in enumerate(lines) if 'usage_input_tokens"] = ' in l]
+    assert sites, "expected at least one usage capture site"
+    missing = []
+    for i in sites:
+        window = lines[i + 1 : i + 4]
+        if not any("usage_cached_tokens" in w for w in window):
+            missing.append(i + 1)
+    assert not missing, (
+        f"these usage capture sites record input tokens but NOT cached tokens, "
+        f"so streaming cache hits are billed at full rate: lines {missing}"
+    )
+
+
+def test_streaming_loggers_pass_cached_tokens(tmp_path):
+    """The streaming completion loggers must forward the captured count.
+
+    Capturing it into `_stream_stats` is not enough — it has to reach
+    `_log_request_to_db`, or the row still reads cached_tokens=0.
+    """
+    src = _module_source(ep)
+    assert "_cap_cached = int(_stream_stats.get(\"usage_cached_tokens\") or 0)" in src, (
+        "streaming loggers must read usage_cached_tokens out of _stream_stats"
+    )
+    assert src.count("cached_tokens=_cap_cached,") >= 2, (
+        "both streaming completion loggers (primary + escalated) must pass "
+        "cached_tokens=_cap_cached"
+    )
+
+
+def test_logger_fallback_cost_honours_cached_tokens():
+    """The single choke point must pass cached tokens into the price.
+
+    `_log_request_to_db` computes a cost whenever the caller does not state
+    one. If that path drops the cached count, every hit is billed at the full
+    input rate no matter how well the callers are wired.
+    """
+    import inspect
+
+    src = inspect.getsource(ep._log_request_to_db)
+    assert "cached_input_tokens=cached_tokens" in src, (
+        "the logger's own cost fallback must pass cached_input_tokens so a "
+        "cache hit is billed at the cached rate"
+    )

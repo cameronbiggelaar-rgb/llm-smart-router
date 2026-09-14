@@ -2993,6 +2993,7 @@ async def _resume_stream(
            if _pin or _pout:
             stats["usage_input_tokens"] = _pin
             stats["usage_output_tokens"] = _pout
+            stats["usage_cached_tokens"] = _sse_cached_tokens(data)
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
         # call silently drops the rest of the stream).
@@ -3014,6 +3015,7 @@ async def _resume_stream(
                         if _uin or _uout:
                             stats["usage_input_tokens"] = _uin
                             stats["usage_output_tokens"] = _uout
+                            stats["usage_cached_tokens"] = _sse_cached_tokens(data)
             await resp.aclose()
         # Scan once at the end of the stream. Repeatedly re-regexing the growing
         # buffer per delta is pointless latency; a single scan after stream close
@@ -3260,6 +3262,7 @@ async def _non_streaming_fallback_to_sse(
             if _fin or _fout:
                 stats["usage_input_tokens"] = _fin
                 stats["usage_output_tokens"] = _fout
+            stats["usage_cached_tokens"] = _get_cached_tokens(result)
             stats["final_provider"] = provider
         return StreamingResponse(
             _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
@@ -3340,6 +3343,7 @@ async def proxy_to_backend_streaming(
         if _lin or _lout:
             stats["usage_input_tokens"] = _lin
             stats["usage_output_tokens"] = _lout
+            stats["usage_cached_tokens"] = _get_cached_tokens(result)
         return StreamingResponse(
             _wrap_non_streaming(provider, backend_model, result, on_complete=on_complete),
             media_type="text/event-stream",
@@ -3817,6 +3821,7 @@ async def chat_completions(request: Request):
                 # together: a lone cost_unknown would zero the estimate.
                 _cap_in = int(_stream_stats.get("usage_input_tokens") or 0)
                 _cap_out = int(_stream_stats.get("usage_output_tokens") or 0)
+                _cap_cached = int(_stream_stats.get("usage_cached_tokens") or 0)
                 _usage_seen = bool(_cap_in or _cap_out)
                 _cost_kw = {}
                 if not _usage_seen:
@@ -3833,6 +3838,7 @@ async def chat_completions(request: Request):
                     complexity_score=features["complexity_score"],
                     input_tokens=_cap_in or features.get("context_tokens", 0),
                     output_tokens=_cap_out,
+                    cached_tokens=_cap_cached,
                     latency_seconds=elapsed,
                     routing_time_ms=round(routing_time * 1000),
                     success=True,
@@ -4060,6 +4066,7 @@ async def chat_completions(request: Request):
                 # cost_unknown set, so a partial figure is never read as measured.
                 _cap_in = int(_stream_stats.get("usage_input_tokens") or 0)
                 _cap_out = int(_stream_stats.get("usage_output_tokens") or 0)
+                _cap_cached = int(_stream_stats.get("usage_cached_tokens") or 0)
                 _usage_seen = bool(_cap_in or _cap_out)
                 _final_model = _stream_stats.get("final_model", escalation.selected_model)
                 _cost_kw = {}
@@ -4077,6 +4084,7 @@ async def chat_completions(request: Request):
                     complexity_score=features["complexity_score"],
                     input_tokens=_cap_in or features.get("context_tokens", 0),
                     output_tokens=_cap_out,
+                    cached_tokens=_cap_cached,
                     latency_seconds=elapsed,
                     routing_time_ms=round(routing_time * 1000),
                     success=True,
