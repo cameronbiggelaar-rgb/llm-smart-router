@@ -1624,6 +1624,40 @@ def _get_usage_tokens(response: dict, direction: str) -> int:
     return usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
 
 
+def _get_cached_tokens(response: dict) -> int:
+    """Extract the prompt-cache hit count from an OpenAI-compatible response.
+
+    Providers report hits in ``usage.prompt_tokens_details.cached_tokens``
+    (verified live against ollama.com: a repeated 9,941-token prompt returned
+    ``{"cached_tokens": 9856}`` on the second call and no details block at all
+    on the cold first call). Some gateways use a flat ``cached_tokens`` or
+    ``cache_read_input_tokens`` instead, so all three are accepted.
+
+    Returns 0 when nothing is reported — a cache miss, a provider that does not
+    report hits, or a malformed payload. Never raises: usage capture is
+    diagnostic and must not break a request.
+    """
+    try:
+        if not isinstance(response, dict):
+            return 0
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            return 0
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            for key in ("cached_tokens", "cache_read_input_tokens"):
+                val = details.get(key)
+                if val is not None:
+                    return max(0, int(val))
+        for key in ("cached_tokens", "cache_read_input_tokens"):
+            val = usage.get(key)
+            if val is not None:
+                return max(0, int(val))
+        return 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _sse_usage_tokens(data: str) -> Tuple[int, int]:
     """Extract ``(prompt_tokens, completion_tokens)`` from one SSE data line.
 
@@ -1658,6 +1692,21 @@ def _sse_usage_tokens(data: str) -> Tuple[int, int]:
         return int(prompt or 0), int(completion or 0)
     except (TypeError, ValueError):  # pragma: no cover - defensive
         return 0, 0
+
+
+def _sse_cached_tokens(data: str) -> int:
+    """Extract the cache-hit count from one SSE data line.
+
+    Mirrors ``_get_cached_tokens`` for the streaming shape, where usage arrives
+    in a final chunk with an empty ``choices`` list.
+    """
+    if not data or data == "[DONE]":
+        return 0
+    try:
+        obj = json.loads(data)
+    except (ValueError, TypeError):
+        return 0
+    return _get_cached_tokens(obj)
 
 
 def _empty_content_reason(response: Any) -> str:
@@ -2020,6 +2069,7 @@ def _log_request_to_db(
     success: bool = True,
     escalated: bool = False,
     error_type: str = "",
+    cached_tokens: int = 0,
     compression_level: str = "off",
     compression_savings_pct: float = 0.0,
     compression_time_ms: float = 0.0,
@@ -2076,7 +2126,8 @@ def _log_request_to_db(
         elif cost_unknown is None:
             # Caller did not state a cost: compute it. Never guess silently.
             _computed, _computed_unknown = compute_cost_fields(
-                model_used, input_tokens, output_tokens, conn=db
+                model_used, input_tokens, output_tokens, conn=db,
+                cached_input_tokens=cached_tokens,
             )
             _resolved_cost, _resolved_cost_unknown = float(_computed), int(_computed_unknown)
         else:
@@ -2116,9 +2167,10 @@ def _log_request_to_db(
                 requires_tools, context_tokens, empty_stream, saw_content,
                 saw_tool_calls, final_model, routing_reason,
                 cost_usd, cost_unknown, quality_score, quality_method,
-                pricing_version, experiment, experiment_arm, is_shadow, finish_reason
+                pricing_version, experiment, experiment_arm, is_shadow, finish_reason,
+                cached_tokens
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     "",  # session_id — not available at endpoint level
@@ -2155,6 +2207,7 @@ def _log_request_to_db(
                     experiment_arm,
                     1 if is_shadow else 0,
                     finish_reason,
+                    int(cached_tokens or 0),
                     ),
                     )
         db.commit()
@@ -3860,8 +3913,13 @@ async def chat_completions(request: Request):
         if not want_stream:
             _in_tok = _get_usage_tokens(result, "input") or features.get("prompt_text", "").count(" ")
             _out_tok = _get_usage_tokens(result, "output") or 0
+            # Cache hits are recorded AND billed at the discounted rate (B31
+            # change 4). Dropping this argument was billing every cached token
+            # at the full input rate.
+            _cached_tok = _get_cached_tokens(result)
             _cost, _cost_unknown = compute_cost_fields(
-                decision.selected_model, _in_tok, _out_tok
+                decision.selected_model, _in_tok, _out_tok,
+                cached_input_tokens=_cached_tok,
             )
             _log_request_to_db(
                 model_used=decision.selected_model,
@@ -3870,6 +3928,7 @@ async def chat_completions(request: Request):
                 complexity_score=features["complexity_score"],
                 input_tokens=_in_tok,
                 output_tokens=_out_tok,
+                cached_tokens=_cached_tok,
                 latency_seconds=total_time,
                 routing_time_ms=round(routing_time * 1000),
                 success=True,

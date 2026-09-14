@@ -53,6 +53,10 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     "quality_score": "REAL",
     "quality_method": "TEXT NOT NULL DEFAULT ''",
     "finish_reason": "TEXT NOT NULL DEFAULT ''",
+    # Cache observability (B31 change 4). Without it a rollup cannot show how
+    # much of the input was served from cache — the metric that makes the
+    # recurring compaction churn visible in reports rather than only in logs.
+    "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
 }
 
 # ── New tables ────────────────────────────────────────────────────────────────
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     provider TEXT NOT NULL,
     input_usd_per_1m REAL NOT NULL,
     output_usd_per_1m REAL NOT NULL,
+    cached_input_usd_per_1m REAL,
     effective_from TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (model, effective_from)
@@ -87,6 +92,7 @@ CREATE TABLE IF NOT EXISTS daily_findings (
     calls INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
     cost_unknown_calls INTEGER NOT NULL DEFAULT 0,
     success_calls INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +175,7 @@ def _migrate_daily_findings_shadow(conn: sqlite3.Connection) -> int:
             calls INTEGER NOT NULL DEFAULT 0,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
             cost_usd REAL NOT NULL DEFAULT 0,
             cost_unknown_calls INTEGER NOT NULL DEFAULT 0,
             success_calls INTEGER NOT NULL DEFAULT 0,
@@ -182,14 +189,15 @@ def _migrate_daily_findings_shadow(conn: sqlite3.Connection) -> int:
         )"""
     )
     shadow_expr = "is_shadow" if "is_shadow" in cols else "0"
+    cached_expr = "cached_tokens" if "cached_tokens" in cols else "0"
     conn.execute(
         f"""INSERT INTO daily_findings_shadow_migration
             (day, workload_type, model, call_type, calls, input_tokens,
-             output_tokens, cost_usd, cost_unknown_calls, success_calls,
+             output_tokens, cached_tokens, cost_usd, cost_unknown_calls, success_calls,
              escalated_calls, latency_p50, latency_p95, quality_avg, quality_n,
              is_shadow)
             SELECT day, workload_type, model, call_type, calls, input_tokens,
-                   output_tokens, cost_usd, cost_unknown_calls, success_calls,
+                   output_tokens, {cached_expr}, cost_usd, cost_unknown_calls, success_calls,
                    escalated_calls, latency_p50, latency_p95, quality_avg, quality_n,
                    {shadow_expr}
             FROM daily_findings"""
@@ -374,8 +382,15 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
     picked up on a re-run, and so a re-run can never double-count. Returns the
     number of finding rows written.
     """
+    # `cached_tokens` is additive; a database created before it (or a test
+    # fixture) must still roll up, so fall back to a literal 0.
+    _cached_sum = (
+        "COALESCE(SUM(cached_tokens), 0)"
+        if "cached_tokens" in _log_columns(conn)
+        else "0"
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT
             COALESCE(NULLIF(workload_type, ''), 'unknown') AS workload_type,
             model_used,
@@ -383,6 +398,7 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
             COUNT(*),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
+            {_cached_sum},
             COALESCE(SUM(cost_usd), 0),
             COALESCE(SUM(cost_unknown), 0),
             COALESCE(SUM(success), 0),
@@ -410,7 +426,7 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
 
     written = 0
     for r in rows:
-        (workload_type, model, call_type, calls, in_tok, out_tok, cost,
+        (workload_type, model, call_type, calls, in_tok, out_tok, cached_tok, cost,
          unknown_calls, success_calls, escalated_calls, q_avg, q_n, is_shadow) = r
         is_shadow = int(is_shadow or 0)
         # Latency percentiles must be computed over the same shadow/non-shadow
@@ -428,12 +444,13 @@ def rollup_day(conn: sqlite3.Connection, day: str) -> int:
         ]
         conn.execute(
             "INSERT INTO daily_findings (day, workload_type, model, call_type, calls, "
-            "input_tokens, output_tokens, cost_usd, cost_unknown_calls, success_calls, "
-            "escalated_calls, latency_p50, latency_p95, quality_avg, quality_n, is_shadow) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "input_tokens, output_tokens, cached_tokens, cost_usd, cost_unknown_calls, "
+            "success_calls, escalated_calls, latency_p50, latency_p95, quality_avg, "
+            "quality_n, is_shadow) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 day, workload_type, model, call_type, int(calls),
-                int(in_tok), int(out_tok), float(cost), int(unknown_calls),
+                int(in_tok), int(out_tok), int(cached_tok), float(cost), int(unknown_calls),
                 int(success_calls), int(escalated_calls),
                 _percentile(latencies, 50.0), _percentile(latencies, 95.0),
                 float(q_avg) if q_avg is not None else None, int(q_n or 0),

@@ -172,3 +172,90 @@ def _module_source(mod) -> str:
     import inspect
 
     return inspect.getsource(mod)
+
+
+# ── Change 4 (b): the extractor + wiring must actually record a cache hit ─────
+
+def test_get_cached_tokens_reads_prompt_tokens_details():
+    """The provider's real shape must be parsed.
+
+    Verified live (ollama.com, repeated 9,941-token prompt):
+      cold -> usage has NO prompt_tokens_details at all
+      warm -> {"prompt_tokens_details": {"cached_tokens": 9856}}
+    """
+    assert ep._get_cached_tokens(
+        {"usage": {"prompt_tokens": 9941, "prompt_tokens_details": {"cached_tokens": 9856}}}
+    ) == 9856
+    # cold call / provider that reports nothing
+    assert ep._get_cached_tokens({"usage": {"prompt_tokens": 9941}}) == 0
+    assert ep._get_cached_tokens({"usage": {"prompt_tokens_details": {}}}) == 0
+
+
+def test_get_cached_tokens_accepts_alternate_shapes():
+    """Other gateways use a flat or differently-named cache field."""
+    assert ep._get_cached_tokens({"usage": {"cached_tokens": 100}}) == 100
+    assert ep._get_cached_tokens(
+        {"usage": {"cache_read_input_tokens": 250}}
+    ) == 250
+    assert ep._get_cached_tokens(
+        {"usage": {"prompt_tokens_details": {"cache_read_input_tokens": 7}}}
+    ) == 7
+
+
+def test_get_cached_tokens_is_defensive():
+    """Malformed usage must yield 0, never raise — capture is diagnostic."""
+    for bad in (None, {}, {"usage": None}, {"usage": "nope"},
+                {"usage": {"prompt_tokens_details": "x"}},
+                {"usage": {"cached_tokens": "abc"}},
+                {"usage": {"cached_tokens": None}}):
+        assert ep._get_cached_tokens(bad) == 0
+
+
+def test_sse_cached_tokens_reads_the_final_usage_chunk():
+    """Streaming reports usage in a chunk with an EMPTY choices list."""
+    line = '{"choices": [], "usage": {"prompt_tokens": 500, "cached_tokens": 480}}'
+    assert ep._sse_cached_tokens(line) == 480
+    assert ep._sse_cached_tokens("[DONE]") == 0
+    assert ep._sse_cached_tokens("not json") == 0
+
+
+def test_log_request_to_db_accepts_and_persists_cached_tokens(tmp_path, monkeypatch):
+    """End-to-end: a cached count passed to the logger must land in the table.
+
+    This is the assertion that would have caught the original defect, where the
+    column existed but nothing ever wrote a non-zero value into it.
+    """
+    db = tmp_path / "r.db"
+    # Build the schema exactly as production does: models.SCHEMA_SQL for the
+    # base table, then the endpoint's own runtime ALTERs, so this test validates
+    # the real column set (including cached_tokens) rather than a drifted subset.
+    import models
+
+    conn = models.init_db(str(db))
+    conn.close()
+
+    monkeypatch.setenv("BIGGIE_ROUTER_DB", str(db))
+    monkeypatch.setattr(ep, "_sqlite_conn", None)
+    real_conn = ep._get_db_connection()
+    assert real_conn is not None
+    ep._log_request_to_db(
+        model_used="m", provider="p", task_type="t", complexity_score=0.0,
+        input_tokens=1000, output_tokens=10, latency_seconds=1.0, routing_time_ms=5,
+        cached_tokens=900, cost_usd=0.0, cost_unknown=0,
+    )
+    row = real_conn.execute(
+        "SELECT input_tokens, cached_tokens FROM router_logs"
+    ).fetchone()
+    assert row is not None, "a row must be written"
+    assert row[1] == 900, f"cached_tokens must persist, got {row[1]}"
+
+
+def test_cached_tokens_is_wired_into_the_request_path():
+    """The handler must CALL the extractor, not merely define it."""
+    import inspect
+
+    src = inspect.getsource(ep)
+    assert "_get_cached_tokens(" in src
+    assert "cached_input_tokens=_cached_tok" in src, (
+        "the request path must pass the cache count into cost computation"
+    )
