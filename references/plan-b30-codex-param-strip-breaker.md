@@ -64,9 +64,25 @@ Implementation note: the strip (fix 1) removes the *cause*, so with fix 1 in
 place the Codex branch cannot emit these params again. Fix 2 is defence in
 depth — it prevents any *future* schema mismatch from becoming a retry storm.
 
-**Fix 3 — bound the blast radius.** The measured 18× amplification exists
-because escalation re-tries a deterministic failure. Covered by fix 2's
-classification; additionally recorded here as the evidence baseline.
+**Fix 3 — an expired breaker must re-arm with a FRESH failure budget.**
+(Original scoping called this "covered by fix 2"; that was WRONG. Live
+evidence during B30 found a separate, independent defect.)
+
+`is_model_available()` restored `available = True` when the circuit-breaker or
+rate-limit cooldown expired, but never reset `consecutive_failures`. The
+poisoned counter therefore survived recovery, so a SINGLE fresh failure
+immediately satisfied `consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD` (3)
+and re-opened the breaker.
+
+Observed live: `gpt-5.5` at **4,046 consecutive failures** while its breaker
+"cycled" open every 30 minutes. Net effect: a broken model received exactly
+ONE attempt per 30-minute window and the counter grew without bound. This is
+what actually sustained the amplification — fix 2 stops a single request from
+walking the ladder, fix 3 stops the model from being permanently poisoned.
+
+Both expiry paths (rate limit and circuit breaker) now reset
+`consecutive_failures` to 0 so recovery is genuine. `mark_available()` remains
+the explicit manual reset.
 
 ## Non-goals
 
@@ -79,7 +95,20 @@ classification; additionally recorded here as the evidence baseline.
 
 - `tests/test_b30_codex_param_strip.py` — fix 1 static + behavioural.
 - `tests/test_b30_deterministic_4xx_breaker.py` — fix 2 classification.
-- Full router suite green.
-- Live: restart, then re-probe with `temperature` and confirm no 400 and no
-  ladder walk.
+- `tests/test_b30_breaker_rearm_budget.py` — fix 3 re-arm budget.
+- Full router suite green: **551 passed**.
+- Live (post-restart, PID 1976698): the exact reproduction that previously
+  produced 18 upstream 400s and a 180s client timeout now returns
+  **HTTP 200 in 1.9s**, both streaming and non-streaming, with
+  **0** `Unsupported parameter` 400s and **0** ERROR lines in the window.
+
+### Measured before/after
+
+| signal | before | after |
+|---|---|---|
+| client request carrying `temperature`, model gpt-5.5 | 180s timeout, 18 upstream 400s | HTTP 200 in 1.9s |
+| codex `Unsupported parameter` 400s (20 min window) | 165 | 0 |
+| escalation events (20 min window) | 290 | 0 |
+| upstream codex successes in window | 0 | 7 |
+| gpt-5.5 consecutive_failures | 4,046 (never reset) | resets to 0 on expiry |
 
