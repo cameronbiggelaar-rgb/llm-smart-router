@@ -155,16 +155,16 @@ class FitSummary:
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "llama3.1:8b":        {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 1, "date": "2026-07-01"},
     "dolphin3":           {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 2, "date": "2026-07-01"},
-    "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.47, "input": 0.22,  "output": 0.66,  "tier": 3, "date": "2026-09-12"},
-    "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "tier": 3, "date": "2026-09-12"},
-    "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "tier": 5.5, "date": "2026-09-12"},
+    "deepseek-v4-flash":  {"provider": "ollama-cloud",  "ratio": 1.47, "input": 0.22,  "output": 0.66,  "cached": 0.0044, "tier": 3, "date": "2026-09-12"},
+    "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "cached": 0.0030, "tier": 3, "date": "2026-09-12"},
+    "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "cached": 0.0038, "tier": 5.5, "date": "2026-09-12"},
     "minimax-m2.7:cloud": {"provider": "ollama-cloud", "ratio": 2.0, "input": 0.30, "output": 1.20, "tier": 4, "date": "2026-09-13"},
     "glm-5": {"provider": "ollama-cloud", "ratio": 2.0, "input": 1.00, "output": 3.00, "tier": 4, "date": "2026-07-01"},
-    "glm-5.1": {"provider": "ollama-cloud", "ratio": 2.5, "input": 1.00, "output": 3.20, "tier": 5, "date": "2026-09-13"},
-    "glm-5.3": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "tier": 6, "date": "2026-09-13"},
-    "glm-5.2": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "tier": 6.5, "date": "2026-09-13"},
-    "qwen3.5": {"provider": "ollama-cloud", "ratio": 3.5, "input": 0.60, "output": 3.60, "tier": 7, "date": "2026-09-13"},
-    "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 0.66, "output": 1.98, "tier": 8, "date": "2026-09-13"},
+    "glm-5.1": {"provider": "ollama-cloud", "ratio": 2.5, "input": 1.00, "output": 3.20, "cached": 0.025, "tier": 5, "date": "2026-09-13"},
+    "glm-5.3": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6, "date": "2026-09-13"},
+    "glm-5.2": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6.5, "date": "2026-09-13"},
+    "qwen3.5": {"provider": "ollama-cloud", "ratio": 3.5, "input": 0.60, "output": 3.60, "cached": 0.015, "tier": 7, "date": "2026-09-13"},
+    "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 0.66, "output": 1.98, "cached": 0.0165, "tier": 8, "date": "2026-09-13"},
     "deepseek-v3.1:671b": {"provider": "ollama-cloud",  "ratio": 10.0, "input": 5.00,  "output": 15.00, "tier": 9, "date": "2026-07-01"},
     "gpt-5.5":            {"provider": "openai-codex",  "ratio": 30.0, "input": 15.00, "output": 60.00, "tier": 10,"date": "2026-07-01"},
     "gpt-5.6-luna":       {"provider": "openai-codex",  "ratio": 32.0, "input": 16.00, "output": 64.00, "tier": 11,"date": "2026-09-05"},
@@ -389,7 +389,30 @@ def insert_router_log(conn: sqlite3.Connection, log: RouterLog) -> int:
 
 
 def get_model_cost(model: str, conn: sqlite3.Connection) -> Optional[ModelCost]:
-    """Look up pricing for a model. Returns None if unknown."""
+    """Look up pricing for a model. Returns None if unknown.
+
+    Reads the AUTHORITATIVE ``model_pricing`` table (newest effective row) and
+    only falls back to the legacy ``model_costs`` table when no price is on
+    record. The legacy table is frozen at 2026-07-01 and had drifted badly —
+    it reports ``deepseek-v4-pro`` at $2.00/$6.00 against the real $0.66/$1.98
+    (3x) and ``deepseek-v4-flash`` at $0.50/$1.50 against $0.22/$0.66 — so cost
+    reports built on it overstated spend.
+    """
+    try:
+        from unit_economics import price_for
+
+        price = price_for(model, conn=conn)
+        if price is not None:
+            return ModelCost(
+                model=price.model,
+                provider=price.provider,
+                input_cost_per_1m=float(price.input_usd_per_1m),
+                output_cost_per_1m=float(price.output_usd_per_1m),
+                effective_date=price.effective_from,
+            )
+    except Exception:                                        # pragma: no cover
+        # Never let a pricing lookup break a report; fall through to legacy.
+        pass
     row = conn.execute(
         "SELECT model, provider, input_cost_per_1m, output_cost_per_1m, effective_date "
         "FROM model_costs WHERE model = ?",

@@ -41,6 +41,12 @@ class Price:
     output_usd_per_1m: Decimal
     effective_from: str
     source: str = ""
+    # Discounted rate for tokens served from the provider's prompt cache.
+    # ``None`` means "no cache rate on record" and the input rate is used, which
+    # preserves the old behaviour for uncached/unpriced rows. Providers charge
+    # ~1/50th of the input rate for a hit (verified: deepseek-v4.1-flash
+    # 0.15 -> 0.003), so leaving this unset overstates spend on cached traffic.
+    cached_input_usd_per_1m: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -71,21 +77,67 @@ def strip_provider_suffix(model: str) -> str:
 
 
 def record_price(conn: sqlite3.Connection, price: Price) -> None:
-    """Insert or replace one dated price."""
+    """Insert or replace one dated price.
+
+    Tolerates a database whose ``model_pricing`` predates the cached-rate
+    column: the ALTER runs first, so a writer never has to care which schema
+    generation it is talking to.
+    """
+    _ensure_cached_rate_column(conn)
+    cached = price.cached_input_usd_per_1m
     conn.execute(
         "INSERT OR REPLACE INTO model_pricing "
-        "(model, provider, input_usd_per_1m, output_usd_per_1m, effective_from, source) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(model, provider, input_usd_per_1m, output_usd_per_1m, "
+        " cached_input_usd_per_1m, effective_from, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             strip_provider_suffix(price.model),
             price.provider,
             float(price.input_usd_per_1m),
             float(price.output_usd_per_1m),
+            (float(cached) if cached is not None else float(price.input_usd_per_1m)),
             price.effective_from,
             price.source,
         ),
     )
     conn.commit()
+
+
+def _has_cached_rate_column(conn: sqlite3.Connection) -> bool:
+    """True when ``model_pricing`` carries the cached-input rate column."""
+    try:
+        return any(
+            r[1] == "cached_input_usd_per_1m"
+            for r in conn.execute("PRAGMA table_info(model_pricing)")
+        )
+    except Exception:                                        # pragma: no cover
+        return False
+
+
+def _ensure_cached_rate_column(conn: sqlite3.Connection) -> None:
+    """Add ``cached_input_usd_per_1m`` to an existing ``model_pricing`` table.
+
+    Existing rows are backfilled with their own input rate, i.e. "no cache
+    discount known", which is the conservative (non-understating) default. The
+    correct discounted rates are then applied by ``record_price`` callers.
+
+    Never raises: a schema probe must not be able to break cost capture.
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(model_pricing)")}
+        if not cols:
+            return
+        if "cached_input_usd_per_1m" not in cols:
+            conn.execute(
+                "ALTER TABLE model_pricing ADD COLUMN cached_input_usd_per_1m REAL"
+            )
+            conn.execute(
+                "UPDATE model_pricing SET cached_input_usd_per_1m = input_usd_per_1m "
+                "WHERE cached_input_usd_per_1m IS NULL"
+            )
+            conn.commit()
+    except Exception:                                        # pragma: no cover
+        pass
 
 
 def seed_prices(conn: sqlite3.Connection) -> int:
@@ -116,6 +168,11 @@ def seed_prices(conn: sqlite3.Connection) -> int:
             out_usd = Decimal(str(cfg.get("output", 0) or 0))
         except Exception:
             continue
+        cached_usd = cfg.get("cached")
+        try:
+            cached_usd = Decimal(str(cached_usd)) if cached_usd is not None else None
+        except Exception:
+            cached_usd = None
         record_price(
             conn,
             Price(
@@ -125,6 +182,7 @@ def seed_prices(conn: sqlite3.Connection) -> int:
                 output_usd_per_1m=out_usd,
                 effective_from=effective,
                 source="MODEL_REGISTRY",
+                cached_input_usd_per_1m=cached_usd,
             ),
         )
         written += 1
@@ -144,10 +202,19 @@ def price_for(
     if conn is None:
         conn = _default_conn()
     base = strip_provider_suffix(model)
+    # A reader must not assume the cached-rate column exists: any DB created
+    # before this column (or by a test fixture) is still perfectly readable, and
+    # a missing column simply means "no cache discount on record".
+    cached_col = (
+        "cached_input_usd_per_1m" if _has_cached_rate_column(conn) else "NULL"
+    )
+    cols = (
+        "model, provider, input_usd_per_1m, output_usd_per_1m, "
+        f"effective_from, source, {cached_col} "
+    )
     if at is None:
         row = conn.execute(
-            "SELECT model, provider, input_usd_per_1m, output_usd_per_1m, "
-            "effective_from, source FROM model_pricing WHERE model=? "
+            f"SELECT {cols} FROM model_pricing WHERE model=? "
             "ORDER BY effective_from DESC LIMIT 1",
             (base,),
         ).fetchone()
@@ -156,14 +223,19 @@ def price_for(
         # correct date compare for same-format values; substr() keeps a date
         # like '2026-09-15' comparable against '2026-09-15T10:00:00+00:00'.
         row = conn.execute(
-            "SELECT model, provider, input_usd_per_1m, output_usd_per_1m, "
-            "effective_from, source FROM model_pricing WHERE model=? "
+            f"SELECT {cols} FROM model_pricing WHERE model=? "
             "AND substr(?, 1, 10) >= substr(effective_from, 1, 10) "
             "ORDER BY effective_from DESC LIMIT 1",
             (base, at),
         ).fetchone()
     if not row:
         return None
+    cached = None
+    try:
+        if len(row) > 6 and row[6] is not None:
+            cached = Decimal(str(row[6]))
+    except Exception:                                        # pragma: no cover
+        cached = None
     return Price(
         model=row[0],
         provider=row[1],
@@ -171,6 +243,7 @@ def price_for(
         output_usd_per_1m=Decimal(str(row[3])),
         effective_from=row[4],
         source=row[5],
+        cached_input_usd_per_1m=cached,
     )
 
 
@@ -184,8 +257,11 @@ def cost_of_call(
 ) -> Optional[Decimal]:
     """Exact USD cost of one call, or ``None`` when the model is unpriced.
 
-    ``cached_input_tokens`` are billed at the input rate here; discounted cache
-    pricing would need a separate column in ``model_pricing``.
+    ``cached_input_tokens`` are billed at ``cached_input_usd_per_1m`` when the
+    price row carries one, else at the input rate (conservative: never
+    understates). Verified live that a cache hit really is ~50x cheaper
+    (deepseek-v4.1-flash 0.15 -> 0.003 per 1M), so billing hits at the full
+    rate made the reported spend a large overstatement of the invoice.
     """
     if conn is None:
         conn = _default_conn()
@@ -200,12 +276,25 @@ def cost_of_call(
         price = price_for(model, at=at, conn=conn)
     if price is None:
         return None
-    billable_in = (input_tokens or 0) - (cached_input_tokens or 0)
-    if billable_in < 0:
-        billable_in = 0
+    try:
+        cached_tok = int(cached_input_tokens or 0)
+    except (TypeError, ValueError):
+        cached_tok = 0
+    total_in = int(input_tokens or 0)
+    if cached_tok < 0:
+        cached_tok = 0
+    # A provider (or a buggy caller) can report more cached than total tokens.
+    # Clamping keeps the arithmetic sane and the cost non-negative.
+    if cached_tok > total_in:
+        cached_tok = total_in
+    billable_in = total_in - cached_tok
+    cached_rate = price.cached_input_usd_per_1m
+    if cached_rate is None:
+        cached_rate = price.input_usd_per_1m
     million = Decimal(1_000_000)
     return (
         (Decimal(billable_in) / million) * price.input_usd_per_1m
+        + (Decimal(cached_tok) / million) * cached_rate
         + (Decimal(output_tokens or 0) / million) * price.output_usd_per_1m
     )
 
