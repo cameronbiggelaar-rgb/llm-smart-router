@@ -57,6 +57,13 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     # much of the input was served from cache — the metric that makes the
     # recurring compaction churn visible in reports rather than only in logs.
     "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
+    # Session attribution (B32). `session_id` existed from the beginning but was
+    # never populated by the endpoint (hardcoded ""), so per-session churn could
+    # not be attributed. `session_id_source` records HOW the id was obtained —
+    # a real header/body id is not equivalent to a derived prompt-prefix key,
+    # which can collide across sessions sharing an opening prompt. Without the
+    # label, a derived key would be silently read as proof of a distinct session.
+    "session_id_source": "TEXT NOT NULL DEFAULT ''",
 }
 
 # ── New tables ────────────────────────────────────────────────────────────────
@@ -227,6 +234,7 @@ def migrate(conn: sqlite3.Connection) -> Dict[str, int]:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 session_id TEXT NOT NULL DEFAULT '',
+        session_id_source TEXT NOT NULL DEFAULT '',
                 model_used TEXT NOT NULL DEFAULT '',
                 provider TEXT NOT NULL DEFAULT '',
                 task_type TEXT NOT NULL DEFAULT 'other',

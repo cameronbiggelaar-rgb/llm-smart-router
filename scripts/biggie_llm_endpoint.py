@@ -169,6 +169,11 @@ _COST_OBS_COLUMNS = {
     # that the provider was actually granting was unmeasurable, and every cached
     # token was billed at the full input rate in our own cost figures.
     "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
+    # Session attribution (B32). session_id was previously hardcoded to "" with
+    # the comment "not available at endpoint level", which was false: the value
+    # IS available at the call site. Without it, per-session churn analysis was
+    # impossible and the blank key made distinct sessions look like one.
+    "session_id_source": "TEXT NOT NULL DEFAULT ''",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -721,6 +726,7 @@ async def run_shadow_experiment(
     request_body: Optional[Dict[str, Any]] = None,
     request_id: str = "",
     session_id: str = "",
+    session_id_source: str = "",
     incumbent_model: str = "",
     workload_type: str = "",
     on_row: Any = None,
@@ -862,6 +868,10 @@ async def run_shadow_experiment(
         "experiment": getattr(experiment, "name", ""),
         "experiment_arm": "shadow",
         "is_shadow": True,
+        # A shadow observation belongs to the same session as the incumbent it
+        # is compared against; without this its rows are unattributable.
+        "session_id": session_id,
+        "session_id_source": session_id_source,
     }
 
     try:
@@ -1583,6 +1593,59 @@ def _compression_session_key(messages: Any, session_id: str = "") -> str:
         return "pfx:unkeyable"
 
 
+
+# Provenance labels for session identity. A real session id and a derived
+# prompt-prefix key are NOT equivalent: the first is stable per SESSION, the
+# second is stable per CONTEXT PREFIX, so two sessions that share an opening
+# prompt collide. Storing the value without its provenance silently conflated
+# them and made "940 compactions from ONE session" an inference from a blank
+# key rather than a measurement. The label keeps the distinction queryable.
+SESSION_ID_SOURCES = ("header", "body", "derived", "none")
+
+_SESSION_ID_HEADERS = ("x-hermes-session-id", "x-session-id")
+_SESSION_ID_BODY_KEYS = ("session_id", "sessionId", "user")
+
+
+def resolve_session_identity(
+    headers: Any = None, body: Any = None, messages: Any = None
+) -> tuple:
+    """Resolve the calling session's identity and how it was obtained.
+
+    Returns ``(session_id, source)`` where source is one of
+    :data:`SESSION_ID_SOURCES`. Priority is header, then body fields, then a
+    derived prompt-prefix key, then ``"none"``.
+
+    The derived key reuses :func:`_compression_session_key`, which is already
+    proven stable across the turns of one session and distinct between
+    sessions.
+
+    Never raises: logging bookkeeping must not break a live request.
+    """
+    try:
+        if isinstance(headers, dict):
+            lower = {str(k).lower(): v for k, v in headers.items()}
+            for name in _SESSION_ID_HEADERS:
+                val = str(lower.get(name) or "").strip()
+                if val:
+                    return val, "header"
+        if isinstance(body, dict):
+            for key in _SESSION_ID_BODY_KEYS:
+                val = str(body.get(key) or "").strip()
+                if val:
+                    return val, "body"
+            meta = body.get("metadata")
+            if isinstance(meta, dict):
+                val = str(meta.get("session_id") or "").strip()
+                if val:
+                    return val, "body"
+        key = _compression_session_key(messages)
+        if key and key != "pfx:unkeyable":
+            return key, "derived"
+        return "", "none"
+    except Exception:  # pragma: no cover - defensive, must never raise
+        return "", "none"
+
+
 def _compression_call_count(session_key: str, now: Optional[float] = None) -> int:
     """Count calls inside the rolling window, pruning expired entries."""
     if not COMPRESSION_GUARD_ENABLED:
@@ -2093,6 +2156,8 @@ def _log_request_to_db(
     experiment_arm: str = "",
     is_shadow: bool = False,
     finish_reason: str = "",
+    session_id: str = "",
+    session_id_source: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -2168,12 +2233,12 @@ def _log_request_to_db(
                 saw_tool_calls, final_model, routing_reason,
                 cost_usd, cost_unknown, quality_score, quality_method,
                 pricing_version, experiment, experiment_arm, is_shadow, finish_reason,
-                cached_tokens
+                cached_tokens, session_id_source
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
-                    "",  # session_id — not available at endpoint level
+                    session_id or "",
                     model_used,
                     provider,
                     task_type,
@@ -2208,6 +2273,7 @@ def _log_request_to_db(
                     1 if is_shadow else 0,
                     finish_reason,
                     int(cached_tokens or 0),
+                    session_id_source or "",
                     ),
                     )
         db.commit()
@@ -3483,6 +3549,16 @@ async def chat_completions(request: Request):
     body = _normalize_compression_request(body, workload_type)
     requires_tools = body.get("_requires_tools", bool(body.get("tools")))
 
+    # Session attribution (B32). Resolved ONCE here and threaded into every log
+    # row, because a blank session_id made per-session churn attribution
+    # impossible: "940 compactions from one session" was inferred from a blank
+    # key rather than measured. The provenance label is stored alongside the
+    # value because a real session id and a derived prompt-prefix key are not
+    # equivalent (a derived key can collide across sessions sharing an opening).
+    session_id, session_id_source = resolve_session_identity(
+        headers=dict(request.headers), body=body, messages=messages
+    )
+
     # Compression budget guard (B31 change 3). A session that has already made
     # more than COMPRESSION_GUARD_PER_SESSION_MAX compaction calls inside the
     # rolling window is in the no-op churn loop (see the guard's docstring):
@@ -3717,6 +3793,8 @@ async def chat_completions(request: Request):
         "workload_type": workload_type,
         "requires_tools": requires_tools,
         "context_tokens": features.get("context_tokens", 0),
+        "session_id": session_id,
+        "session_id_source": session_id_source,
     }
 
     # Self-optimising router: optional experiment routes a share of production
@@ -4171,6 +4249,8 @@ async def chat_completions(request: Request):
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
                 routing_reason=escalation.reason,
+                session_id=session_id,
+                session_id_source=session_id_source,
             )
         return result
 
