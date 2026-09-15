@@ -73,16 +73,37 @@ trigger estimator and the budget walk share one wire-truth predicate. Core chang
 sessions currently pinned at 180,236–184,427.
 
 ### Phase 3 — close the measurement gap that made this hard
+
+**Status: 3.2 DONE (mechanism proven, plugin installed, verified in-process).
+Activation pending a gateway restart.**
+
 1. **Compaction outcome must be queryable.** `compressed N → M msgs` + token
    before/after exists ONLY in `agent.log` (AEST), so proving a no-op requires
    grepping logs on a different clock from the DB (UTC). Add a table/columns so
-   "is this loop a no-op?" is a SQL query, not a log correlation.
-2. **`session_id` on the wire.** Chat-completions carries only `Authorization` +
-   `Content-Type`; `session_id` sits in the dump envelope unsent. Until it is sent,
-   every per-session number is approximate. Codex already does this via
-   `prompt_cache_key` — mirror it.
-3. **A collision-safety flag.** `session_id_source='derived'` does not say whether
-   the key *discriminates*. Record that, or the same mistake recurs.
+   "is this loop a no-op?" is a SQL query, not a log correlation. **Still open.**
+
+2. **`session_id` on the wire — DONE (B35).** The premise changed during recon:
+   core ALREADY sends `prompt_cache_key` on chat-completions, gated on the
+   provider profile's `supports_prompt_cache_key`. The generic `custom` profile
+   leaves it `False`, so the route had no identity. A **user plugin** at
+   `$HERMES_HOME/plugins/model-providers/biggie-llm/` overrides the route and
+   sets the flag — **no core patch needed** (which is why this moved ahead of
+   B33). Proven read-only: 2/2 session-scoped keys emitted, distinct per session,
+   turn-stable, 0/2 without the flag. `cache_key` is in
+   `_SESSION_ID_ENFORCEABLE_SOURCES`, so this also **restores guard
+   enforceability** on the main path. Artefact: `deploy/model-providers/biggie-llm/`.
+
+3. **A collision-safety flag — largely delivered (B32/B34).**
+   `session_id_source` plus `_SESSION_ID_ENFORCEABLE_SOURCES` already encode
+   "does this key discriminate". A separate flag would be redundant.
+
+**Phase 3.2's consequence:** because B34 made the guard refuse a
+non-discriminating key, `session_compression_overflow` stopped firing for
+chat-completions traffic — correct labelling, but **containment on that path is
+now zero until B33 lands**. B33 is therefore the only remaining containment.
+
+**Order revised:** B35 (done) → **B33** → verify the guard actually fires on
+real runaways.
 
 ---
 
