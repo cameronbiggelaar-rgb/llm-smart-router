@@ -62,7 +62,7 @@ def test_compression_guard_records_and_counts_calls():
     """The first N compactions for a session are allowed and counted."""
     sid = "sess-alpha"
     for i in range(3):
-        assert ep._compression_guard_allows(sid) is True, f"call {i} should be allowed"
+        assert ep._compression_guard_allows(sid, "header") is True, f"call {i} should be allowed"
     assert ep._compression_call_count(sid) == 3
 
 
@@ -71,10 +71,10 @@ def test_compression_guard_denies_past_the_cap():
     sid = "sess-beta"
     cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
     for _ in range(cap):
-        assert ep._compression_guard_allows(sid) is True
+        assert ep._compression_guard_allows(sid, "header") is True
     # The cap+1'th call is the first denied one.
-    assert ep._compression_guard_allows(sid) is False
-    assert ep._compression_guard_allows(sid) is False
+    assert ep._compression_guard_allows(sid, "header") is False
+    assert ep._compression_guard_allows(sid, "header") is False
 
 
 def test_compression_guard_is_per_session_not_global():
@@ -82,10 +82,10 @@ def test_compression_guard_is_per_session_not_global():
     a, b = "sess-a", "sess-b"
     cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
     for _ in range(cap):
-        ep._compression_guard_allows(a)
-    assert ep._compression_guard_allows(a) is False
+        ep._compression_guard_allows(a, "header")
+    assert ep._compression_guard_allows(a, "header") is False
     # A different session still has its own full budget.
-    assert ep._compression_guard_allows(b) is True
+    assert ep._compression_guard_allows(b, "header") is True
 
 
 def test_compression_guard_window_expiry_resets_budget():
@@ -97,8 +97,8 @@ def test_compression_guard_window_expiry_resets_budget():
     sid = "sess-gamma"
     cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
     for _ in range(cap):
-        ep._compression_guard_allows(sid)
-    assert ep._compression_guard_allows(sid) is False
+        ep._compression_guard_allows(sid, "header")
+    assert ep._compression_guard_allows(sid, "header") is False
 
     # Age every recorded call past the window.
     now = ep._compression_guard_now()
@@ -106,7 +106,7 @@ def test_compression_guard_window_expiry_resets_budget():
     ep._COMPRESSION_GUARD_STATE[sid] = [
         t - (window + 1) for t in ep._COMPRESSION_GUARD_STATE[sid]
     ]
-    assert ep._compression_guard_allows(sid) is True, "expired calls must free budget"
+    assert ep._compression_guard_allows(sid, "header") is True, "expired calls must free budget"
 
 
 def test_guard_is_disabled_when_configured_off(monkeypatch):
@@ -114,7 +114,7 @@ def test_guard_is_disabled_when_configured_off(monkeypatch):
     monkeypatch.setattr(ep, "COMPRESSION_GUARD_ENABLED", False)
     sid = "sess-delta"
     for _ in range(ep.COMPRESSION_GUARD_PER_SESSION_MAX * 3):
-        assert ep._compression_guard_allows(sid) is True
+        assert ep._compression_guard_allows(sid, "header") is True
 
 
 def test_session_key_is_stable_across_turns_and_distinct_between_sessions():
@@ -159,8 +159,8 @@ def test_overflow_is_labelled_not_rejected():
     sid = "sess-eps"
     cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
     for _ in range(cap):
-        ep._compression_guard_allows(sid)
-    assert ep._compression_guard_allows(sid) is False
+        ep._compression_guard_allows(sid, "header")
+    assert ep._compression_guard_allows(sid, "header") is False
     # The overflow marker is what the request path attaches to the log row.
     assert ep.COMPRESSION_GUARD_OVERFLOW_WORKLOAD == "session_compression_overflow"
     assert ep.COMPRESSION_GUARD_OVERFLOW_ERROR == "compression_budget_exceeded"
@@ -168,7 +168,7 @@ def test_overflow_is_labelled_not_rejected():
 
 def test_guard_helpers_never_raise_on_malformed_input():
     """Guard bookkeeping must never break a live request."""
-    assert ep._compression_guard_allows("") in (True, False)
+    assert ep._compression_guard_allows("", "header") in (True, False)
     assert isinstance(ep._compression_session_key(None, session_id=""), str)
     assert isinstance(ep._compression_session_key([], session_id=""), str)
     assert isinstance(ep._compression_session_key(["not-a-dict"], session_id=""), str)
@@ -229,3 +229,38 @@ def test_overflow_label_uses_the_summariser_ladder():
     assert "_next_session_compression_rung" in window or "_select_session_compression_model" in window, (
         "the overflow label must stay on the summariser ladder"
     )
+
+
+def test_source_less_key_is_exempt_from_the_cap():
+    """B34 contract change, pinned deliberately.
+
+    The guard used to apply to ANY key, including the derived prompt-prefix key.
+    That key is not a session identity - it collides across sessions sharing an
+    opening wrapper - so the cap spent one session's budget on another's churn
+    (measured: 289 overflow rows landing on ONE key).
+
+    User decision 2026-09-15: never enforce a per-session cap on a key that
+    cannot discriminate. A source-less call is therefore EXEMPT, not capped.
+
+    Consequence, stated plainly: for traffic that carries no real session id on
+    the wire (the chat-completions path sends none), the overflow relabel no
+    longer fires. Runaway protection for that traffic now depends on fixing the
+    cause (B33), not on this band-aid.
+    """
+    sid = "sess-source-less"
+    cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
+    for _ in range(cap * 3):
+        assert ep._compression_guard_allows(sid) is True, (
+            "a key with no real identity must never be capped"
+        )
+    for _ in range(cap * 3):
+        assert ep._compression_guard_allows("pfx:" + "d" * 32, "derived") is True
+
+
+def test_cap_still_applies_when_a_real_identity_is_present():
+    """The runaway protection must survive for genuine session ids."""
+    sid = "sess-real"
+    cap = ep.COMPRESSION_GUARD_PER_SESSION_MAX
+    for _ in range(cap):
+        assert ep._compression_guard_allows(sid, "header") is True
+    assert ep._compression_guard_allows(sid, "header") is False

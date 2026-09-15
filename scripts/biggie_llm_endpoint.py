@@ -1633,6 +1633,15 @@ def _compression_session_key(messages: Any, session_id: str = "") -> str:
 # key rather than a measurement. The label keeps the distinction queryable.
 SESSION_ID_SOURCES = ("header", "body", "cache_key", "derived", "none")
 
+# B34: sources that identify a SESSION rather than a context prefix. Only a
+# real identity may carry a per-session cap - the derived key is a prefix hash
+# that still collides across sessions sharing an opening wrapper (compaction
+# payloads begin with a constant "[CONTEXT COMPACTION ...]" wrapper; measured
+# on production dumps, one derived key covered 4 distinct state.db sessions).
+# Enforcing on a colliding key spends one session's budget on another's churn,
+# which is how a healthy conversation lost compaction treatment.
+_SESSION_ID_ENFORCEABLE_SOURCES = ("header", "body", "cache_key")
+
 _SESSION_ID_HEADERS = ("x-hermes-session-id", "x-session-id")
 _SESSION_ID_BODY_KEYS = ("session_id", "sessionId", "user")
 # B34: a real session id on the Codex/Responses path, present on 58/92 dumps;
@@ -1692,7 +1701,27 @@ def resolve_session_identity(
         return "", "none"
 
 
-def _compression_call_count(session_key: str, now: Optional[float] = None) -> int:
+def _compression_guard_enforceable(session_key: str, source: str) -> bool:
+    """May this key carry a per-session compaction cap?
+
+    Only a real session identity can. A derived prefix key collides across
+    sessions, so a cap on it is a cap on an arbitrary group of them - the
+    defect behind 289 overflow rows landing on ONE key (user decision
+    2026-09-15: never enforce a per-session cap on a key that cannot
+    discriminate).
+
+    False means "exempt from the cap", never "reject": the request is still
+    served; only the overflow relabel is withheld.
+    """
+    try:
+        if not session_key or session_key == "pfx:unkeyable":
+            return False
+        return str(source or "").strip() in _SESSION_ID_ENFORCEABLE_SOURCES
+    except Exception:  # pragma: no cover - defensive, must never raise
+        return False
+
+
+def _compression_call_count(session_key: str, now: Optional[float] = None, source: str = "") -> int:
     """Count calls inside the rolling window, pruning expired entries."""
     if not COMPRESSION_GUARD_ENABLED:
         return 0
@@ -1706,17 +1735,23 @@ def _compression_call_count(session_key: str, now: Optional[float] = None) -> in
     return len(stamps)
 
 
-def _compression_guard_allows(session_key: str) -> bool:
+def _compression_guard_allows(session_key: str, source: str = "") -> bool:
     """Record one compaction attempt; return False once the cap is exceeded.
 
     A False return means "this is a runaway, stop treating it as a compaction",
     NOT "reject the request". The caller still serves it.
+
+    Enforcement is gated on SOURCE (B34): a derived prefix key cannot
+    discriminate between sessions, so capping it spends one session's budget
+    on another's churn. A non-enforceable key is exempt, not rejected.
     """
     if not COMPRESSION_GUARD_ENABLED:
         return True
+    if not _compression_guard_enforceable(session_key, source):
+        return True  # exempt from the cap; the request is still served
     try:
         now = _compression_guard_now()
-        count = _compression_call_count(session_key, now=now)
+        count = _compression_call_count(session_key, now=now, source=source)
         if count >= COMPRESSION_GUARD_PER_SESSION_MAX:
             return False
         _COMPRESSION_GUARD_STATE.setdefault(session_key, []).append(now)
@@ -3612,11 +3647,17 @@ async def chat_completions(request: Request):
     # relabelled so the churn is visible, and routed away from the compaction
     # lane so a runaway cannot keep buying a paid summariser.
     if workload_type == "session_compression":
-        _guard_key = _compression_session_key(
-            messages,
-            session_id=str(body.get("session_id") or body.get("user") or ""),
-        )
-        if not _compression_guard_allows(_guard_key):
+        # B34: prefer a REAL session identity for the cap. The derived key is a
+        # prefix hash that collides across sessions, so a cap on it would spend one
+        # session's budget on another's churn. _compression_guard_enforceable()
+        # decides from `session_id_source` whether the cap may apply at all.
+        if session_id_source in _SESSION_ID_ENFORCEABLE_SOURCES:
+            _guard_key = f"sid:{session_id}"
+            _guard_source = session_id_source
+        else:
+            _guard_key = _compression_session_key(messages)
+            _guard_source = session_id_source or "derived"
+        if not _compression_guard_allows(_guard_key, _guard_source):
             logger.warning(
                 "Compression budget exceeded for session %s — serving without "
                 "compaction treatment (possible no-op compaction loop)",
