@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Router Decision Path",
+    "output": "docs/diagrams/router-decision-path.html",
+    "viewBox": [
+      1160,
+      660
+    ],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "admit",
+        "label": "Admit",
+        "focus": [
+          "request",
+          "gate",
+          "classify"
+        ],
+        "note": "The size gate and workload classification decide everything downstream."
+      },
+      {
+        "id": "decide",
+        "label": "Decide",
+        "focus": [
+          "classify",
+          "tier",
+          "override",
+          "breaker"
+        ],
+        "note": "Tier pick, the force_model override, and breaker filtering."
+      },
+      {
+        "id": "serve",
+        "label": "Serve and record",
+        "focus": [
+          "breaker",
+          "primary",
+          "row"
+        ],
+        "note": "Proxy the selected model, then record one evidence row."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "edge",
+      "label": "Edge"
+    },
+    {
+      "id": "routing",
+      "label": "Routing decision"
+    },
+    {
+      "id": "serving",
+      "label": "Serving"
+    },
+    {
+      "id": "evidence",
+      "label": "Evidence"
+    }
+  ],
+  "phases": [
+    {
+      "id": "p_gate",
+      "label": "Gate",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "p_decide",
+      "label": "Decide",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "p_serve",
+      "label": "Serve",
+      "fromCol": 5,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "request",
+    "gate",
+    "classify",
+    "tier",
+    "breaker",
+    "primary",
+    "row"
+  ],
+  "nodes": [
+    {
+      "id": "request",
+      "lane": "edge",
+      "col": 0,
+      "width": 80,
+      "type": "external",
+      "label": "Request",
+      "sublabel": "/chat"
+    },
+    {
+      "id": "gate",
+      "lane": "edge",
+      "col": 1,
+      "width": 48,
+      "type": "backend",
+      "label": "Gate",
+      "sublabel": "0.75x"
+    },
+    {
+      "id": "classify",
+      "lane": "routing",
+      "col": 2,
+      "width": 48,
+      "type": "backend",
+      "label": "Route",
+      "sublabel": "kind"
+    },
+    {
+      "id": "tier",
+      "lane": "routing",
+      "col": 3,
+      "width": 40,
+      "type": "backend",
+      "label": "Tier",
+      "sublabel": "fit"
+    },
+    {
+      "id": "override",
+      "lane": "routing",
+      "col": 4,
+      "width": 40,
+      "type": "external",
+      "label": "Pin",
+      "sublabel": "force"
+    },
+    {
+      "id": "breaker",
+      "lane": "serving",
+      "col": 4,
+      "width": 40,
+      "type": "security",
+      "label": "Drop",
+      "sublabel": "trip"
+    },
+    {
+      "id": "primary",
+      "lane": "serving",
+      "col": 5,
+      "width": 80,
+      "type": "cloud",
+      "label": "Ollama",
+      "sublabel": "cloud"
+    },
+    {
+      "id": "row",
+      "lane": "evidence",
+      "col": 5,
+      "width": 80,
+      "type": "database",
+      "label": "Log",
+      "sublabel": "1 row"
+    }
+  ],
+  "edges": [
+    {
+      "from": "request",
+      "to": "gate",
+      "variant": "emphasis"
+    },
+    {
+      "from": "gate",
+      "to": "classify",
+      "label": "under"
+    },
+    {
+      "from": "classify",
+      "to": "tier"
+    },
+    {
+      "from": "tier",
+      "to": "breaker"
+    },
+    {
+      "from": "override",
+      "to": "primary",
+      "variant": "dashed"
+    },
+    {
+      "from": "breaker",
+      "to": "primary",
+      "variant": "emphasis"
+    },
+    {
+      "from": "primary",
+      "to": "row",
+      "label": "record"
+    }
+  ],
+  "cards": [
+    {
+      "title": "Escalation and fallback",
+      "dot": "cyan",
+      "items": [
+        "Primary: Ollama Cloud (deepseek / glm / qwen family)",
+        "empty_content -> escalate to openai-codex (high tier)",
+        "Then limp home to local Ollama if the chain is exhausted",
+        "Every attempt writes exactly one evidence row"
+      ]
+    },
+    {
+      "title": "Four routing lanes",
+      "dot": "violet",
+      "items": [
+        "normal, rethink/rearchitect, failure escalation, force_model",
+        "Lane is derived from workload type, not the model name",
+        "Tripped breakers are filtered before the chain is built",
+        "force_model override bypasses tier selection entirely"
+      ]
+    }
+  ]
+}

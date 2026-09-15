@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Router Request Lifecycle",
+    "output": "docs/diagrams/router-request-lifecycle.html",
+    "viewBox": [
+      1000,
+      560
+    ],
+    "column_fit": "spread",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "admission",
+        "label": "Admission",
+        "focus": [
+          "hermes",
+          "endpoint",
+          "router"
+        ],
+        "note": "The request arrives, is compressed if oversized, then features are extracted."
+      },
+      {
+        "id": "selection",
+        "label": "Model selection",
+        "focus": [
+          "endpoint",
+          "router",
+          "registry"
+        ],
+        "note": "The registry and breakers decide the target lane."
+      },
+      {
+        "id": "dispatch",
+        "label": "Fallback and evidence",
+        "focus": [
+          "router",
+          "ollama",
+          "codex",
+          "logs"
+        ],
+        "note": "Proxy out, escalate on failure, and always record one evidence row."
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes",
+      "sublabel": "client"
+    },
+    {
+      "id": "endpoint",
+      "type": "backend",
+      "label": "Endpoint",
+      "sublabel": ":8080"
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "Router",
+      "sublabel": "route_task"
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "Registry",
+      "sublabel": "tiers + prices"
+    },
+    {
+      "id": "ollama",
+      "type": "cloud",
+      "label": "Ollama Cloud",
+      "sublabel": "primary"
+    },
+    {
+      "id": "codex",
+      "type": "external",
+      "label": "openai-codex",
+      "sublabel": "high tier"
+    },
+    {
+      "id": "logs",
+      "type": "database",
+      "label": "Evidence DB",
+      "sublabel": "one row per call"
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 240,
+      "label": "Admission"
+    },
+    {
+      "from": 250,
+      "to": 300,
+      "label": "Selection"
+    },
+    {
+      "from": 320,
+      "to": 490,
+      "label": "Dispatch and evidence"
+    }
+  ],
+  "messages": [
+    {
+      "id": "post",
+      "from": "hermes",
+      "to": "endpoint",
+      "y": 175,
+      "label": "POST /chat/completions",
+      "variant": "emphasis"
+    },
+    {
+      "id": "features",
+      "from": "endpoint",
+      "to": "router",
+      "y": 213,
+      "label": "classify + compress",
+      "variant": "default"
+    },
+    {
+      "id": "tiers",
+      "from": "router",
+      "to": "registry",
+      "y": 251,
+      "label": "read tiers",
+      "variant": "default"
+    },
+    {
+      "id": "candidate",
+      "from": "registry",
+      "to": "router",
+      "y": 283,
+      "label": "candidate chain",
+      "variant": "return"
+    },
+    {
+      "id": "proxy",
+      "from": "router",
+      "to": "ollama",
+      "y": 331,
+      "label": "proxy_to_backend",
+      "variant": "emphasis"
+    },
+    {
+      "id": "empty",
+      "from": "ollama",
+      "to": "router",
+      "y": 363,
+      "label": "empty_content",
+      "variant": "return"
+    },
+    {
+      "id": "escalate",
+      "from": "router",
+      "to": "codex",
+      "y": 395,
+      "label": "escalate on failure",
+      "variant": "dashed"
+    },
+    {
+      "id": "row",
+      "from": "endpoint",
+      "to": "logs",
+      "y": 443,
+      "label": "record evidence row",
+      "variant": "dashed"
+    },
+    {
+      "id": "reply",
+      "from": "endpoint",
+      "to": "hermes",
+      "y": 475,
+      "label": "200 completion",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "endpoint",
+      "from": 170,
+      "to": 482,
+      "type": "backend"
+    },
+    {
+      "participant": "router",
+      "from": 205,
+      "to": 405,
+      "type": "backend"
+    }
+  ]
+}

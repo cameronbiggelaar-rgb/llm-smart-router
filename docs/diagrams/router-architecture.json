@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "LLM Smart Router — System Architecture",
+    "output": "docs/diagrams/router-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/cameronbiggelaar-rgb/llm-smart-router",
+      "provider": "github",
+      "revision": "018e4a9600029e09fea571f203beccf3972b4a3e"
+    },
+    "views": [
+      {
+        "id": "request-path",
+        "label": "Request path",
+        "focus": [
+          "hermes",
+          "endpoint",
+          "router",
+          "ollama"
+        ],
+        "note": "One chat-completion from Hermes through to a backend model."
+      },
+      {
+        "id": "decision-inputs",
+        "label": "Routing inputs",
+        "focus": [
+          "endpoint",
+          "compress",
+          "router",
+          "registry"
+        ],
+        "note": "What the router reads before it picks a model."
+      },
+      {
+        "id": "optimising-loop",
+        "label": "Evidence loop",
+        "focus": [
+          "endpoint",
+          "logs",
+          "rollup",
+          "optimiser"
+        ],
+        "note": "How traffic becomes cost evidence, then proposals."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes Gateway",
+      "sublabel": "custom provider",
+      "pos": [
+        30,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "endpoint",
+      "type": "backend",
+      "label": "Endpoint",
+      "sublabel": "FastAPI :8080",
+      "tag": "serving",
+      "pos": [
+        270,
+        80
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/biggie_llm_endpoint.py",
+          "line": 3594,
+          "label": "chat_completions"
+        }
+      ]
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "Router",
+      "sublabel": "tiers + breakers",
+      "tag": "decision",
+      "pos": [
+        540,
+        80
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/router.py",
+          "line": 868,
+          "label": "route_task"
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "MODEL_REGISTRY",
+      "sublabel": "single source of truth",
+      "pos": [
+        810,
+        80
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/models.py",
+          "line": 155,
+          "label": "MODEL_REGISTRY"
+        }
+      ]
+    },
+    {
+      "id": "compress",
+      "type": "backend",
+      "label": "Compression",
+      "sublabel": "B29 ratchet",
+      "tag": "serving",
+      "pos": [
+        270,
+        240
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/biggie_llm_endpoint.py",
+          "line": 1483,
+          "label": "compression_level_for_workload"
+        }
+      ]
+    },
+    {
+      "id": "ollama",
+      "type": "cloud",
+      "label": "Ollama Cloud",
+      "sublabel": "deepseek / glm / qwen",
+      "pos": [
+        540,
+        240
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "codex",
+      "type": "external",
+      "label": "openai-codex",
+      "sublabel": "gpt-5.5 / 5.6",
+      "pos": [
+        810,
+        240
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "local",
+      "type": "cloud",
+      "label": "Local Ollama",
+      "sublabel": "llama3.1:8b limp-home",
+      "pos": [
+        1080,
+        240
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "logs",
+      "type": "database",
+      "label": "router_logs.db",
+      "sublabel": "one row per call",
+      "tag": "evidence",
+      "pos": [
+        30,
+        400
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "rollup",
+      "type": "backend",
+      "label": "rollup.py",
+      "sublabel": "daily_findings",
+      "tag": "accounting",
+      "pos": [
+        250,
+        400
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/rollup.py",
+          "line": 386,
+          "label": "rollup_day"
+        }
+      ]
+    },
+    {
+      "id": "optimiser",
+      "type": "backend",
+      "label": "optimiser.py",
+      "sublabel": "propose-only",
+      "tag": "accounting",
+      "pos": [
+        470,
+        400
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "scripts/optimiser.py",
+          "label": "propose() → candidate_routing.yaml"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "evidence loop",
+      "wraps": [
+        "logs",
+        "rollup",
+        "optimiser"
+      ],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "from": "hermes",
+      "to": "endpoint",
+      "label": "POST /chat",
+      "variant": "emphasis"
+    },
+    {
+      "from": "endpoint",
+      "to": "router",
+      "label": "features",
+      "variant": "emphasis"
+    },
+    {
+      "from": "router",
+      "to": "registry",
+      "label": "tiers"
+    },
+    {
+      "from": "endpoint",
+      "to": "compress",
+      "label": "size gate",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        440,
+        196
+      ]
+    },
+    {
+      "from": "router",
+      "to": "ollama",
+      "label": "proxy",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        625,
+        192
+      ]
+    },
+    {
+      "from": "router",
+      "to": "codex",
+      "label": "high tier",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          760,
+          112
+        ],
+        [
+          760,
+          272
+        ]
+      ]
+    },
+    {
+      "from": "router",
+      "to": "local",
+      "label": "fallback",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          625,
+          40
+        ],
+        [
+          1165,
+          40
+        ]
+      ]
+    },
+    {
+      "from": "endpoint",
+      "to": "logs",
+      "label": "cost rows",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          355,
+          196
+        ],
+        [
+          115,
+          196
+        ]
+      ],
+      "labelAt": [
+        205,
+        172
+      ]
+    },
+    {
+      "from": "logs",
+      "to": "rollup",
+      "label": "rollup_day",
+      "variant": "emphasis",
+      "labelAt": [
+        225,
+        392
+      ]
+    },
+    {
+      "from": "rollup",
+      "to": "optimiser",
+      "label": "findings"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Two Planes, One Host",
+      "items": [
+        "Serving plane: endpoint + compression + router",
+        "Evidence plane: router_logs.db → rollup → optimiser",
+        "No Hermes core patching — the router is an external provider"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Routing Inputs",
+      "items": [
+        "Workload type decides compression, not size alone",
+        "MODEL_REGISTRY is the single source of truth",
+        "Tier clamp caps normal routing below the expensive lane"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Prompt-Cache Identity (B34/B35)",
+      "items": [
+        "Derived key anchors on the FIRST USER TURN, not the system prompt",
+        "Cap enforcement is gated on the key's source",
+        "B35: override the generic 'custom' profile so supports_prompt_cache_key=True",
+        "Live on chat-completions: real session id reaches the wire as cache_key"
+      ]
+    }
+  ]
+}
