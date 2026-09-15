@@ -138,20 +138,26 @@ Full detail deferred until A produces data. Current evidence:
 - So Hermes believes a session is ~366K tokens while the provider bills a median of 2,693
 - Compaction fires against a **phantom**, cannot win, and re-fires: the loop
 
-**Suspect:** `turn_context.py:64`
-```python
-charge_stale_thinking=_agent_stale_thinking_on_wire(agent),
-```
-→ `stale_thinking_reaches_wire(...)`, documented "True (conservative full charge) when
-route facts are unavailable" — `except: return True`. Our route is a **custom**
-provider (`api_mode: custom`, `127.0.0.1:8080/v1`), which it cannot classify.
+**CONFIRMED (see `plan-b33-route-blind-preflight-charge.md`) — and this section's
+original suspect was WRONG.**
 
-**Open questions A should answer:**
-- Is it ONE session looping or many? (needs A1)
-- What is the true floor split: phantom vs genuinely-prunable?
-- Does the billed input track the local estimate at all, per session?
+The original guess here was that `_agent_stale_thinking_on_wire()`'s
+`except: return True` fail-conservative path was firing. **It is not.** The
+predicate resolves correctly for the primary route (`biggie-router` →
+`stale_thinking_reaches_wire = False`).
 
----
+The real defect is one level up: `_preflight_request_tokens()` returns the
+**anchored** estimate *before* reaching the route-aware generic estimator, and
+`anchored_context_tokens()` declares `charge_stale_thinking: bool = True` while
+its callers omit the argument. So the gating number charges reasoning on every
+route, including routes where Hermes itself strips it.
+
+Measured on the real dump: **364,368** (blind) vs **158,603** (route-correct)
+against a 180,000 threshold — a 205,765-token inflation, i.e. the session is
+charged as over-threshold when it is comfortably under.
+
+This correction is recorded rather than quietly deleted: the wrong suspect was
+plausible from the code shape alone, and only measurement distinguished them.
 
 ## 5. Additional data we should capture (future state)
 
