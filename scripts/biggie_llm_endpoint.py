@@ -1564,9 +1564,30 @@ def _compression_session_key(messages: Any, session_id: str = "") -> str:
 
     Every compaction row in `router_logs` has a BLANK session_id (verified:
     `session_compression||4929`), so the key must be derived from the prompt.
-    The prefix is stable across turns for a given session (the original context
-    is re-sent each time) and distinct between sessions, which is exactly what a
-    rolling per-session cap needs.
+
+    The key anchors on the FIRST USER TURN. Two earlier derivations were wrong,
+    both measured against production payloads:
+
+    * Hashing the joined text from index 0 made this a SYSTEM-PROMPT hash. The
+      system message is first and always exceeds the 512-char budget (min 9,088,
+      median 27,847 across 92 dumps), so the prefix covered ONLY the system
+      prompt and every session on a profile collided. The per-session 40/hr
+      guard was therefore a GLOBAL budget: 3 of 4 parallel Hermes sessions
+      shared one key, and 289 overflow rows landed on a single key while only
+      95 genuine compression rows sat on 2 keys.
+    * Merely SKIPPING the system message left a GROWING window, so the key
+      changed whenever turns were appended while the opening turn was shorter
+      than the budget. A rolling cap keyed that way resets its own budget
+      mid-conversation.
+
+    The opening user turn is immutable as a conversation grows, so anchoring on
+    it is stable by construction and still discriminates between conversations.
+
+    CAVEAT, measured: this is still not a true session identity. Compaction
+    payloads open with a constant CONTEXT COMPACTION wrapper, so several
+    different sessions have been observed sharing one derived key. A real
+    identity (header/body/cache_key) always wins, and derived keys are NOT
+    enforced as per-session.
 
     Never raises: guard bookkeeping must not be able to break a live request.
     """
@@ -1576,18 +1597,28 @@ def _compression_session_key(messages: Any, session_id: str = "") -> str:
             return f"sid:{sid}"
         text = ""
         if isinstance(messages, list):
-            parts: List[str] = []
+            anchor = ""
             for m in messages:
                 if isinstance(m, dict):
-                    parts.append(_message_text(m.get("content", "")))
+                    if str(m.get("role", "")).lower() == "user":
+                        anchor = _message_text(m.get("content", ""))
+                        break
                 elif isinstance(m, str):
-                    parts.append(m)
-                if sum(len(p) for p in parts) >= COMPRESSION_GUARD_KEY_PREFIX_CHARS:
+                    anchor = m
                     break
-            text = "\n".join(parts)
+            if not anchor:
+                for m in messages:
+                    if isinstance(m, dict):
+                        if str(m.get("role", "")).lower() == "system":
+                            continue
+                        anchor = _message_text(m.get("content", ""))
+                        break
+            text = anchor
         elif isinstance(messages, str):
             text = messages
         prefix = text[:COMPRESSION_GUARD_KEY_PREFIX_CHARS]
+        if not prefix.strip():
+            return "pfx:unkeyable"
         return "pfx:" + hashlib.sha256(prefix.encode("utf-8", "replace")).hexdigest()[:32]
     except Exception:  # pragma: no cover - defensive, must never raise
         return "pfx:unkeyable"
@@ -1600,10 +1631,14 @@ def _compression_session_key(messages: Any, session_id: str = "") -> str:
 # prompt collide. Storing the value without its provenance silently conflated
 # them and made "940 compactions from ONE session" an inference from a blank
 # key rather than a measurement. The label keeps the distinction queryable.
-SESSION_ID_SOURCES = ("header", "body", "derived", "none")
+SESSION_ID_SOURCES = ("header", "body", "cache_key", "derived", "none")
 
 _SESSION_ID_HEADERS = ("x-hermes-session-id", "x-session-id")
 _SESSION_ID_BODY_KEYS = ("session_id", "sessionId", "user")
+# B34: a real session id on the Codex/Responses path, present on 58/92 dumps;
+# 42 match a state.db session id exactly. The chat-completions path does NOT
+# send it, so this is Codex-only.
+_SESSION_ID_CACHE_KEY = "prompt_cache_key"
 
 
 def resolve_session_identity(
@@ -1612,8 +1647,12 @@ def resolve_session_identity(
     """Resolve the calling session's identity and how it was obtained.
 
     Returns ``(session_id, source)`` where source is one of
-    :data:`SESSION_ID_SOURCES`. Priority is header, then body fields, then a
-    derived prompt-prefix key, then ``"none"``.
+    :data:`SESSION_ID_SOURCES`. Priority is header, then body fields, then ``prompt_cache_key``
+    (``"cache_key"``), then a derived prompt-prefix key, then ``"none"``.
+
+    ``"cache_key"`` and ``"derived"`` are NOT equivalent: ``prompt_cache_key``
+    is a genuine session id, whereas the derived key is a context-prefix hash
+    that still collides across sessions sharing an opening wrapper.
 
     The derived key reuses :func:`_compression_session_key`, which is already
     proven stable across the turns of one session and distinct between
@@ -1633,6 +1672,13 @@ def resolve_session_identity(
                 val = str(body.get(key) or "").strip()
                 if val:
                     return val, "body"
+            # B34: `prompt_cache_key` carries a REAL session id on the Codex path
+            # (42 of 58 observed values match a state.db session id exactly). Resolve it
+            # as an identity rather than falling through to a prefix hash that cannot
+            # discriminate between sessions.
+            val = str(body.get(_SESSION_ID_CACHE_KEY) or "").strip()
+            if val:
+                return val, "cache_key"
             meta = body.get("metadata")
             if isinstance(meta, dict):
                 val = str(meta.get("session_id") or "").strip()
