@@ -254,3 +254,46 @@ def test_all_log_request_to_db_call_sites_pass_session_id():
         if not (explicit or splatted):
             missing.append(chunk[:60].replace("\n", " "))
     assert not missing, f"call sites missing session identity: {missing}"
+
+
+def test_shadow_site_passes_resolved_identity_not_a_missing_feature_key():
+    """The shadow row must carry the RESOLVED identity.
+
+    The shadow call site passed ``features.get("session_id", "")``, but
+    ``feature_extractor`` never sets a ``session_id`` key, so the lookup
+    always returned "" — every shadow row was silently unattributable while
+    looking like it had been wired. Assert the resolved variable is used and
+    the missing-key lookup is gone.
+    """
+    src = (SCRIPTS_DIR / "biggie_llm_endpoint.py").read_text()
+
+    assert 'session_id=features.get("session_id", "")' not in src, (
+        "shadow path must not read features['session_id'] — that key is never set"
+    )
+
+    # Locate the shadow invocation and confirm identity is threaded through.
+    idx = src.index("run_shadow_experiment(")
+    # take the call site that passes request_body (the real invocation)
+    while "request_body=" not in src[idx:idx + 600]:
+        idx = src.index("run_shadow_experiment(", idx + 1)
+    chunk = src[idx:idx + 600]
+    assert "session_id=session_id," in chunk, "shadow call must pass the resolved session_id"
+    assert "session_id_source=session_id_source," in chunk, (
+        "shadow call must pass session_id_source so derived vs real is distinguishable"
+    )
+
+
+def test_feature_extractor_gains_session_id_or_the_lookup_stays_gone():
+    """Pin the underlying assumption: features has no session_id key.
+
+    If someone later ADDS ``session_id`` to the feature dict, the shadow
+    lookup would become correct again — this test documents which way the
+    dependency runs so the assertion above is not silently invalidated.
+    """
+    import feature_extractor
+
+    sig_src = (SCRIPTS_DIR / "feature_extractor.py").read_text()
+    assert '"session_id":' not in sig_src and "'session_id':" not in sig_src, (
+        "feature_extractor now sets session_id — revisit the shadow-site "
+        "assertion, which assumes that key is absent"
+    )

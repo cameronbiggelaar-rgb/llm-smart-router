@@ -3852,7 +3852,11 @@ async def chat_completions(request: Request):
                     messages=compressed_messages,
                     request_body=body,
                     request_id=request_id,
-                    session_id=features.get("session_id", ""),
+                    # The RESOLVED identity, NOT features["session_id"] — the feature
+                    # extractor never sets that key, so every shadow row
+                    # silently logged a blank session (unattributable).
+                    session_id=session_id,
+                    session_id_source=session_id_source,
                     incumbent_model=decision.selected_model,
                     workload_type=workload_type,
                     )
