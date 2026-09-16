@@ -1,6 +1,6 @@
 # Plan — build stamping so staleness is detectable, not guessed
 
-Status: implementing (2026-09-16)
+Status: IMPLEMENTED 2026-09-16 (B5 `84568c6`, B6 `7c9bf55`)
 Thread: 56467
 
 ## Problem (measured, not hypothetical)
@@ -119,3 +119,50 @@ Code + tests committed per convention (unpushed). **Activation needs
 `sudo systemctl restart biggie-llm-endpoint`** — the fix is itself subject to the
 staleness it detects, so verify with the new signature (`build.stale` false and a
 `git_sha` matching HEAD) rather than a 200.
+
+
+---
+
+## Completion (2026-09-16)
+
+Shipped as two batches, both committed (unpushed, per convention).
+
+### B5 `84568c6` — endpoint stamps its build
+- `_capture_build_stamp()` / `_newer_than_stamp()` / `_source_mtime()` in
+  `biggie_llm_endpoint.py`; stamp taken once at import.
+- `/health` gains a `build` block (`git_sha`, `source_mtime`, `started_at`,
+  `stale`, `changed_files`); `version` kept for compatibility.
+- Tracks **both** `biggie_llm_endpoint.py` and `router.py`.
+- Fails open to `"unknown"`.
+- Tests: `tests/test_batch5_build_stamp.py` (12). Suite 653 → **665**.
+
+### B6 `7c9bf55` — the ops job flags it
+- `router_ops.py`: `_fetch_health()`, `_repo_head_sha()`, `evaluate_deploy()`,
+  `cmd_deploy_check` (+ `deploy-check` subcommand, `--json`).
+- `maintain` calls it as a **non-fatal warning**.
+- Tests: `tests/test_batch6_deploy_check.py` (13). Suite 665 → **678**.
+
+### Deviation from plan (worth recording)
+
+The plan assumed a missing `build` block means UNKNOWN. Measured against the live
+endpoint, that was wrong in the most important case: the running process returned
+**no build block at all** (it predated B5), which is *proof* of a stale
+deployment — the exact scenario the check exists for — and reporting UNKNOWN
+there would be honest but useless. Added `_endpoint_source_has_stamp()`: if the
+deployed source has the feature but the running process does not report it, the
+verdict is STALE. Two tests pin both sides.
+
+Second deviation: no `httpx`/`subprocess` imports or endpoint URL constant existed
+in `router_ops.py`; both were added.
+
+### Verification
+- Full suite **678 passed**.
+- Live CLI works: `python3 scripts/router_ops.py deploy-check` → **STALE**
+  against the currently-running (pre-B5) endpoint, `rc=1`; matching sha → OK.
+- `maintain --days 1` ran end-to-end on the real DB, warned about staleness, and
+  still completed rollup + report + propose.
+
+### Status: NOT YET LIVE
+This work is subject to the staleness it detects — the running endpoint needs
+`sudo systemctl restart biggie-llm-endpoint` before `deploy-check` can report OK.
+Until then it correctly reports its own deployment as STALE.
