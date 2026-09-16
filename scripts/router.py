@@ -67,7 +67,33 @@ FLASH_MAX_CONTEXT_TOKENS = int(os.environ.get("BIGGIE_FLASH_MAX_CONTEXT_TOKENS",
 # limited to 150K and larger compressions escalate to glm-5.2 (the tier above).
 MODEL_CONTEXT_CEILING = {
     "glm-5.3": int(os.environ.get("BIGGIE_GLM53_MAX_CONTEXT_TOKENS", "150000")),
+    # Local llama-server runs `-c 4096 --context-shift` (CPU-only, 1 slot), but
+    # Ollama's own /api/show advertises `llama.context_length = 131072` from the
+    # model's *training* metadata. Trusting that number handed local prompts it
+    # cannot hold — measured 28 requests over 4,096 tokens in one day — and
+    # --context-shift then silently drops the OLDEST tokens, which is how a
+    # summary legitimately comes back truncated or empty instead of erroring.
+    # Declare the real serving window here so oversized work routes elsewhere.
+    "llama3.1:8b": int(os.environ.get("BIGGIE_LOCAL_MAX_CONTEXT_TOKENS", "4096")),
+    "dolphin3": int(os.environ.get("BIGGIE_LOCAL_MAX_CONTEXT_TOKENS", "4096")),
 }
+
+def _within_declared_window(model: str, context_tokens: int) -> bool:
+    """True when a model can actually hold a request of this size.
+
+    Consults ``MODEL_CONTEXT_CEILING`` — the single source of truth for
+    per-model context limits, already enforced on the compression ladder.
+
+    A ceiling of 0, or an unlisted model, means "no declared limit".
+    ``context_tokens`` of 0 means the size is unknown, which must never
+    *remove* a candidate: existing callers pass no context and rely on
+    today's chains, so they are unaffected.
+    """
+    if context_tokens <= 0:
+        return True
+    ceiling = MODEL_CONTEXT_CEILING.get(_normalize_model_name(model), 0)
+    return ceiling == 0 or context_tokens <= ceiling
+
 
 # Path to router state DB
 ROUTER_STATE_DB = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_state.db")
@@ -1053,7 +1079,7 @@ def route_task(
             selected_model=force_model,
             selected_provider=_get_provider(force_model),
             reason=f"forced model: {force_model}",
-            fallback_chain=_build_fallback_chain(force_model),
+            fallback_chain=_build_fallback_chain(force_model, context_tokens),
         )
 
     # ── Native Hermes session-compression workload ─────────────────────
@@ -1063,7 +1089,7 @@ def route_task(
     # ── Capability-based routing ──
     # Find the cheapest available model that meets the minimum tier
     selected = _select_model(min_tier)
-    fallback_chain = _build_fallback_chain(selected)
+    fallback_chain = _build_fallback_chain(selected, context_tokens)
 
     all_exhausted = not is_model_available(selected) if selected else True
 
@@ -1258,6 +1284,29 @@ def escalate_on_failure(
                 limp_home=True,
                 limp_home_reason=_LIMP_HOME_REASON,
             )
+        # Local is the only option in limp-home, but it still cannot hold an
+        # arbitrarily large request: llama-server runs -c 4096 --context-shift,
+        # and context-shift drops the OLDEST tokens. Serving a 100K+ compaction
+        # here would return a summary with its beginning silently missing —
+        # worse than an honest failure, because the caller cannot tell. Fail
+        # closed, matching how this function already handles tool-required work.
+        if not _within_declared_window("llama3.1:8b", context_tokens):
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason=(
+                    f"limp-home mode active and request ({context_tokens} tokens) "
+                    f"exceeds local's declared {MODEL_CONTEXT_CEILING.get('llama3.1:8b', 0)}-token "
+                    "window — failing closed rather than returning a summary with "
+                    "its oldest tokens silently dropped"
+                ),
+                fallback_chain=[],
+                is_fallback=True,
+                original_model=failed_model,
+                all_exhausted=True,
+                limp_home=True,
+                limp_home_reason=_LIMP_HOME_REASON,
+            )
         local_model = _select_limp_home_model("other", 0.5)
         if local_model:
             return RoutingDecision(
@@ -1313,13 +1362,18 @@ def escalate_on_failure(
                 selected_model=model,
                 selected_provider=_get_provider(model),
                 reason=f"escalation from {failed_model} ({error_type})",
-                fallback_chain=_build_fallback_chain(model),
+                fallback_chain=_build_fallback_chain(model, context_tokens),
                 is_fallback=True,
                 original_model=failed_model,
             )
 
-    # Nothing available — try local as last resort (only for non-tool work)
-    if not requires_tools and is_model_available("llama3.1:8b"):
+    # Nothing available — try local as last resort (only for non-tool work,
+    # and only if local can actually hold the request).
+    if (
+        not requires_tools
+        and is_model_available("llama3.1:8b")
+        and _within_declared_window("llama3.1:8b", context_tokens)
+    ):
         return RoutingDecision(
             selected_model="llama3.1:8b",
             selected_provider="local",
@@ -1777,10 +1831,14 @@ def _select_model(min_tier: int) -> str:
     return ""
 
 
-def _build_fallback_chain(current_model: str) -> List[str]:
+def _build_fallback_chain(current_model: str, context_tokens: int = 0) -> List[str]:
     """Build the escalation chain from the current model upward.
 
     Returns models with higher capability that are currently available.
+
+    Candidates whose declared context window cannot hold ``context_tokens``
+    are skipped — this is what stops local (4,096) being offered as an escape
+    hatch for a 100K+ compaction. The default of 0 preserves existing chains.
     """
     current_tier = MODEL_CAPABILITY_TIERS.get(current_model, 0)
     available = get_available_models()
@@ -1789,12 +1847,20 @@ def _build_fallback_chain(current_model: str) -> List[str]:
     for model in available:
         if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
             continue
+        if not _within_declared_window(model, context_tokens):
+            continue
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         if tier > current_tier:
             chain.append(model)
 
-    # Always include local as last resort
-    if "llama3.1:8b" not in chain and is_model_available("llama3.1:8b"):
+    # Always include local as last resort — but only if it can hold the
+    # request. Handing local a prompt beyond its serving window is worse than
+    # having no fallback: --context-shift drops the oldest tokens silently.
+    if (
+        "llama3.1:8b" not in chain
+        and is_model_available("llama3.1:8b")
+        and _within_declared_window("llama3.1:8b", context_tokens)
+    ):
         chain.append("llama3.1:8b")
 
     return chain
