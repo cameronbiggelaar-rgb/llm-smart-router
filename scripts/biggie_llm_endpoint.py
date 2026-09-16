@@ -63,6 +63,7 @@ from router import (
     mark_credential_expired,
     log_recovery_event,
     mark_available,
+    is_model_available,
     RoutingDecision,
     MODEL_CAPABILITY_TIERS,
     TOOL_CAPABLE_MODELS,
@@ -1203,6 +1204,65 @@ def discover_backends() -> Dict[str, Dict[str, Any]]:
     _backends_cache = backends
     _backends_cache_time = time.time()
     return backends
+
+
+def _pick_fallback_backend(
+    backends: Dict[str, Dict[str, Any]],
+    needed_tier: int,
+    requires_tools: bool,
+    is_available: Optional[Callable[[str], bool]] = None,
+) -> Optional[str]:
+    """Choose the best backend that is actually *callable*.
+
+    ``discover_backends()`` reports what is **configured**, not what may be
+    called: a model stays listed while held by an account-wide quota cap
+    (B28) or while its circuit breaker is open. Selecting purely by
+    capability tier therefore re-dispatches into a capped account — that was
+    the source of the once-a-minute codex 429 storm, because ``gpt-5.5``
+    (tier 10) remained "best reachable" for the ~83h the account cap held.
+
+    Preference is unchanged: the cheapest candidate that still meets
+    ``needed_tier``, else the most capable. Candidates failing the
+    tool-capability gate or the availability check are skipped. Returns
+    ``None`` when nothing is callable, so the caller fails closed instead of
+    dispatching into a wall.
+
+    ``is_available`` is injectable for tests; it defaults to the router's
+    real availability predicate.
+    """
+    if is_available is None:
+        is_available = is_model_available
+
+    best_name: Optional[str] = None
+    best_tier = -1
+    cheapest_meeting: Optional[str] = None
+    cheapest_meeting_tier = 99
+
+    for model_name in backends:
+        base = re.sub(r":(cloud|local|ollama)$", "", model_name)
+        if requires_tools and base not in TOOL_CAPABLE_MODELS:
+            continue
+        # Router state is keyed by the base name, but discovery can hand back
+        # a provider-suffixed alias (e.g. deepseek-v4.1-flash:cloud), so both
+        # spellings must resolve the same hold.
+        if not (is_available(model_name) and is_available(base)):
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(base, 0)
+        if tier >= needed_tier and tier < cheapest_meeting_tier:
+            cheapest_meeting = model_name
+            cheapest_meeting_tier = tier
+        if tier > best_tier:
+            best_tier = tier
+            best_name = model_name
+
+    return cheapest_meeting or best_name
+
+
+def _tier_of(model_name: str) -> int:
+    """Capability tier for a possibly provider-suffixed model name."""
+    return MODEL_CAPABILITY_TIERS.get(
+        re.sub(r":(cloud|local|ollama)$", "", model_name), 0
+    )
 
 
 def _add_backend(
@@ -3746,27 +3806,13 @@ async def chat_completions(request: Request):
         # backends may serve them.
         logger.warning("Selected model %s not in discovered backends, falling back to best reachable", decision.selected_model)
         needed_tier = MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0)
-        best_name = None
-        best_tier = -1
-        cheapest_meeting = None
-        cheapest_meeting_tier = 99
-        for model_name, bk in backends.items():
-            base = re.sub(r":(cloud|local|ollama)$", "", model_name)
-            if requires_tools and base not in TOOL_CAPABLE_MODELS:
-                continue
-            tier = MODEL_CAPABILITY_TIERS.get(base, 0)
-            if tier >= needed_tier and tier < cheapest_meeting_tier:
-                cheapest_meeting = model_name
-                cheapest_meeting_tier = tier
-            if tier > best_tier:
-                best_tier = tier
-                best_name = model_name
-        # Prefer cheapest that meets the tier; else most capable
-        chosen = cheapest_meeting or best_name
+        chosen = _pick_fallback_backend(
+            backends, needed_tier, requires_tools
+        )
         if chosen:
             backend = backends[chosen]
             decision.selected_model = chosen
-            logger.info("Fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
+            logger.info("Fell back to reachable backend: %s (tier %d, needed %d)", chosen, _tier_of(chosen), needed_tier)
         elif requires_tools:
             # No reachable tool-capable backend — fail closed.
             return JSONResponse(
@@ -4175,26 +4221,13 @@ async def chat_completions(request: Request):
             # For tool-required work, only proven tool-capable backends may serve.
             logger.warning("Escalated model %s not in discovered backends, falling back to best reachable", escalation.selected_model)
             needed_tier = MODEL_CAPABILITY_TIERS.get(escalation.selected_model, 0)
-            best_name = None
-            best_tier = -1
-            cheapest_meeting = None
-            cheapest_meeting_tier = 99
-            for model_name, bk in backends.items():
-                base = re.sub(r":(cloud|local|ollama)$", "", model_name)
-                if requires_tools and base not in TOOL_CAPABLE_MODELS:
-                    continue
-                tier = MODEL_CAPABILITY_TIERS.get(base, 0)
-                if tier >= needed_tier and tier < cheapest_meeting_tier:
-                    cheapest_meeting = model_name
-                    cheapest_meeting_tier = tier
-                if tier > best_tier:
-                    best_tier = tier
-                    best_name = model_name
-            chosen = cheapest_meeting or best_name
+            chosen = _pick_fallback_backend(
+                backends, needed_tier, requires_tools
+            )
             if chosen:
                 backend = backends[chosen]
                 escalation.selected_model = chosen
-                logger.info("Escalation fell back to reachable backend: %s (tier %d, needed %d)", chosen, cheapest_meeting_tier if cheapest_meeting else best_tier, needed_tier)
+                logger.info("Escalation fell back to reachable backend: %s (tier %d, needed %d)", chosen, _tier_of(chosen), needed_tier)
             elif requires_tools:
                 # No reachable tool-capable backend — fail closed.
                 return JSONResponse(
