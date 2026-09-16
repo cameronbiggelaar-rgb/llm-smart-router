@@ -1642,6 +1642,24 @@ def _normalize_compression_request(
     return body
 
 
+# The preamble of the genuine compaction prompts built in
+# agent/context_compressor.py (`_build_summary_prompt`). BOTH the fresh and the
+# iterative-update forms open with this exact sentence:
+#
+#     prompt = f"""{_summarizer_preamble}\n\n...
+#
+# This single phrase is the reliable discriminator. It is deliberately narrow:
+# nobody types "You are a summarization agent creating a context checkpoint" by
+# accident, yet a real compaction ALWAYS carries it -- which matters because a
+# real compaction inherits the parent session's tool schemas, so a body with
+# `tools` cannot be used to veto it (confirmed in production: 198,788
+# session_compression rows logged requires_tools=1 before B29's strip went live).
+_STRONG_COMPRESSION_MARKERS = (
+    "summarization agent creating a context checkpoint",
+    "summarisation agent creating a context checkpoint",
+)
+
+
 def detect_workload_type(
     messages: List[Dict[str, Any]],
     body: Dict[str, Any],
@@ -1711,6 +1729,24 @@ def detect_workload_type(
         "checkpoint summary",
     )
     if any(marker in prompt for marker in compression_markers):
+        # Two tiers. The STRONG markers below appear in the preamble of the
+        # genuine compaction prompts built in agent/context_compressor.py
+        # ("You are a summarization agent creating a context checkpoint"), so
+        # they identify a real compaction even when the request inherited the
+        # parent session's tool schemas -- which in production it does. Those
+        # must still be stripped, or `requires_tools` unlocks the
+        # tool-capability route and the "most-capable tool model" escalation
+        # branch, and offered tools provoke tool-call-only responses from a
+        # summariser (the exact failure B29 exists to prevent).
+        #
+        # The LOOSE markers are short phrases a user can plausibly type or paste
+        # (a handoff block, "summarize the conversation so I can continue").
+        # Those must NOT demote a body carrying real tool schemas, or the
+        # 2026-09-16 defect returns: the turn loses its tools, routes to a
+        # non-tool-capable model, and that model fabricates markup.
+        if not any(marker in prompt for marker in _STRONG_COMPRESSION_MARKERS):
+            if body.get("tools"):
+                return "normal_chat"
         return "session_compression"
 
     return "normal_chat"
