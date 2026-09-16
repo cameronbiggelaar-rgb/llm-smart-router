@@ -91,3 +91,58 @@ for good.
 ## Status
 NOT deployed. Requires endpoint restart to go live (`sudo systemctl restart
 biggie-llm-endpoint`) — user signs off, gateway already-current.
+---
+
+## Outcome (2026-09-16) — SHIPPED
+
+Batch 7 -> `47d630c`; batch 8 -> `895d8fe`. Full suite 678 -> 707.
+
+### What batch 8 changed vs the original plan
+
+The plan's batch 2 ("if the body has `tools`, force normal_chat") was too blunt
+and was rejected during non-vacuity testing: it reopened the exact defect B29
+exists to prevent, because a REAL compaction request inherits the parent
+session's tool schemas. Production evidence: **198,788 session_compression rows
+logged `requires_tools=1`** before B29's strip went live.
+
+The working discriminator is a two-tier marker split:
+
+- **STRONG** — the preamble of the prompts built by
+  `agent/context_compressor.py::_build_summary_prompt`, which BOTH the fresh and
+  iterative forms open with: "You are a summarization agent creating a context
+  checkpoint". Nobody types this by accident; a real compaction always has it.
+  A strong marker demotes even a tool-bearing body.
+- **LOOSE** — short phrases a user can type or paste ("compressed summary",
+  "preserve key facts", a pasted handoff). These only demote a body with NO tools.
+
+### Fixture correction (important)
+
+`tests/test_b29_compression_tools_strip.py` used a hand-invented string
+("Context compaction task: summarize earlier conversation so I can continue.
+Preserve key facts, decisions, and file paths.") that appears NOWHERE in the
+Hermes source. Replaced with the genuine prompt text so the test exercises its
+real invariant. The old string's loose markers are ALSO the ones that
+false-positived in production — see `agent/conversation_compression.py:65`, where
+"Compacting context — summarizing earlier conversation so I can continue..." is a
+**UI status string**, not a request prompt, and therefore lands in *history*.
+
+### Verified end-to-end (3 cases)
+
+| case | workload | tools kept |
+|---|---|---|
+| handoff in history, tools present (reported bug) | normal_chat | yes |
+| real compaction prompt, inherited tools (B29) | session_compression | no |
+| user mentions a marker phrase but wants tools | normal_chat | yes |
+
+### Also found
+
+The genuine FIRST-TIME compaction prompt matched none of the original 14 markers,
+so a real fresh compaction was being routed as ordinary chat (false negative B29
+never caught). New marker "checkpoint summary".
+
+### Deploy
+
+Requires an endpoint restart to go live:
+`sudo systemctl restart biggie-llm-endpoint`
+(`deploy-check` will report STALE until then — that is the build-stamping detector
+working, not a failure.)
