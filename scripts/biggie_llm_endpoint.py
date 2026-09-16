@@ -1672,7 +1672,23 @@ def detect_workload_type(
     if explicit in {"compression", "context_compression", "session_compression", "compaction"}:
         return "session_compression"
 
-    prompt = "\n".join(_message_text(m.get("content", "")) for m in messages).lower()
+    # Scan ONLY the last user message. A genuine compaction request is a single
+    # synthesized user message (the prompt built in agent/context_compressor.py),
+    # so its instruction text is what identifies it. Scanning the WHOLE history
+    # was the 2026-09-16 defect: every long Hermes session carries a compaction
+    # handoff such as "[CONTEXT COMPACTION - REFERENCE ONLY]" somewhere in its
+    # history, so once a thread compacted, EVERY later agent turn was
+    # reclassified as compression, had its tool schemas stripped, and was routed
+    # to a non-tool-capable summariser -- which then fabricated tool markup
+    # ("<terminal>", "<skill_view>") that never executed.
+    last_user_text = ""
+    for message in reversed(messages):
+        if str(message.get("role", "")).lower() == "user":
+            last_user_text = _message_text(message.get("content", ""))
+            break
+    if not last_user_text and messages:
+        last_user_text = _message_text(messages[-1].get("content", ""))
+    prompt = last_user_text.lower()
     compression_markers = (
         "context compaction",
         "context compression",
@@ -1688,6 +1704,11 @@ def detect_workload_type(
         "summarise the conversation so i can continue",
         "preserve facts, decisions",
         "preserve key facts",
+        # The genuine FIRST-TIME compaction prompt ("Create a structured
+        # checkpoint summary for the conversation after earlier turns are
+        # compacted...") matched none of the markers above, so a real fresh
+        # compaction used to fall through to normal_chat.
+        "checkpoint summary",
     )
     if any(marker in prompt for marker in compression_markers):
         return "session_compression"
