@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -87,6 +88,98 @@ from traffic_split import (
 )
 
 logger = logging.getLogger("biggie-llm-endpoint")
+
+
+#  Build stamp — what did THIS process actually load? 
+#
+# Motivation (measured 2026-09-16): this endpoint served 21 hours of pre-patch
+# code while the file on disk was current, and /health returned 200 throughout
+# because it reported a hardcoded version string. Python binds a module at
+# process start and the unit is Type=simple/Restart=on-failure/CanReload=no, so
+# systemd only re-execs on a crash — an edit to the file changes nothing until
+# an explicit restart. A fix can therefore be committed, tested and "done" while
+# not serving a single request, with a green health check saying all is well.
+#
+# So: record the build once at import, then answer "is the on-disk source newer
+# than what I loaded?" by comparing mtimes. mtime rather than a fresh `git
+# rev-parse` because it is far cheaper per call and strictly more sensitive — it
+# catches uncommitted edits, which is the normal state of this repo.
+
+_TRACKED_SOURCE_FILES = (
+    "biggie_llm_endpoint.py",  # the process itself
+    "router.py",               # the routing policy it imports; a stale copy
+                               # here is how the batch-1/2/3 routing fixes
+                               # could silently fail to apply
+)
+
+# Paths resolved from the module's own location (stable regardless of cwd, which
+# the unit sets to scripts/ anyway).
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_DIR.parent
+
+
+def _source_mtime(path: Path) -> float:
+    """mtime of one tracked file, or 0.0 if it cannot be stat'd.
+
+    Fails to 0.0 (never raises) so an unreadable file cannot mark the process
+    permanently stale or crash the health endpoint.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _capture_build_stamp() -> Dict[str, Any]:
+    """Record what this process loaded. Called once at import.
+
+    Never raises: `git` may be absent, slow, or this may not be a checkout, and a
+    stamping bug must never be able to take the endpoint down. Any failure
+    degrades to "unknown".
+    """
+    stamp: Dict[str, Any] = {
+        "git_sha": "unknown",
+        "source_mtime": {},
+        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    try:
+        for name in _TRACKED_SOURCE_FILES:
+            stamp["source_mtime"][str(_SCRIPTS_DIR / name)] = _source_mtime(
+                _SCRIPTS_DIR / name
+            )
+    except Exception:  # noqa: BLE001 - fail open, never break startup
+        pass
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            stamp["git_sha"] = result.stdout.strip()
+    except Exception:  # noqa: BLE001 - fail open, never break startup
+        pass
+    return stamp
+
+
+def _newer_than_stamp(stamp: Dict[str, Any]) -> List[str]:
+    """Tracked files edited since `stamp` was taken.
+
+    Empty list == this process is running the current source. Non-empty == it is
+    serving stale code and needs a restart.
+    """
+    changed: List[str] = []
+    for path, recorded in (stamp.get("source_mtime") or {}).items():
+        current = _source_mtime(Path(path))
+        # > not != : a restored/older mtime is not "newer code"
+        if current > float(recorded or 0):
+            changed.append(path)
+    return changed
+
+
+_BUILD_STAMP: Dict[str, Any] = _capture_build_stamp()
 
 # Reasoning-capable summariser models can spend several thousand tokens on their
 # hidden reasoning trace before emitting visible summary content. A low caller
@@ -3670,14 +3763,28 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint.
+
+    Reports the build this process actually loaded, not just that it answers.
+    A 200 here proves the PROCESS is up; `build.stale` proves the CODE is
+    current. Those are different questions and conflating them let a fix sit
+    unserved for 21 hours behind a green light (2026-09-16).
+    """
     info = check_limp_home_status(needs_llm=False)
+    changed = _newer_than_stamp(_BUILD_STAMP)
     return {
         "status": "ok",
         "limp_home": info["active"],
         "routing_profile": ROUTING_PROFILE,
         "compression": COMPRESSION_LEVEL,
         "version": "1.0.0",
+        "build": {
+            "git_sha": _BUILD_STAMP["git_sha"],
+            "source_mtime": _BUILD_STAMP["source_mtime"],
+            "started_at": _BUILD_STAMP["started_at"],
+            "stale": bool(changed),
+            "changed_files": changed,
+        },
     }
 
 
