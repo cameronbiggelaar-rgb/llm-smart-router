@@ -647,6 +647,68 @@ def apply_experiment(
 
 _SHADOW_MAX_CONCURRENCY = 2
 _SHADOW_TIMEOUT_SECONDS = 90.0
+
+# Shared ceiling for backends that do not declare their own. Codex and cloud
+# models legitimately run long, so this stays generous.
+_BACKEND_DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# Local llama-server is CPU-only with a single slot (`-c 4096 -np 1`). When it
+# saturates it does not refuse — it queues — so held requests pile up: measured
+# 45-46 established plus 88 open connections to :11434, each parked for the
+# shared 300s and then multiplied by api_max_retries. Failing fast lets the
+# caller escalate to a cloud model instead of waiting minutes for a foregone
+# conclusion. Overridable for slower hardware.
+_LOCAL_TIMEOUT_SECONDS_DEFAULT = 60.0
+
+
+def _local_timeout_seconds() -> float:
+    """Resolve local's fast-fail timeout, honoring the operator override."""
+    raw = os.environ.get("BIGGIE_LOCAL_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _LOCAL_TIMEOUT_SECONDS_DEFAULT
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.warning(
+            "BIGGIE_LOCAL_TIMEOUT_SECONDS=%r is not a number — using %ss",
+            raw, _LOCAL_TIMEOUT_SECONDS_DEFAULT,
+        )
+        return _LOCAL_TIMEOUT_SECONDS_DEFAULT
+    if val <= 0:
+        logger.warning(
+            "BIGGIE_LOCAL_TIMEOUT_SECONDS=%r must be positive — using %ss",
+            raw, _LOCAL_TIMEOUT_SECONDS_DEFAULT,
+        )
+        return _LOCAL_TIMEOUT_SECONDS_DEFAULT
+    return val
+
+
+def _timeout_for(provider: str) -> float:
+    """Per-provider request timeout.
+
+    Always returns a float. This is deliberate: ``httpx`` treats ``timeout=None``
+    as "no timeout at all", so returning None here to mean "use the default"
+    would silently disable timeouts the first time a caller passed it straight
+    through. Backends without a specific rule get the shared ceiling.
+    """
+    if provider == "local":
+        return _local_timeout_seconds()
+    return _BACKEND_DEFAULT_TIMEOUT_SECONDS
+
+
+def _exc_desc(exc: BaseException) -> str:
+    """Describe an exception so the log line is actually diagnosable.
+
+    httpx timeout errors stringify to the empty string (``httpx.ReadTimeout("")``),
+    so the historical ``"Backend %s request failed: %s" % (provider, e)`` emitted
+    ``Backend local request failed:`` with no cause recorded — and with local
+    failures undercounted 62x in the database (these paths 502 out before the row
+    is written), the log is the only trace. Always name the class; append the
+    message when there is one.
+    """
+    msg = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {msg}" if msg else name
 _shadow_semaphore = None
 
 
@@ -932,7 +994,7 @@ def _get_httpx_client() -> httpx.AsyncClient:
     """Get or create a shared httpx client with connection pooling."""
     global _httpx_client
     if _httpx_client is None:
-        _httpx_client = httpx.AsyncClient(timeout=300.0)
+        _httpx_client = httpx.AsyncClient(timeout=_BACKEND_DEFAULT_TIMEOUT_SECONDS)
     return _httpx_client
 
 
@@ -2612,8 +2674,8 @@ async def proxy_to_backend(
             )
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
-            logger.error("Backend %s request failed: %s", provider, e)
-            raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+            logger.error("Backend %s request failed: %s", provider, _exc_desc(e))
+            raise HTTPException(status_code=502, detail=f"Backend request failed: {_exc_desc(e)}")
 
         if not responses_data:
             raise HTTPException(status_code=502, detail="No response data from Codex API")
@@ -2695,7 +2757,9 @@ async def proxy_to_backend(
 
         try:
             client = _get_httpx_client()
-            resp = await client.post(url, json=body, headers=headers)
+            resp = await client.post(
+                url, json=body, headers=headers, timeout=_timeout_for(provider)
+            )
             resp.raise_for_status()
             ollama_data = resp.json()
             # Convert Ollama format to OpenAI Chat Completions format
@@ -2726,8 +2790,8 @@ async def proxy_to_backend(
             )
             raise HTTPException(status_code=502, detail=detail)
         except httpx.RequestError as e:
-            logger.error("Backend %s request failed: %s", provider, e)
-            raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+            logger.error("Backend %s request failed: %s", provider, _exc_desc(e))
+            raise HTTPException(status_code=502, detail=f"Backend request failed: {_exc_desc(e)}")
 
     # ── OpenAI-compatible (Ollama Cloud, etc.) ─────────────────────────────
     body = {
@@ -2764,8 +2828,8 @@ async def proxy_to_backend(
         )
         raise HTTPException(status_code=502, detail=detail)
     except httpx.RequestError as e:
-        logger.error("Backend %s request failed: %s", provider, e)
-        raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+        logger.error("Backend %s request failed: %s", provider, _exc_desc(e))
+        raise HTTPException(status_code=502, detail=f"Backend request failed: {_exc_desc(e)}")
 
 
 @dataclass
@@ -3011,10 +3075,10 @@ async def _preflight_openai_stream(
         req = client.build_request("POST", url, json=out, headers=headers)
         resp = await client.send(req, stream=True)
     except httpx.RequestError as e:
-        logger.error("Backend %s stream request failed during preflight: %s", provider, e)
+        logger.error("Backend %s stream request failed during preflight: %s", provider, _exc_desc(e))
         return _StreamPreflight(
             status="error", backend_model=backend_model, provider=provider,
-            error=f"Backend request failed: {e}",
+            error=f"Backend request failed: {_exc_desc(e)}",
         )
     if resp.status_code != 200:
         try:
@@ -3085,7 +3149,7 @@ async def _preflight_openai_stream(
         await resp.aclose()
         return _StreamPreflight(
             status="error", backend_model=backend_model, provider=provider,
-            error=f"Backend request failed: {e}",
+            error=f"Backend request failed: {_exc_desc(e)}",
         )
     # Stream ended without content — treat as empty.
     await resp.aclose()
@@ -3132,8 +3196,8 @@ async def _open_fresh_stream(
         req = client.build_request("POST", url, json=out, headers=headers)
         resp = await client.send(req, stream=True)
     except httpx.RequestError as e:
-        logger.error("Backend %s stream request failed: %s", provider, e)
-        raise HTTPException(status_code=502, detail=f"Backend request failed: {e}")
+        logger.error("Backend %s stream request failed: %s", provider, _exc_desc(e))
+        raise HTTPException(status_code=502, detail=f"Backend request failed: {_exc_desc(e)}")
     if resp.status_code != 200:
         try:
             error_text = (await resp.aread()).decode()

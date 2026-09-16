@@ -173,13 +173,15 @@ class _FakeClient:
 
     def __init__(self, payload):
         self.captured = None
+        self.calls = []
         self._resp = _FakeResponse(payload)
 
     def stream(self, method, url, json=None, headers=None):
         self.captured = {"method": method, "url": url, "json": json}
         return _FakeStreamCtx(self._resp)
 
-    async def post(self, url, json=None, headers=None):
+    async def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         self.captured = {"method": "POST", "url": url, "json": json}
         return self._resp
 
@@ -266,5 +268,79 @@ def test_ollama_still_receives_temperature(monkeypatch):
     )
     assert body.get("temperature") == 0.3, (
         "Ollama accepts temperature and must still receive it"
+    )
+
+
+def test_ollama_request_carries_the_fast_fail_timeout(monkeypatch):
+    """Local must be issued with its OWN short timeout, not the shared ceiling.
+
+    Verified at the real dispatch site by observing what the client was
+    actually handed — the local branch is the one place local traffic flows,
+    including the streaming path which delegates here.
+    """
+    fake = _FakeClient(SSE_PAYLOAD)
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: fake)
+    monkeypatch.delenv("BIGGIE_LOCAL_TIMEOUT_SECONDS", raising=False)
+    asyncio.run(
+        ep.proxy_to_backend(
+            {
+                "provider": "local",
+                "backend_model": "llama3.1:8b",
+                "base_url": "http://127.0.0.1:11434",
+                "api_key": "",
+            },
+            [{"role": "user", "content": "say hi"}],
+            {"model": "llama3.1:8b", "max_tokens": 16},
+        )
+    )
+    assert fake.calls, "no request reached the local backend"
+    sent = fake.calls[-1]["timeout"]
+    assert sent == 60.0, (
+        f"local was dispatched with timeout={sent!r}; it must fast-fail at 60s "
+        "so a busy single-slot server cannot park the caller for 300s"
+    )
+
+
+def test_codex_is_not_given_the_short_local_timeout(monkeypatch):
+    """Cloud must stay patient — 60s would break long Codex completions.
+
+    Codex does not pass a per-request timeout; it streams via ``client.stream``
+    and inherits the shared client default. So the guarantee is two-part: the
+    shared client is built with the generous ceiling, and the Codex call site
+    does not apply local's short timeout.
+    """
+    # 1. The shared client carries the generous default, not local's.
+    assert "httpx.AsyncClient(timeout=_BACKEND_DEFAULT_TIMEOUT_SECONDS)" in ENDPOINT_SRC, (
+        "the shared client must keep the generous ceiling for cloud backends"
+    )
+    assert ep._BACKEND_DEFAULT_TIMEOUT_SECONDS >= 300.0
+
+    # 2. The short timeout is applied at exactly ONE call site, and that site
+    # is guarded by the local branch. Codex streams through a different path
+    # with no per-request timeout, so it keeps the shared client default.
+    lines = ENDPOINT_SRC.splitlines()
+    call_lines = [
+        (i, ln)
+        for i, ln in enumerate(lines)
+        if "timeout=_timeout_for(" in ln and "def " not in ln
+    ]
+    assert len(call_lines) == 1, (
+        f"expected exactly one dispatch site applying the per-provider timeout, "
+        f"found {len(call_lines)}: {[ln.strip() for _, ln in call_lines]}"
+    )
+    idx, call_ln = call_lines[0]
+    guard = next(
+        (
+            ln.strip()
+            for ln in reversed(lines[:idx])
+            if ln.strip().startswith("if provider ==")
+            or ln.strip().startswith("if provider in")
+        ),
+        None,
+    )
+    assert guard is not None, "the timeout call site is not guarded by a provider branch"
+    assert '"local"' in guard, (
+        f"the per-provider timeout is applied under {guard!r}; only the local "
+        "branch may use the short timeout"
     )
 
