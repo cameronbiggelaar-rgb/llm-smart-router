@@ -1023,8 +1023,32 @@ def route_task(
             is_private=True,
         )
 
-    # ── Force model override ──
+    # ── Force model override ─────────────────────────────────────────────
+    # An explicit override must still respect an active account/quota hold.
+    # The endpoint turns any non-sentinel client model name into force_model
+    # (biggie_llm_endpoint.py:3608), so without this check a caller naming a
+    # capped model re-hits the same wall: the account cap fired ~1-3x/min
+    # while get_available_models() reported zero eligible codex models,
+    # because this branch returned the held model unconditionally.
+    #
+    # Check BOTH the raw name and its normalized form: state rows are keyed
+    # by normalized name (e.g. "glm-5.3"), while a client may send a
+    # provider-suffixed alias ("glm-5.3:cloud"). A name with no state row is
+    # unknown and stays forceable (is_model_available returns True).
     if force_model:
+        forced_key = _normalize_model_name(force_model)
+        if not is_model_available(force_model) or not is_model_available(forced_key):
+            return RoutingDecision(
+                selected_model="",
+                selected_provider="",
+                reason=(
+                    f"forced model {force_model} is unavailable (rate-limited "
+                    f"or circuit-broken) — failing closed rather than "
+                    f"dispatching into an active hold"
+                ),
+                fallback_chain=[],
+                all_exhausted=True,
+            )
         return RoutingDecision(
             selected_model=force_model,
             selected_provider=_get_provider(force_model),
