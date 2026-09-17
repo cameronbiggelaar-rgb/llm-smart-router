@@ -2135,6 +2135,44 @@ def _sse_usage_tokens(data: str) -> Tuple[int, int]:
         return 0, 0
 
 
+def _sse_finish_reason(data: str) -> str:
+    """Extract the terminal ``finish_reason`` from one SSE data line.
+
+    On a streaming response the finish_reason arrives on the FINAL chunk,
+    alongside an EMPTY delta, e.g.::
+
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+
+    Because the delta is empty, a parser that only inspects ``delta.content``
+    never sees it — the same class of drop that hid token usage on the whole
+    streaming path until the writer-cleanup batch. This is the single most
+    important signal for the truncation bug class (``finish_reason == "length"``
+    means the summary ran out of output budget before finishing).
+
+    Returns ``""`` for any chunk without a finish_reason — a content delta, a
+    usage chunk (empty ``choices``), ``[DONE]``, or malformed JSON. Never
+    raises: this is diagnostic and must not break a stream.
+    """
+    if not data or data == "[DONE]":
+        return ""
+    try:
+        obj = json.loads(data)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        reason = choice.get("finish_reason")
+        if reason:
+            return str(reason)
+    return ""
+
+
 def _sse_cached_tokens(data: str) -> int:
     """Extract the cache-hit count from one SSE data line.
 
@@ -3440,6 +3478,9 @@ async def _resume_stream(
             stats["usage_input_tokens"] = _pin
             stats["usage_output_tokens"] = _pout
             stats["usage_cached_tokens"] = _sse_cached_tokens(data)
+           _reason = _sse_finish_reason(data)
+           if _reason:
+            stats["finish_reason"] = _reason
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
         # call silently drops the rest of the stream).
@@ -3462,6 +3503,9 @@ async def _resume_stream(
                             stats["usage_input_tokens"] = _uin
                             stats["usage_output_tokens"] = _uout
                             stats["usage_cached_tokens"] = _sse_cached_tokens(data)
+                        _reason = _sse_finish_reason(data)
+                        if _reason:
+                            stats["finish_reason"] = _reason
             await resp.aclose()
         # Scan once at the end of the stream. Repeatedly re-regexing the growing
         # buffer per delta is pointless latency; a single scan after stream close
@@ -4320,6 +4364,7 @@ async def chat_completions(request: Request):
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     routing_reason=decision.reason,
+                    finish_reason=_stream_stats.get("finish_reason", ""),
                     **_cost_kw,
                     **_obs,
                 )
@@ -4554,6 +4599,7 @@ async def chat_completions(request: Request):
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     final_model=_final_model,
                     routing_reason=escalation.reason,
+                    finish_reason=_stream_stats.get("finish_reason", ""),
                     **_cost_kw,
                     **_obs,
                 )
