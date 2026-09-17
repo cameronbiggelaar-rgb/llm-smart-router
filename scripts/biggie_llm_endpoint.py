@@ -189,26 +189,51 @@ _BUILD_STAMP: Dict[str, Any] = _capture_build_stamp()
 SESSION_COMPRESSION_MIN_MAX_TOKENS = int(
     os.environ.get("BIGGIE_SESSION_COMPRESSION_MIN_MAX_TOKENS", "16384")
 )
+# Scale the output floor with input size: DeepSeek's hidden reasoning trace eats
+# budget before visible summary content, so a fixed 16k floor runs out (yielding
+# finish_reason=length and a truncated/empty summary) on genuinely large inputs.
+SESSION_COMPRESSION_MAX_MAX_TOKENS = int(
+    os.environ.get("BIGGIE_SESSION_COMPRESSION_MAX_MAX_TOKENS", "32768")
+)
+SESSION_COMPRESSION_INPUT_FOR_MAX = int(
+    os.environ.get("BIGGIE_SESSION_COMPRESSION_INPUT_FOR_MAX", "300000")
+)
+
+
+def _compression_output_floor(input_tokens: int) -> int:
+    """Floor for a session-compression output budget, scaled by input size.
+
+    Linear from MIN at 0 tokens to MAX at INPUT_FOR_MAX, clamped to [MIN, MAX].
+    """
+    min_v = SESSION_COMPRESSION_MIN_MAX_TOKENS
+    max_v = SESSION_COMPRESSION_MAX_MAX_TOKENS
+    if max_v <= min_v:
+        return min_v
+    ratio = max(0.0, min(1.0, input_tokens / SESSION_COMPRESSION_INPUT_FOR_MAX))
+    return int(round(min_v + (max_v - min_v) * ratio))
 
 
 def apply_session_compression_output_floor(
-    body: Dict[str, Any], workload_type: str
+    body: Dict[str, Any], workload_type: str, input_tokens: int = 0
 ) -> bool:
     """Ensure native compactions have room to emit content after reasoning.
 
     Mutates ``body`` and returns whether the value changed. Explicit caller
-    budgets above the floor are preserved.
+    budgets above the computed floor are preserved. The floor scales with
+    ``input_tokens`` (a preflight context-token estimate) so large sessions get
+    a budget the summariser can finish under instead of truncating.
     """
     if workload_type != "session_compression":
         return False
+    floor = _compression_output_floor(input_tokens)
     current = body.get("max_tokens")
     try:
         current = int(current) if current is not None else None
     except (TypeError, ValueError):
         current = None
-    if current is not None and current >= SESSION_COMPRESSION_MIN_MAX_TOKENS:
+    if current is not None and current >= floor:
         return False
-    body["max_tokens"] = SESSION_COMPRESSION_MIN_MAX_TOKENS
+    body["max_tokens"] = floor
     return True
 
 
@@ -4140,7 +4165,9 @@ async def chat_completions(request: Request):
     # reasoning-only empty completions even at 16K context. Enforce the floor
     # after any in-request compression so both the initial upstream call and
     # escalation/fallback attempts inherit it through `body`.
-    if apply_session_compression_output_floor(body, workload_type):
+    if apply_session_compression_output_floor(
+        body, workload_type, input_tokens=int(features.get("context_tokens", 0) or 0)
+    ):
         logger.info(
             "Session compression max_tokens floor applied: %s",
             SESSION_COMPRESSION_MIN_MAX_TOKENS,
