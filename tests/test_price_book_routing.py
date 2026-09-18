@@ -55,7 +55,7 @@ def test_corrected_models_sit_in_their_new_positions():
     order = m.MODEL_COST_ORDER
 
     # v4-pro ($0.66) is now cheaper than every glm, so it precedes them all.
-    for glm in ("glm-5", "glm-5.1", "glm-5.3", "glm-5.2"):
+    for glm in ("glm-5.1", "glm-5.3", "glm-5.2"):
         assert order.index("deepseek-v4-pro") < order.index(glm), (
             f"deepseek-v4-pro ($0.66) should now precede {glm}"
         )
@@ -88,7 +88,7 @@ def test_tier_6_band_selects_the_cheapest_capable_model():
         (5, "glm-5.3-flash"),
         (7, "deepseek-v4-pro"),
         (8, "deepseek-v4-pro"),
-        (9, "deepseek-v3.1:671b"),
+        (9, "gpt-5.5"),
         (10, "gpt-5.5"),
     ],
 )

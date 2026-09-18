@@ -1639,7 +1639,6 @@ def _session_compression_ladder(context_tokens: int = 0) -> List[str]:
         "glm-5.3",
         "glm-5.2",
         "deepseek-v4-pro",
-        "deepseek-v3.1:671b",
         # The ChatGPT plan models are deliberately absent: 100K-token summaries
         # burn scarce plan capacity and triggered Plus usage caps. Use them for
         # real reasoning/debugging, not maintenance summarization. Enforced
