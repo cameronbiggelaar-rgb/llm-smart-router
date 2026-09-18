@@ -222,7 +222,7 @@ def test_log_request_to_db_defaults_are_safe(conn, monkeypatch):
     monkeypatch.setattr(ep, "_get_db_connection", lambda: conn)
     ep._ensure_log_columns(conn)
     ep._log_request_to_db(
-        model_used="deepseek-v4-flash",
+        model_used="deepseek-v4.1-flash",
         provider="ollama-cloud",
         task_type="qa",
         complexity_score=0.1,

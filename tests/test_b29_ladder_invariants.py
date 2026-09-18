@@ -79,7 +79,7 @@ def test_every_chatgpt_plan_model_is_reserved_by_provider():
 
 
 def test_non_plan_models_are_not_reserved():
-    for model in ("deepseek-v4.1-flash", "glm-5.3", "qwen3.5", "deepseek-v3.1:671b"):
+    for model in ("deepseek-v4.1-flash", "glm-5.3", "deepseek-v3.1:671b"):
         assert not router._is_reserved_from_compression(model), model
 
 
@@ -166,7 +166,7 @@ def test_validator_rejects_reserved_rung(monkeypatch):
     monkeypatch.setattr(
         router,
         "_session_compression_ladder",
-        lambda ctx=0: ["deepseek-v4-flash", "gpt-5.5"],
+        lambda ctx=0: ["deepseek-v4.1-flash", "gpt-5.5"],
     )
     with pytest.raises(AssertionError, match="reserved"):
         router._validate_curated_ladder()
@@ -176,7 +176,7 @@ def test_validator_rejects_unregistered_rung(monkeypatch):
     monkeypatch.setattr(
         router,
         "_session_compression_ladder",
-        lambda ctx=0: ["deepseek-v4-flash", "no-such-model"],
+        lambda ctx=0: ["deepseek-v4.1-flash", "no-such-model"],
     )
     with pytest.raises(AssertionError, match="unregistered"):
         router._validate_curated_ladder()

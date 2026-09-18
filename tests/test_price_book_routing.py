@@ -54,13 +54,6 @@ def test_corrected_models_sit_in_their_new_positions():
     """Pin the corrected ordering, so a price edit shows up as a routing diff."""
     order = m.MODEL_COST_ORDER
 
-    # Cheaper than glm-5.3 now, because $0.60 < $1.40.
-    assert order.index("qwen3.5") < order.index("glm-5.3"), (
-        "qwen3.5 ($0.60) should now precede glm-5.3 ($1.40)"
-    )
-    assert order.index("qwen3.5") < order.index("glm-5.2"), (
-        "qwen3.5 ($0.60) should now precede glm-5.2 ($1.40)"
-    )
     # v4-pro ($0.66) is now cheaper than every glm, so it precedes them all.
     for glm in ("glm-5", "glm-5.1", "glm-5.3", "glm-5.2"):
         assert order.index("deepseek-v4-pro") < order.index(glm), (
@@ -70,18 +63,18 @@ def test_corrected_models_sit_in_their_new_positions():
     assert order.index("minimax-m2.7:cloud") < order.index("deepseek-v4-pro")
 
 
-def test_tier_6_band_selects_the_cheaper_capable_model():
-    """The one band B18 changed: tier 6 now resolves to qwen3.5, not glm-5.3.
+def test_tier_6_band_selects_the_cheapest_capable_model():
+    """Tier 6 resolves to deepseek-v4-pro after qwen3.5's retirement.
 
-    glm-5.3 is tier 6 at $1.40; qwen3.5 is tier 7 at $0.60 — cheaper *and* more
-    capable, so it wins on both counts. Before the correction glm-5.3 was
-    $1.50 and ordered first.
+    qwen3.5 (tier 7, $0.60) used to win this band as the cheapest capable model;
+    it retired 2026-09-25, leaving deepseek-v4-pro (tier 8, $0.66) as the
+    cheapest model meeting tier >= 6.
     """
     selected = _cheapest_meeting(6, AUTO_ROUTABLE)
-    assert selected == "qwen3.5", (
-        f"tier-6 routing selected {selected}, expected qwen3.5 — the B18 "
-        "reordering changed this band; update the test only with a deliberate "
-        "pricing decision"
+    assert selected == "deepseek-v4-pro", (
+        f"tier-6 routing selected {selected}, expected deepseek-v4-pro — the "
+        "qwen3.5 retirement changed this band; update the test only with a "
+        "deliberate pricing decision"
     )
 
 
@@ -93,7 +86,7 @@ def test_tier_6_band_selects_the_cheaper_capable_model():
         (3, "deepseek-v4.1-flash"),
         (4, "glm-5.3-flash"),
         (5, "glm-5.3-flash"),
-        (7, "qwen3.5"),
+        (7, "deepseek-v4-pro"),
         (8, "deepseek-v4-pro"),
         (9, "deepseek-v3.1:671b"),
         (10, "gpt-5.5"),
@@ -107,6 +100,5 @@ def test_unaffected_bands_still_select_as_before(min_tier, expected):
 def test_price_correction_is_visible_as_a_routing_change():
     """The linkage itself: prices decide routing, so they are not bookkeeping."""
     assert "deepseek-v4-pro" in m.MODEL_COST_ORDER
-    assert "qwen3.5" in m.MODEL_COST_ORDER
-    # If price did not drive order, this ordering assertion could not hold.
-    assert m.MODEL_COST_ORDER.index("qwen3.5") != m.MODEL_COST_ORDER.index("glm-5.3")
+    # deepseek-v4-pro ($0.66) outranks the glm family ($1.00+) by price.
+    assert m.MODEL_COST_ORDER.index("deepseek-v4-pro") < m.MODEL_COST_ORDER.index("glm-5.3")

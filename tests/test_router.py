@@ -386,7 +386,7 @@ class TestModelCost:
     def test_default_costs_have_all_models(self):
         models = {mc.model for mc in DEFAULT_MODEL_COSTS}
         assert "gpt-5.5" in models
-        assert "deepseek-v4-flash" in models
+        assert "deepseek-v4.1-flash" in models
         assert "glm-5.3" in models
         assert "llama3.1:8b" in models
 
@@ -474,11 +474,11 @@ class TestRouterDB:
 
     def test_get_model_cost(self, router_db):
         conn = sqlite3.connect(router_db)
-        mc = get_model_cost("deepseek-v4-flash", conn)
+        mc = get_model_cost("deepseek-v4.1-flash", conn)
         assert mc is not None
-        assert mc.model == "deepseek-v4-flash"
-        assert mc.input_cost_per_1m == 0.22
-        assert mc.output_cost_per_1m == 0.66
+        assert mc.model == "deepseek-v4.1-flash"
+        assert mc.input_cost_per_1m == 0.15
+        assert mc.output_cost_per_1m == 0.60
 
         unknown = get_model_cost("nonexistent-model", conn)
         assert unknown is None
@@ -486,9 +486,9 @@ class TestRouterDB:
 
     def test_estimate_cost(self, router_db):
         conn = sqlite3.connect(router_db)
-        cost = estimate_cost("deepseek-v4-flash", 1_000_000, 500_000, conn)
-        # Real USD: 1M input * $0.22/1M = $0.22, 500K output * $0.66/1M = $0.33
-        assert cost == pytest.approx(0.55, rel=0.01)
+        cost = estimate_cost("deepseek-v4.1-flash", 1_000_000, 500_000, conn)
+        # Real USD: 1M input * $0.15/1M = $0.15, 500K output * $0.60/1M = $0.30
+        assert cost == pytest.approx(0.45, rel=0.01)
 
         # Unknown model = free
         cost = estimate_cost("nonexistent", 1000, 500, conn)
@@ -844,7 +844,7 @@ class TestCorrectionDetection:
 
 class TestModelFit:
     def test_simple_task_on_cheap_model(self):
-        fit = compute_model_fit("deepseek-v4-flash", 0.1, 0, True)
+        fit = compute_model_fit("deepseek-v4.1-flash", 0.1, 0, True)
         assert not fit["overkill"]
         assert not fit["underpowered"]
 
@@ -982,9 +982,8 @@ class TestOllamaToolCapableModels:
 
     def setup_method(self):
         for model in (
-            "deepseek-v4-flash",
+            "deepseek-v4.1-flash",
             "glm-5.3",
-            "qwen3.5",
             "deepseek-v4-pro",
             "deepseek-v3.1:671b",
             "gpt-5.5",
@@ -997,10 +996,6 @@ class TestOllamaToolCapableModels:
         from router import mark_rate_limited
         for m in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
             mark_rate_limited(m)
-
-    def test_flash_is_tool_capable(self):
-        from router import TOOL_CAPABLE_MODELS
-        assert "deepseek-v4-flash" in TOOL_CAPABLE_MODELS
 
     def test_glm53_is_tool_capable(self):
         from router import TOOL_CAPABLE_MODELS
@@ -1020,12 +1015,11 @@ class TestOllamaToolCapableModels:
         )
         assert decision.selected_model == "gpt-5.5"
 
-    def test_tool_routing_falls_to_glm_when_gpt55_and_flash_down(self):
-        """When gpt-5.5 AND flash are rate-limited, tool work escalates to the
+    def test_tool_routing_falls_to_next_model_when_gpt55_down(self):
+        """When gpt-5.5 is rate-limited, tool work escalates to the
         next-most-capable tool model (deepseek-v4-pro or glm-5.3)."""
         from router import mark_rate_limited
         mark_rate_limited("gpt-5.5")
-        mark_rate_limited("deepseek-v4-flash")
         decision = route_task(
             complexity_score=0.5,
             task_type="debugging",
@@ -1035,7 +1029,6 @@ class TestOllamaToolCapableModels:
         # over glm-5.3 (tier 6) as the more capable option
         assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}
         mark_available("gpt-5.5")
-        mark_available("deepseek-v4-flash")
 
     def test_tool_routing_no_longer_fails_closed_when_gpt55_capped(self):
         """With multiple tool-capable models, gpt-5.5 being capped falls to the
@@ -1048,13 +1041,13 @@ class TestOllamaToolCapableModels:
             requires_tools=True,
         )
         # deepseek-v4-pro (tier 8) is now the most capable tool model below gpt-5.5
-        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3", "deepseek-v4-flash"}
+        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}
         assert not decision.all_exhausted
         mark_available("gpt-5.5")
 
     def test_tool_fallback_chain_contains_new_models(self):
         from router import _build_tool_fallback_chain
-        chain = _build_tool_fallback_chain("deepseek-v4-flash")
+        chain = _build_tool_fallback_chain("deepseek-v4-pro")
         # glm-5.3 is now tool-capable, so it should appear in the escalation chain
         assert any("glm-5.3" in m for m in chain) or any("gpt-5.5" in m for m in chain)
 
@@ -1062,7 +1055,7 @@ class TestOllamaToolCapableModels:
         """CRITICAL: if every tool-capable model is unavailable, tool work must
         STILL fail closed — never leak to a non-tool-capable model like qwen."""
         from router import mark_rate_limited
-        for m in ("deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
+        for m in ("deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_rate_limited(m)
         decision = route_task(
             complexity_score=0.5,
@@ -1072,7 +1065,7 @@ class TestOllamaToolCapableModels:
         assert decision.selected_model == ""
         assert decision.all_exhausted
         # restore
-        for m in ("deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
+        for m in ("deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_available(m)
 
     def test_escalation_from_gpt55_falls_to_next_tool_model(self):
@@ -1087,7 +1080,7 @@ class TestOllamaToolCapableModels:
             requires_tools=True,
         )
         # deepseek-v4-pro (tier 8) is now tool-capable, so it is the next pick
-        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3", "deepseek-v4-flash"}, f"got {decision.selected_model}"
+        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}, f"got {decision.selected_model}"
 
 
 class TestCompressionSkippedForToolRequests:

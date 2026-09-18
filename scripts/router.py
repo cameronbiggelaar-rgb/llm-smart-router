@@ -120,7 +120,6 @@ TOOL_CAPABLE_MODELS = {
  "gpt-5.6-terra", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
  "gpt-5.6-sol", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
  "deepseek-v4-pro", # verified 2026-08-15: emits clean tool_calls + finish_reason (streaming + non-streaming, multi-tool)
- "deepseek-v4-flash",
  "glm-5.3",
 }
 
@@ -1637,10 +1636,8 @@ def _session_compression_ladder(context_tokens: int = 0) -> List[str]:
     # minimax/glm-5/glm-5.1 as summarisers).
     preferred = [
         "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
         "glm-5.3",
         "glm-5.2",
-        "qwen3.5",
         "deepseek-v4-pro",
         "deepseek-v3.1:671b",
         # The ChatGPT plan models are deliberately absent: 100K-token summaries

@@ -38,7 +38,6 @@ from unit_economics import Price  # noqa: E402
 VENDOR_PUBLISHED = {
     "deepseek-v4-pro": (Decimal("0.66"), Decimal("1.98")),
     "minimax-m2.7:cloud": (Decimal("0.30"), Decimal("1.20")),
-    "qwen3.5": (Decimal("0.60"), Decimal("3.60")),
     "glm-5.3": (Decimal("1.40"), Decimal("4.40")),
     "glm-5.2": (Decimal("1.40"), Decimal("4.40")),
     "glm-5.1": (Decimal("1.00"), Decimal("3.20")),
@@ -49,7 +48,6 @@ VENDOR_PUBLISHED = {
 SUPERSEDED = {
     "deepseek-v4-pro": ("2.00", "6.00", "2026-07-01"),
     "minimax-m2.7": ("1.00", "3.00", "2026-07-01"),
-    "qwen3.5": ("1.75", "5.25", "2026-08-08"),
     "glm-5.3": ("1.50", "4.50", "2026-08-26"),
     "glm-5.2": ("1.50", "4.50", "2026-09-04"),
     "glm-5.1": ("1.25", "3.75", "2026-07-01"),
