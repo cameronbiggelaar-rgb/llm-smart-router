@@ -1,6 +1,7 @@
 # Plan — Shadow head-to-head: is v4-pro a safe large-context summariser?
 
-Status: **harness built + validated; live run BLOCKED on an Ollama account credit cap.**
+Status: **RUN COMPLETE — clean data. One confound remains (prompt had no
+instruction); a single real-task confirmation run settles the collapse decision.**
 
 ## Why this exists
 
@@ -31,8 +32,7 @@ That number came from `/tmp/investigate_glm10.py`:
 * The 46 `empty_content` rows have **`saw_content=1`**.
 
 So "25% saw content" measures a Sep-14 transport incident plus a `saw_content`
-logging quirk, **not** v4-pro's ability to serve 150K+. Neither an endorsement
-nor a condemnation. The band remains genuinely unmeasured.
+logging quirk, **not** v4-pro's ability to serve 150K+.
 
 ## Correction 3 — v1 of the harness was invalid (3 defects)
 
@@ -57,50 +57,75 @@ models as "empty" at 150K. Every bit of that was harness error:
 
 Validated after fixes at 30K (cheap): v4.1-flash `finish=stop content=1480`,
 glm-5.2 `finish=stop content=1061`, plus 13,116 / 3,651 reasoning tokens.
-This is what proved defect 1 — the same two models scored "empty" under a
-256-token budget and healthy under a 16,384 budget.
 
-## The live blocker (current)
+## Run 1 (09:33) — flash + glm clean; v4-pro circuit-held
 
-`ollama-cloud` returned an explicit account-level cap:
+First live run of the corrected harness:
 
-> `usage credits auto reload monthly max reached, increase your monthly max or
-> add usage credits at https://ollama.com/settings`
+* `v4.1-flash`: 5/6 served content (1 reasoning-only at 200K); **0 empty**.
+* `glm-5.2`: 6/6 served content; **0 empty**.
+* `v4-pro`: **all 6 returned instant 503** (`all_models_exhausted`).
 
-Consequences observed (2026-09-19 ~09:19 AEST):
+The v4-pro failures were NOT model results. At 09:18:18 the circuit breaker
+opened for `deepseek-v4-pro` (1800s hold) after 3 consecutive failures — all
+caused by the earlier credit-cap 429s. Every probe inside that window got an
+instant breaker-503 while flash/glm (unheld) sailed through. Confirmed via
+`router_state.db` `model_state` (`circuit_open_until`, `consecutive_failures=3`,
+`last_error=rate_limit`). Re-ran v4-pro alone after the breaker closed at
+09:48.
 
-* All **11** ollama-cloud models held simultaneously; v4-pro held longest
-  (**240s** vs 60s for the rest) because it carries the most production load.
-* Production fell into **limp-home** (routing to the local model), self-exited
-  after 66s, then re-entered intermittently.
-* A minimal 1-token direct call still returns **HTTP 200**, so this is a
-  threshold/contention cap, not a hard block.
+## Run 2 (09:50) — v4-pro alone, breaker clear
 
-Running the 150K/200K/250K probe under this condition is counterproductive:
-probe traffic competes with production for a capped allowance, and any 503s are
-indistinguishable from model failure — the exact contamination that ruined v1.
+| size | run | result |
+|---|---|---|
+| 150K | r1 | `fin=stop content=729` (17.6s) |
+| 150K | r2 | `fin=length content=0 reason=33695` (80.3s) — reasoning runaway |
+| 200K | r1 | `fin=stop content=344` (11.6s) |
+| 200K | r2 | `fin=stop content=475` (8.6s) |
+| 250K | r1 | `fin=length content=0 reason=33458` (71.7s) — reasoning runaway |
+| 250K | r2 | `fin=stop content=333` (9.3s) |
 
-## What the run does once unblocked
+**v4-pro: 4/6 served content, 0 empty-stream, 0 errors, 0 escalated.**
 
-Three-way forced-model head-to-head at 150K / 200K / 250K:
+## Clean result — the empty-stream failure is gone
 
-* `deepseek-v4.1-flash:cloud` — incumbent workhorse ($0.15 in)
-* `glm-5.2:cloud`             — current large-context insurance ($1.40 in)
-* `deepseek-v4-pro`           — proposed replacement ($0.66 in)
+Under clean conditions (cap cleared, breaker closed, 16,384 budget), **zero
+models empty-streamed at any size**:
 
-Per run: `used_model`, `served_content`, `reasoning_only`, `empty_stream`,
-`finish`, `prompt_tokens`, `latency_s`. `X-Compression-Level: off` so the router
-cannot pre-collapse the payload.
+| model | served content | reasoning-only | empty-stream | errors |
+|---|---|---|---|---|
+| v4.1-flash | 5/6 | 1 | **0** | 0 |
+| glm-5.2 | 6/6 | 0 | **0** | 0 |
+| v4-pro | 4/6 | 2 | **0** | 0 |
 
-Estimated probe cost: ~**$3** total (18 large-context calls). Cost is not the
-blocker; the capped allowance is.
+This formally retires both prior claims: "v4-pro 25% at >=150K" (storm-day
+artifact) and "proven to 439K" (now actually evidenced: v4-pro served real
+content at 150K, 200K, 250K).
+
+## The one confound — and the one remaining question
+
+v4-pro served a usable summary 4/6 times but on **2/6** runs it emitted ~33K
+reasoning tokens and hit the output cap before writing any content
+(`finish=length`, 80s). glm-5.2 never does this; flash did once. Same *outcome*
+as empty-stream (no summary), different cause (output budget vs reasoning
+mismatch).
+
+**Confound:** the synthetic payload carries NO instruction — the models literally
+reply "I don't see a question or task." A reasoning model burning 33K tokens to
+conclude "there's no task" is plausibly an artifact of the confusing no-task
+prompt, not behaviour a real "summarise this session" call would trigger.
+
+**Remaining run (cheap, one-shot):** same 3 sizes, v4-pro + glm-5.2 (control),
+with a real *"summarise this conversation"* instruction. If v4-pro holds under a
+real task → collapse both glm rungs. If it still runs away → keep glm-5.2 as
+large-context insurance, drop only dormant glm-5.3.
 
 ## Decision rule
 
-* v4-pro holds **>=81%** served at >=150K → collapse ladder to
+* v4-pro holds a usable summary under a real instruction → collapse ladder to
   `v4.1-flash → v4-pro` (drop glm-5.3 + glm-5.2), TDD batch, sign-off, restart.
-* v4-pro falls meaningfully below glm-5.2 → **keep glm-5.2**, drop only
-  glm-5.3 (capped at 150K anyway).
+* v4-pro still runs away → **keep glm-5.2**, drop only glm-5.3 (capped at 150K
+  anyway, dormant since Sep 15).
 * Roughly parity but cheaper → prefer v4-pro on cost, but require real quality
   parity, not just cost.
 
