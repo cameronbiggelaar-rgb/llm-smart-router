@@ -57,6 +57,8 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     # much of the input was served from cache — the metric that makes the
     # recurring compaction churn visible in reports rather than only in logs.
     "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "tool_names": "TEXT NOT NULL DEFAULT ''",
+    "tool_args_sig": "TEXT NOT NULL DEFAULT ''",
     # Session attribution (B32). `session_id` existed from the beginning but was
     # never populated by the endpoint (hardcoded ""), so per-session churn could
     # not be attributed. `session_id_source` records HOW the id was obtained —

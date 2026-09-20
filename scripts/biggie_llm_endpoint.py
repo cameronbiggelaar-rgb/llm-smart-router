@@ -288,6 +288,13 @@ _COST_OBS_COLUMNS = {
     # that the provider was actually granting was unmeasurable, and every cached
     # token was billed at the full input rate in our own cost figures.
     "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
+    # Tool-choice agreement (B34). `saw_tool_calls` only says the model emitted
+    # *a* tool call — it cannot say WHICH tool, so a valid-JSON call to the
+    # wrong tool is invisible. Cutover of tool-bearing traffic is gated on
+    # agreement between incumbent and candidate, which needs the ordered names
+    # the model actually chose plus a bounded, stable signature of the args.
+    "tool_names": "TEXT NOT NULL DEFAULT ''",
+    "tool_args_sig": "TEXT NOT NULL DEFAULT ''",
     # Session attribution (B32). session_id was previously hardcoded to "" with
     # the comment "not available at endpoint level", which was false: the value
     # IS available at the call site. Without it, per-session churn analysis was
@@ -2350,6 +2357,100 @@ def _normalize_tool_call(tc: Any) -> Tuple[str, str]:
     return (name, args)
 
 
+def _tool_names_from_message(msg: Any) -> Tuple[str, str]:
+    """Return (comma_joined_names, args_signature) for a non-streaming message.
+
+    The signature is a short SHA-256 of the canonicalized (name, args) pairs so
+    two calls that chose the same tools with equivalent args agree while a wrong
+    tool or different args disagree. Bounded — we never store prompt-like data.
+    """
+    if not isinstance(msg, dict):
+        return ("", "")
+    tool_calls = msg.get("tool_calls") or []
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return ("", "")
+    names: List[str] = []
+    canon: List[str] = []
+    for tc in tool_calls:
+        name, args = _normalize_tool_call(tc)
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+        canon.append(f"{name}|{args}")
+    if not names:
+        return ("", "")
+    sig = hashlib.sha256("\x1e".join(canon).encode("utf-8")).hexdigest()[:16]
+    return (",".join(names), sig)
+
+
+def _tool_names_from_response(response: Any) -> Tuple[str, str]:
+    """Extract tool names/signature from a chat-completion response's first choice."""
+    if not isinstance(response, dict):
+        return ("", "")
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ("", "")
+    return _tool_names_from_message(choices[0].get("message"))
+
+
+def _accumulate_tool_calls(acc: Dict[int, Dict[str, str]], data: str) -> None:
+    """Fold one SSE payload's tool-call deltas into an index-keyed accumulator.
+
+    OpenAI-compatible backends stream tool calls fragmented across deltas:
+    ``delta.tool_calls[i].function.name`` (once, for index i) and
+    ``.function.arguments`` (appended across several deltas). This merges them
+    per index so the finalized form matches the non-streaming extraction.
+    """
+    if data == "[DONE]":
+        return
+    try:
+        evt = json.loads(data)
+    except (json.JSONDecodeError, AttributeError):
+        return
+    if not isinstance(evt, dict):
+        return
+    for ch in evt.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta") or {}
+        if not isinstance(delta, dict):
+            continue
+        for tc in delta.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            idx = tc.get("index", 0)
+            if not isinstance(idx, int):
+                idx = 0
+            slot = acc.setdefault(idx, {"name": "", "arguments": ""})
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict):
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
+
+
+def _finalize_tool_calls(acc: Dict[int, Dict[str, str]]) -> Tuple[str, str]:
+    """Collapse an index-keyed accumulator into (names, signature)."""
+    if not acc:
+        return ("", "")
+    names: List[str] = []
+    canon: List[str] = []
+    for idx in sorted(acc):
+        slot = acc[idx]
+        name = slot.get("name") or ""
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+        canon.append(f"{name}|{slot.get('arguments') or ''}")
+    if not names:
+        return ("", "")
+    sig = hashlib.sha256("\x1e".join(canon).encode("utf-8")).hexdigest()[:16]
+    return (",".join(names), sig)
+
+
 def _degeneration_error(response: Any) -> Optional[str]:
     """Return an error string if a chat-completion response shows degeneration.
 
@@ -4237,6 +4338,8 @@ async def chat_completions(request: Request):
         _experiments_cached(),
         workload=workload_type,
         tier=MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0),
+        requires_tools=requires_tools,
+        incumbent_model=decision.selected_model,
     )
     decision.selected_model, _exp_obs = apply_experiment(
         decision.selected_model,
