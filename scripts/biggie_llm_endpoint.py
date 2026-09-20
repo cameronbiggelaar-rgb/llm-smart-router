@@ -964,6 +964,8 @@ async def run_shadow_experiment(
     error_type = ""
     finish_reason = ""
     saw_tool_calls = False
+    _tool_names = ""
+    _tool_sig = ""
 
     async with sem:
         try:
@@ -980,6 +982,7 @@ async def run_shadow_experiment(
                 content = str(msg.get("content") or "")
                 finish_reason = str(choice.get("finish_reason") or "")
                 saw_tool_calls = bool(msg.get("tool_calls"))
+                _tool_names, _tool_sig = _tool_names_from_message(msg)
                 if not content:
                     # An empty completion is only a FAILURE when the model
                     # genuinely produced nothing. A model that answered with
@@ -1039,6 +1042,8 @@ async def run_shadow_experiment(
         "error_type": error_type,
         "finish_reason": finish_reason,
         "saw_tool_calls": saw_tool_calls,
+        "tool_names": _tool_names,
+        "tool_args_sig": _tool_sig,
         "request_id": request_id,
         "requested_model": incumbent_model,
         "streaming": False,
@@ -2675,6 +2680,8 @@ def _log_request_to_db(
     finish_reason: str = "",
     session_id: str = "",
     session_id_source: str = "",
+    tool_names: str = "",
+    tool_args_sig: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -2750,9 +2757,9 @@ def _log_request_to_db(
                 saw_tool_calls, final_model, routing_reason,
                 cost_usd, cost_unknown, quality_score, quality_method,
                 pricing_version, experiment, experiment_arm, is_shadow, finish_reason,
-                cached_tokens, session_id_source
+                cached_tokens, session_id_source, tool_names, tool_args_sig
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     session_id or "",
@@ -2791,6 +2798,8 @@ def _log_request_to_db(
                     finish_reason,
                     int(cached_tokens or 0),
                     session_id_source or "",
+                    tool_names or "",
+                    tool_args_sig or "",
                     ),
                     )
         db.commit()
@@ -3567,6 +3576,7 @@ async def _resume_stream(
         # the full context for future debugging.
         accumulated = pf.accumulated
         channel_stats = _StreamChannelStats() if trace_channels else None
+        tool_acc: Dict[int, Dict[str, str]] = {}
         for evt in pf.buffered:
          if evt.startswith("data: "):
           data = evt[6:]
@@ -3574,6 +3584,7 @@ async def _resume_stream(
           if channel_stats is not None:
            _update_stream_channel_stats(channel_stats, data)
           if stats is not None:
+           _accumulate_tool_calls(tool_acc, data)
            _pin, _pout = _sse_usage_tokens(data)
            if _pin or _pout:
             stats["usage_input_tokens"] = _pin
@@ -3599,6 +3610,7 @@ async def _resume_stream(
                      _update_stream_channel_stats(channel_stats, data)
                     accumulated += _sse_content_text(data)
                     if stats is not None:
+                        _accumulate_tool_calls(tool_acc, data)
                         _uin, _uout = _sse_usage_tokens(data)
                         if _uin or _uout:
                             stats["usage_input_tokens"] = _uin
@@ -3629,6 +3641,10 @@ async def _resume_stream(
             )
         # The response has now been fully yielded to the client, so the
         # accumulated summary can be scored without touching request latency.
+        if stats is not None and tool_acc:
+            _tn, _ts = _finalize_tool_calls(tool_acc)
+            stats["tool_names"] = _tn
+            stats["tool_args_sig"] = _ts
         if on_summary and accumulated:
             try:
                 on_summary(accumulated)
@@ -4468,6 +4484,8 @@ async def chat_completions(request: Request):
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     routing_reason=decision.reason,
                     finish_reason=_stream_stats.get("finish_reason", ""),
+                    tool_names=_stream_stats.get("tool_names", ""),
+                    tool_args_sig=_stream_stats.get("tool_args_sig", ""),
                     **_cost_kw,
                     **_obs,
                 )
@@ -4564,6 +4582,8 @@ async def chat_completions(request: Request):
                 cost_usd=_cost,
                 cost_unknown=_cost_unknown,
                 pricing_version=_pricing_version(),
+                tool_names=_tool_names_from_response(result)[0],
+                tool_args_sig=_tool_names_from_response(result)[1],
                 **_obs,
             )
         return result
@@ -4703,6 +4723,8 @@ async def chat_completions(request: Request):
                     final_model=_final_model,
                     routing_reason=escalation.reason,
                     finish_reason=_stream_stats.get("finish_reason", ""),
+                    tool_names=_stream_stats.get("tool_names", ""),
+                    tool_args_sig=_stream_stats.get("tool_args_sig", ""),
                     **_cost_kw,
                     **_obs,
                 )
@@ -4779,6 +4801,8 @@ async def chat_completions(request: Request):
                 routing_reason=escalation.reason,
                 session_id=session_id,
                 session_id_source=session_id_source,
+                tool_names=_tool_names_from_response(result)[0],
+                tool_args_sig=_tool_names_from_response(result)[1],
             )
         return result
 
