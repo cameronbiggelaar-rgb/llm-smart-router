@@ -907,6 +907,139 @@ def _shadow_default_row(row: Dict[str, Any]) -> None:
         logger.warning("Shadow: failed to log observation: %s", e)
 
 
+async def _shadow_stream_call(
+    backend: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Stream a shadow candidate and fold the SSE stream into a completion dict.
+
+    Mirrors the OpenAI-compatible streaming path (``_preflight_openai_stream``)
+    but consumes the FULL stream instead of stopping at first content, because a
+    shadow arm has no client to forward to — its job is measurement. The return
+    shape matches ``proxy_to_backend``'s non-streaming return so the existing
+    row-building code in ``run_shadow_experiment`` is unchanged::
+
+        {"choices": [{"message": {"content", "tool_calls"}, "finish_reason"}],
+         "usage": {"prompt_tokens", "completion_tokens", "cached_tokens"}}
+
+    Streaming is the only way the candidate's prompt cache is exercised: a
+    non-streaming call reports 0 cached tokens, so its cost is computed at the
+    full input rate and the "is flash cheaper?" question is answered with
+    fiction. This helper lets the candidate hit the cache and returns the real
+    cached_tokens for ``compute_cost_fields``.
+    """
+    base_url = backend.get("base_url", "")
+    api_key = backend.get("api_key", "")
+    backend_model = backend.get("backend_model", "")
+    provider = backend.get("provider", "")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    out: Dict[str, Any] = {
+        "model": backend_model,
+        "messages": messages,
+        "stream": True,
+    }
+    for param in ("temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"):
+        if param in body:
+            out[param] = body[param]
+
+    # Ask for usage (the final chunk with empty choices) so output tokens AND
+    # cached tokens are recorded — without it a streamed shadow is cost-blind.
+    if provider in STREAM_USAGE_CAPABLE_PROVIDERS:
+        _opts = dict(body.get("stream_options") or {})
+        _opts.setdefault("include_usage", True)
+        out["stream_options"] = _opts
+    elif "stream_options" in body:
+        out["stream_options"] = body["stream_options"]
+
+    if body.get("tools"):
+        out["tools"] = body["tools"]
+    if body.get("tool_choice"):
+        out["tool_choice"] = body["tool_choice"]
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    client = _get_httpx_client()
+    req = client.build_request("POST", url, json=out, headers=headers)
+    resp = await client.send(req, stream=True)
+    if resp.status_code != 200:
+        try:
+            error_text = (await resp.aread()).decode(errors="replace")
+        except Exception:
+            error_text = ""
+        await resp.aclose()
+        _handle_backend_status(
+            provider, backend_model, resp.status_code,
+            error_text=error_text, headers=resp.headers,
+        )
+        raise HTTPException(status_code=502, detail=f"Backend error: {error_text[:500]}")
+
+    content_parts: List[str] = []
+    tool_acc: Dict[int, Dict[str, str]] = {}
+    finish_reason = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
+    saw_tool_calls = False
+
+    try:
+        async for line in resp.aiter_lines():
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            content_parts.append(_sse_content_text(data))
+            _accumulate_tool_calls(tool_acc, data)
+            if tool_acc:
+                saw_tool_calls = True
+            _pin, _pout = _sse_usage_tokens(data)
+            if _pin or _pout:
+                prompt_tokens = _pin
+                completion_tokens = _pout
+            _cached = _sse_cached_tokens(data)
+            if _cached:
+                cached_tokens = _cached
+            _reason = _sse_finish_reason(data)
+            if _reason:
+                finish_reason = _reason
+    finally:
+        await resp.aclose()
+
+    names, sig = _finalize_tool_calls(tool_acc)
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+    }
+    if names:
+        # Reconstruct the tool_calls list in the non-streaming shape so the
+        # existing row-builder (which reads msg.get("tool_calls")) sees them.
+        message["tool_calls"] = [
+            {"id": f"call_{i}", "type": "function",
+             "function": {"name": slot["name"], "arguments": slot.get("arguments", "")}}
+            for i, (idx, slot) in enumerate(sorted(tool_acc.items()))
+        ]
+
+    return {
+        "id": "",
+        "object": "chat.completion",
+        "model": backend_model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason or "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+        },
+    }
+
+
 async def run_shadow_experiment(
     experiment: Any,
     backend: Optional[Dict[str, Any]] = None,
@@ -948,18 +1081,25 @@ async def run_shadow_experiment(
             return
 
     candidate_model = experiment.model
+    stream_shadow = bool(getattr(experiment, "stream", False))
     body = dict(request_body or {})
-    # Force a non-streaming call: we discard the output, and an unconsumed
-    # stream would hold the connection until timeout.
-    body["stream"] = False
-    body.pop("stream_options", None)
+    if stream_shadow:
+        # Streaming arm: leave the request streaming so the candidate hits the
+        # prompt cache. The full stream IS consumed by _shadow_stream_call, so
+        # nothing hangs and the measured cached_tokens/cost are real.
+        body["stream"] = True
+    else:
+        # Force a non-streaming call: we discard the output, and an unconsumed
+        # stream would hold the connection until timeout.
+        body["stream"] = False
+        body.pop("stream_options", None)
     if messages is not None:
         body["messages"] = messages
 
     sem = _get_shadow_semaphore()
     t0 = time.time()
     content = ""
-    in_tok = out_tok = 0
+    in_tok = out_tok = cached_tok = 0
     success = True
     error_type = ""
     finish_reason = ""
@@ -969,14 +1109,19 @@ async def run_shadow_experiment(
 
     async with sem:
         try:
+            if stream_shadow:
+                _call = _shadow_stream_call(backend, list(messages or []), body)
+            else:
+                _call = proxy_to_backend(backend, list(messages or []), body)
             result = await asyncio.wait_for(
-                proxy_to_backend(backend, list(messages or []), body),
+                _call,
                 timeout=_SHADOW_TIMEOUT_SECONDS,
             )
             try:
                 usage = (result or {}).get("usage", {}) or {}
                 in_tok = int(usage.get("prompt_tokens") or 0)
                 out_tok = int(usage.get("completion_tokens") or 0)
+                cached_tok = int(usage.get("cached_tokens") or 0)
                 choice = (((result or {}).get("choices") or [{}])[0] or {})
                 msg = choice.get("message") or {}
                 content = str(msg.get("content") or "")
@@ -1026,7 +1171,9 @@ async def run_shadow_experiment(
         except Exception as e:                              # pragma: no cover
             logger.debug("Shadow: quality scoring failed: %s", e)
 
-    cost_usd, cost_unknown = compute_cost_fields(candidate_model, in_tok, out_tok, conn=conn)
+    cost_usd, cost_unknown = compute_cost_fields(
+        candidate_model, in_tok, out_tok, conn=conn, cached_input_tokens=cached_tok
+    )
 
     row: Dict[str, Any] = {
         "model_used": candidate_model,
@@ -1046,7 +1193,8 @@ async def run_shadow_experiment(
         "tool_args_sig": _tool_sig,
         "request_id": request_id,
         "requested_model": incumbent_model,
-        "streaming": False,
+        "streaming": stream_shadow,
+        "cached_tokens": cached_tok,
         # The candidate runs the SAME workload as the incumbent, so its row
         # lands in the same bucket and can be compared against it. Shadow
         # rows are separated by is_shadow, not by a synthetic workload name.

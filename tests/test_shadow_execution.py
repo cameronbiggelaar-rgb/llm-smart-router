@@ -533,3 +533,183 @@ def test_migrated_db_accepts_the_endpoints_insert(conn, monkeypatch):
     )
     written = conn.execute("SELECT COUNT(*) FROM router_logs WHERE is_shadow = 1").fetchone()[0]
     assert written == 1, "the endpoint could not write a row into a migrated DB"
+
+
+# ── streaming shadow arm (B35) ────────────────────────────────────────────────
+#
+# A non-streaming shadow call suppresses the provider's prompt cache, so the
+# candidate reports 0 cached tokens and its cost is computed at the FULL input
+# rate. That inverts the whole point of shadowing-for-cost: pro logs ~94% cache
+# hits and costs $0.0072/req, while the non-streamed flash shadow logs 0 cached
+# and costs $0.0121/req — flash looks MORE expensive than pro purely because the
+# shadow disabled caching. An opt-in `stream: true` experiment arm must let the
+# candidate stream (with include_usage) so its cached_tokens are real and its
+# cost lands at the discounted cached rate.
+
+
+class _FakeStreamResp:
+    """Minimal httpx streaming response carrying SSE lines."""
+
+    def __init__(self, lines):
+        self._lines = lines
+        self.status_code = 200
+        self.headers = {}
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aclose(self):
+        pass
+
+
+class _CapturingStreamClient:
+    """Captures the request body the streaming shadow sends upstream."""
+
+    def __init__(self, lines):
+        self.captured = {}
+        self._resp = _FakeStreamResp(lines)
+
+    def build_request(self, method, url, json=None, headers=None):
+        self.captured["json"] = json
+        self.captured["url"] = url
+        self.captured["headers"] = headers
+        return {"method": method, "url": url}
+
+    async def send(self, req, stream=False):
+        return self._resp
+
+
+def _stream_lines(usage_cached=6000):
+    """Build an SSE stream: content + tool_call + final usage chunk."""
+    return [
+        'data: {"choices":[{"delta":{"role":"assistant","content":"sum"}}]}',
+        'data: {"choices":[{"delta":{"content":"mary"}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{\\"path\\":\\"a"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"}"}}]}}]}',
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":%d}}}' % usage_cached,
+        "data: [DONE]",
+    ]
+
+
+def test_stream_shadow_calls_with_stream_and_usage(monkeypatch):
+    """A stream:true shadow must stream the candidate and ask for usage, or the
+    cached-token evidence stays missing and the cost is fictional."""
+    client = _CapturingStreamClient(_stream_lines())
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: client)
+    rows = []
+    asyncio.run(
+        ep.run_shadow_experiment(
+            _exp(stream=True, model="deepseek-v4.1-flash"),
+            backend={"provider": "ollama-cloud", "base_url": "http://x", "backend_model": "deepseek-v4.1-flash"},
+            messages=[{"role": "user", "content": "read this file"}],
+            request_body={"stream": True, "tools": [{"type": "function", "function": {"name": "read_file"}}]},
+            request_id="r",
+            session_id="s",
+            incumbent_model="deepseek-v4-pro",
+            on_row=rows.append,
+        )
+    )
+    sent = client.captured["json"]
+    assert sent["stream"] is True, "stream:true shadow must request a stream"
+    assert sent.get("stream_options", {}).get("include_usage") is True
+    assert rows and rows[0]["streaming"] is True
+
+
+def test_stream_shadow_records_cached_tokens(monkeypatch, conn):
+    """The whole point: a streamed shadow must record real cached_tokens, not 0."""
+    client = _CapturingStreamClient(_stream_lines(usage_cached=6000))
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: client)
+    rows = []
+    asyncio.run(
+        ep.run_shadow_experiment(
+            _exp(stream=True, model="deepseek-v4.1-flash"),
+            backend={"provider": "ollama-cloud", "base_url": "http://x", "backend_model": "deepseek-v4.1-flash"},
+            messages=[{"role": "user", "content": "read this file"}],
+            request_body={"stream": True},
+            request_id="r",
+            session_id="s",
+            incumbent_model="deepseek-v4-pro",
+            on_row=rows.append,
+            conn=conn,
+        )
+    )
+    assert rows[0]["cached_tokens"] == 6000
+
+
+def test_stream_shadow_prices_at_cached_rate(monkeypatch, conn):
+    """The cost must apply the cached-input discount, else a streamed shadow is
+    as misleading as the non-streamed one."""
+    client = _CapturingStreamClient(_stream_lines(usage_cached=6000))
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: client)
+    rows = []
+    asyncio.run(
+        ep.run_shadow_experiment(
+            _exp(stream=True, model="deepseek-v4.1-flash"),
+            backend={"provider": "ollama-cloud", "base_url": "http://x", "backend_model": "deepseek-v4.1-flash"},
+            messages=[{"role": "user", "content": "read this file"}],
+            request_body={"stream": True},
+            request_id="r",
+            session_id="s",
+            incumbent_model="deepseek-v4-pro",
+            on_row=rows.append,
+            conn=conn,
+        )
+    )
+    # deepseek-v4.1-flash: $0.15/1M in, $0.003/1M cached, $0.60/1M out.
+    # uncached 4000 in, cached 6000 in, 50 out.
+    expected = (4000 / 1e6) * 0.15 + (6000 / 1e6) * 0.003 + (50 / 1e6) * 0.60
+    assert rows[0]["cost_usd"] == pytest.approx(expected, abs=1e-6)
+    assert rows[0]["cost_unknown"] == 0
+
+
+def test_stream_shadow_captures_tool_names(monkeypatch):
+    """A streamed shadow must reconstruct the tool-call choice, else it cannot be
+    compared against the incumbent for the cutover decision."""
+    client = _CapturingStreamClient(_stream_lines())
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: client)
+    rows = []
+    asyncio.run(
+        ep.run_shadow_experiment(
+            _exp(stream=True, model="deepseek-v4.1-flash"),
+            backend={"provider": "ollama-cloud", "base_url": "http://x", "backend_model": "deepseek-v4.1-flash"},
+            messages=[{"role": "user", "content": "read this file"}],
+            request_body={"stream": True},
+            request_id="r",
+            session_id="s",
+            incumbent_model="deepseek-v4-pro",
+            on_row=rows.append,
+        )
+    )
+    assert rows[0]["tool_names"] == "read_file"
+    assert rows[0]["saw_tool_calls"] is True
+
+
+def test_non_stream_shadow_still_forced_non_streaming(monkeypatch):
+    """The default (stream=False) must keep the historical non-streaming
+    behaviour — no regression to the existing arm."""
+    client = _CapturingStreamClient(_stream_lines())
+    monkeypatch.setattr(ep, "_get_httpx_client", lambda: client)
+    seen = {}
+
+    async def fake_proxy(backend, messages, body):
+        seen["stream"] = body.get("stream")
+        return {"choices": [{"message": {"content": "x"}}], "usage": {}}
+
+    monkeypatch.setattr(ep, "proxy_to_backend", fake_proxy)
+    rows = []
+    asyncio.run(
+        ep.run_shadow_experiment(
+            _exp(stream=False),
+            backend={"provider": "p", "base_url": "u", "backend_model": "m"},
+            messages=[{"role": "user", "content": "hi"}],
+            request_body={"stream": True},
+            request_id="r",
+            session_id="s",
+            incumbent_model="m",
+            on_row=rows.append,
+        )
+    )
+    assert seen["stream"] is False
+    assert rows[0]["streaming"] is False
