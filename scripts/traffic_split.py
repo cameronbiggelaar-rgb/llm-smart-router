@@ -61,6 +61,14 @@ class Experiment:
     percent: float = 0.0
     match_workload: Tuple[str, ...] = ()
     match_min_tier: int = 0
+    # Optional fine-grained scoping. When match_requires_tools is True the
+    # experiment only fires on tool-bearing requests (requires_tools=True).
+    # match_incumbent_model (when non-empty) restricts it further to requests
+    # whose routed incumbent is exactly that model — so a tool-bearing
+    # normal_chat shadow can observe one model without firing on all of
+    # normal_chat. Empty/False means "any", preserving existing behaviour.
+    match_requires_tools: bool = False
+    match_incumbent_model: str = ""
     started: str = ""
     notes: str = ""
     # Optional provider for the candidate. A model under test is usually NOT in
@@ -69,6 +77,12 @@ class Experiment:
     # shadow exists to avoid. When set, shadow resolves the candidate through
     # this provider instead of the routing backends.
     provider: str = ""
+    # Opt-in streaming shadow. A non-streaming shadow call suppresses the
+    # provider's prompt cache (the candidate reports 0 cached tokens), which
+    # inverts the cost evidence — the whole point of shadowing for cost. When
+    # True, the shadow candidate is called with stream=True + include_usage so
+    # its measured cached_tokens (and thus true streamed cost) are recorded.
+    stream: bool = False
 
     @property
     def is_shadow(self) -> bool:
@@ -110,6 +124,9 @@ def build_experiment(raw: Dict[str, Any]) -> Optional[Experiment]:
         min_tier = int(match.get("min_tier") or 0)
     except (TypeError, ValueError):
         min_tier = 0
+    requires_tools = bool(match.get("requires_tools", False))
+    incumbent_model = str(match.get("incumbent_model") or "").strip()
+    stream = bool(raw.get("stream", False))
 
     return Experiment(
         name=name,
@@ -119,9 +136,12 @@ def build_experiment(raw: Dict[str, Any]) -> Optional[Experiment]:
         percent=percent,
         match_workload=workload,
         match_min_tier=min_tier,
+        match_requires_tools=requires_tools,
+        match_incumbent_model=incumbent_model,
         started=str(raw.get("started") or ""),
         notes=str(raw.get("notes") or ""),
         provider=str(raw.get("provider") or "").strip(),
+        stream=stream,
     )
 
 
@@ -146,12 +166,22 @@ def load_experiments(path: Optional[str] = None) -> List[Experiment]:
         return []
 
 
-def _matches(exp: Experiment, workload: str, tier: int) -> bool:
+def _matches(
+    exp: Experiment,
+    workload: str,
+    tier: int,
+    requires_tools: bool = False,
+    incumbent_model: str = "",
+) -> bool:
     if not exp.enabled:
         return False
     if exp.match_workload and workload not in exp.match_workload:
         return False
     if exp.match_min_tier and tier and tier < exp.match_min_tier:
+        return False
+    if exp.match_requires_tools and not requires_tools:
+        return False
+    if exp.match_incumbent_model and incumbent_model != exp.match_incumbent_model:
         return False
     return True
 
@@ -160,10 +190,12 @@ def pick_experiment(
     experiments: Sequence[Experiment],
     workload: str,
     tier: int = 0,
+    requires_tools: bool = False,
+    incumbent_model: str = "",
 ) -> Optional[Experiment]:
-    """Return the first enabled experiment matching this workload/tier."""
+    """Return the first enabled experiment matching this workload/tier/tools/incumbent."""
     for exp in experiments:
-        if _matches(exp, workload, tier):
+        if _matches(exp, workload, tier, requires_tools, incumbent_model):
             return exp
     return None
 
@@ -228,15 +260,24 @@ def experiment_to_row(exp: Experiment) -> Dict[str, Any]:
     """Flatten an Experiment for insertion into the ``experiments`` table."""
     import json
 
+    match = {
+        "workload": list(exp.match_workload),
+        "min_tier": exp.match_min_tier,
+        "requires_tools": exp.match_requires_tools,
+        "incumbent_model": exp.match_incumbent_model,
+    }
+    # Only serialise stream when it is set — the default (non-streaming) keeps
+    # match_json free of the key so old readers see a clean shape.
+    if exp.stream:
+        match["stream"] = True
+
     return {
         "name": exp.name,
         "enabled": 1 if exp.enabled else 0,
         "model": exp.model,
         "mode": exp.mode,
         "percent": exp.percent,
-        "match_json": json.dumps(
-            {"workload": list(exp.match_workload), "min_tier": exp.match_min_tier}
-        ),
+        "match_json": json.dumps(match),
         "started": exp.started,
         "notes": exp.notes,
     }

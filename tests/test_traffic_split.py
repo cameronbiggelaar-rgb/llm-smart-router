@@ -204,3 +204,50 @@ def test_build_experiment_from_dict():
 def test_build_experiment_requires_name_and_model():
     assert build_experiment({"mode": "split"}) is None
     assert build_experiment({"name": "only-name"}) is None
+
+
+# ── streaming shadow flag ─────────────────────────────────────────────────────
+
+def test_experiment_stream_defaults_false():
+    """Non-streaming shadow is the historical default; the flag is opt-in."""
+    e = build_experiment({"name": "n", "model": "m", "mode": "shadow"})
+    assert e.stream is False
+
+
+def test_experiment_stream_parsed_from_yaml():
+    e = build_experiment(
+        {"name": "n", "model": "m", "mode": "shadow", "stream": True}
+    )
+    assert e.stream is True
+
+
+def test_experiment_stream_false_literal_parsed():
+    e = build_experiment(
+        {"name": "n", "model": "m", "mode": "shadow", "stream": False}
+    )
+    assert e.stream is False
+
+
+def test_experiment_stream_serialised_in_match_json():
+    """The stream flag must survive the DB mirror so a run is auditable."""
+    from traffic_split import experiment_to_row
+
+    e = Experiment(name="n", enabled=True, model="m", mode="shadow", stream=True)
+    row = experiment_to_row(e)
+    import json
+
+    match = json.loads(row["match_json"])
+    assert match["stream"] is True
+
+
+def test_experiment_stream_absent_in_match_json_when_false():
+    """Default (non-stream) keeps match_json free of the key so old readers
+    see a clean shape."""
+    from traffic_split import experiment_to_row
+
+    e = Experiment(name="n", enabled=True, model="m", mode="shadow", stream=False)
+    row = experiment_to_row(e)
+    import json
+
+    match = json.loads(row["match_json"])
+    assert "stream" not in match
