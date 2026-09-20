@@ -22,6 +22,8 @@
 #   percent          0-100, honoured for `split`; ignored for `shadow`
 #   match.workload   workload_type values to match ([] = all)
 #   match.min_tier   only apply when the routed tier is at least this
+#   match.requires_tools   true → only tool-bearing requests (requires_tools=1)
+#   match.incumbent_model  non-empty → only requests whose routed model is this
 #
 # NOTE: the candidate must be registered in MODEL_REGISTRY and reachable via a
 # configured backend. An experiment naming an unknown model is skipped, never
@@ -57,6 +59,47 @@ experiments:
     percent: 10
     match:
       workload: [session_compression]
-    notes: >
+    notes: >-
       Serve 10% of session compression from glm-5.3-flash. Requires shadow
       evidence and explicit approval before enabling.
+
+  # Observe deepseek-v4.1-flash on real tool-bearing payloads currently routed
+  # to deepseek-v4-pro. The probe (probe_tool_calling_ollama.py) measured
+  # 100% structured tool-calling with valid JSON args and clean finish_reason
+  # for flash, so shadow gives real-load confirmation before ANY tool traffic
+  # is moved off pro. Keep disabled until shadow evidence is reviewed.
+  - name: v41flash-tool-shadow
+    enabled: false
+    model: deepseek-v4.1-flash
+    provider: ollama-cloud
+    mode: shadow
+    match:
+      workload: [normal_chat]
+      requires_tools: true
+      incumbent_model: deepseek-v4-pro
+    notes: >-
+      Shadow deepseek-v4.1-flash on tool-bearing normal_chat that would be
+      served by deepseek-v4-pro. Output discarded; no traffic moves until a
+      split experiment is separately enabled.
+
+  # Streaming twin of v41flash-tool-shadow (B35). The non-streamed arm forces
+  # stream=False, which suppresses the provider's prompt cache: flash logs 0
+  # cached tokens on every call, so its measured cost is the FULL input rate
+  # and it looks MORE expensive than pro (which is ~94% cache hits when
+  # streamed). This arm streams the candidate so it hits the prompt cache, and
+  # records real cached_tokens + a cost at the discounted cached rate. It also
+  # re-tests whether flash's tool choice improves when streamed.
+  - name: v41flash-tool-shadow-streaming
+    enabled: false
+    model: deepseek-v4.1-flash
+    provider: ollama-cloud
+    mode: shadow
+    stream: true
+    match:
+      workload: [normal_chat]
+      requires_tools: true
+      incumbent_model: deepseek-v4-pro
+    notes: >-
+      Streaming shadow of deepseek-v4.1-flash on tool-bearing normal_chat
+      served by deepseek-v4-pro. Measures true streamed cached_tokens and
+      cached-rate cost; output discarded; no traffic moves.
