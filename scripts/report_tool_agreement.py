@@ -186,6 +186,8 @@ def main() -> int:
           f"({rate*100:.1f}% of scorable)" if rate is not None else "tool set agreement: n/a")
     if arg_rate is not None:
         print(f"arg-signature agreement: {score['arg_agreement']} ({arg_rate*100:.1f}%)")
+        print("  (strict equality — expect near 0% across different models; it is a")
+        print("   degeneration detector, NOT a cutover gate. Tool-SET agreement is.)")
     print(f"shadow empty-content:    {score['shadow_empty_content']} "
           f"({empty*100:.1f}%)" if empty is not None else "shadow empty-content: n/a")
     print(f"shadow error/other:      {score['shadow_errors']}")
