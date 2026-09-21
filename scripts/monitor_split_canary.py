@@ -11,7 +11,8 @@ Signals (each compared against the control arm in the same window):
   * hard-failure rate — error_type present (malformed/empty/degeneration/error)
   * cost per completed request — the whole point of the canary
 
-Exit 0 = report produced. Exit 1 = no canary rows in window (send nothing).
+Exit 0 = report produced (or no canary rows yet, empty stdout for the
+cron watchdog). Exit 2 = cannot open DB.
 
 Usage:
   python3 monitor_split_canary.py            # human report
@@ -138,8 +139,9 @@ def main() -> int:
     stats = _collect(conn, args.since)
 
     if stats["treatment"]["requests"] + stats["control"]["requests"] == 0:
-        print("no canary rows in window — canary may not be live yet", file=sys.stderr)
-        return 1
+        # Watchdog contract: nothing to report -> exit 0 with empty stdout.
+        # (A non-zero exit would raise an error alert on every quiet tick.)
+        return 0
 
     if args.json:
         print(json.dumps(stats, indent=2))
