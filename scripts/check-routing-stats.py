@@ -215,6 +215,49 @@ def main():
     except Exception:
         pass
 
+    # ── Split canary (v41flash-tool-canary) ────────────────────────────────
+    # Served split: a slice of tool-bearing normal_chat goes to flash
+    # (treatment) instead of pro (control). Summarise volume + escalation +
+    # hard-failure + cost per completed task for both arms, so the nightly
+    # digest can catch a regression the hourly watchdog might miss.
+    canary_stats = None
+    try:
+        cconn = sqlite3.connect(ROUTER_LOGS)
+        cconn.row_factory = sqlite3.Row
+
+        def _arm(arm):
+            r = cconn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       COALESCE(SUM(escalated), 0) AS esc,
+                       COALESCE(SUM(CASE WHEN error_type != '' THEN 1 ELSE 0 END), 0) AS hard_fail,
+                       COALESCE(SUM(cost_usd), 0.0) AS cost,
+                       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS ok
+                FROM router_logs
+                WHERE experiment = 'v41flash-tool-canary'
+                  AND experiment_arm = ?
+                  AND is_shadow = 0
+                  AND timestamp >= ?
+                """,
+                (arm, period_start_iso),
+            ).fetchone()
+            n = r["n"] or 0
+            ok = r["ok"] or 0
+            return {
+                "requests": n,
+                "escalated": r["esc"] or 0,
+                "hard_failures": r["hard_fail"] or 0,
+                "cost_usd": r["cost"] or 0.0,
+                "completed": ok,
+            }
+
+        cstats = {"treatment": _arm("treatment"), "control": _arm("control")}
+        cconn.close()
+        if cstats["treatment"]["requests"] + cstats["control"]["requests"] > 0:
+            canary_stats = cstats
+    except Exception:
+        pass
+
     # Keep the legacy name for the existing report section, but now it is scoped
     # to endpoint-observed completion/failure rows since the switch.
     task_types = router_task_types
@@ -275,6 +318,15 @@ def main():
             "task_types": task_types,
             "corrections": corrections,
             "routing_misses": routing_misses,
+            "split_canary": (
+                {
+                    "experiment": "v41flash-tool-canary",
+                    "treatment": canary_stats["treatment"],
+                    "control": canary_stats["control"],
+                }
+                if canary_stats
+                else None
+            ),
             "completion": {
                 "success": completion_success,
                 "failures": completion_failures,
@@ -345,6 +397,34 @@ def main():
             }[lane]
             print(f" {label:28s} {count:6d}")
         print()
+
+        # ── Split canary (v41flash-tool-canary) ────────────────────────────
+        if canary_stats:
+            t = canary_stats["treatment"]
+            c = canary_stats["control"]
+            total = t["requests"] + c["requests"]
+
+            def _pct(a, b):
+                return f"{a/b*100:.1f}%" if b else "n/a"
+
+            def _usd(v, ok):
+                return f"${v/ok:.4f}" if ok else "n/a"
+
+            print(" Split Canary — v41flash-tool-canary (flash vs pro) ")
+            print(f"  requests: {total}  treatment(flash)={t['requests']} "
+                  f"control(pro)={c['requests']}  (share {_pct(t['requests'], total)})")
+            print(f"  escalation rate:  flash {_pct(t['escalated'], t['requests'])}  "
+                  f"(pro {_pct(c['escalated'], c['requests'])})")
+            print(f"  hard-failure rate:flash {_pct(t['hard_failures'], t['requests'])}  "
+                  f"(pro {_pct(c['hard_failures'], c['requests'])})")
+            print(f"  cost/completed:   flash {_usd(t['cost_usd'], t['completed'])}  "
+                  f"(pro {_usd(c['cost_usd'], c['completed'])})")
+            if t["requests"] >= 30 and (
+                t["escalated"] / t["requests"] > 0.10
+                or t["hard_failures"] / t["requests"] > 0.05
+            ):
+                print("  ⚠ flash regression signals — consider rolling back the canary")
+            print()
 
     # ── Compute savings ────────────────────────────────────────────────────
     print(f"  ── Compute Savings ──")
