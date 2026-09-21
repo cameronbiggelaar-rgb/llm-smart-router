@@ -167,6 +167,46 @@ def test_experiment_hook_is_deterministic_per_request_id(conn):
     assert a == b
 
 
+def test_experiment_hook_honours_tool_and_incumbent_and_task_match(conn):
+    """The re-check inside apply_experiment must forward the full match context.
+
+    A split canary scoped to requires_tools + a specific incumbent + task-type
+    exclusions must not be silently rejected by the second match check, which
+    historically only forwarded workload/tier and defaulted requires_tools=False.
+    """
+    e = _exp(
+        match_workload=("normal_chat",),
+        match_requires_tools=True,
+        match_incumbent_model="deepseek-v4-pro",
+        match_exclude_task_type=("debugging", "coding", "testing"),
+        fallback_model="deepseek-v4-pro",
+    )
+    served, obs = ep.apply_experiment(
+        "deepseek-v4-pro", e, workload_type="normal_chat", request_id="r1",
+        requires_tools=True, incumbent_model="deepseek-v4-pro", task_type="planning",
+    )
+    assert served == "candidate"
+    assert obs["experiment_arm"] == "treatment"
+
+
+def test_experiment_hook_task_exclusion_is_enforced(conn):
+    """Excluded task types must stay on the incumbent even when everything else
+    matches, so debugging/coding/testing never leave pro during the canary."""
+    e = _exp(
+        match_workload=("normal_chat",),
+        match_requires_tools=True,
+        match_incumbent_model="deepseek-v4-pro",
+        match_exclude_task_type=("debugging", "coding", "testing"),
+        fallback_model="deepseek-v4-pro",
+    )
+    served, obs = ep.apply_experiment(
+        "deepseek-v4-pro", e, workload_type="normal_chat", request_id="r1",
+        requires_tools=True, incumbent_model="deepseek-v4-pro", task_type="debugging",
+    )
+    assert served == "deepseek-v4-pro"
+    assert obs["experiment_arm"] == ""
+
+
 # ── logging persists the new fields ───────────────────────────────────────────
 
 def test_log_request_to_db_persists_cost_and_quality(conn, monkeypatch):

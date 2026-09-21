@@ -722,6 +722,9 @@ def apply_experiment(
     request_id: str = "",
     session_id: str = "",
     tier: int = 0,
+    requires_tools: bool = False,
+    incumbent_model: str = "",
+    task_type: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     """Decide whether an experiment changes who serves this request.
 
@@ -741,7 +744,14 @@ def apply_experiment(
     if experiment is None or not experiment.enabled:
         return selected_model, obs
 
-    if workload_type and not _experiment_matches(experiment, workload_type, tier):
+    if workload_type and not _experiment_matches(
+        experiment,
+        workload_type,
+        tier,
+        requires_tools=requires_tools,
+        incumbent_model=incumbent_model,
+        task_type=task_type,
+    ):
         return selected_model, obs
 
     arm = _select_arm(experiment, request_id=request_id, session_id=session_id)
@@ -1223,11 +1233,25 @@ async def run_shadow_experiment(
     return None
 
 
-def _experiment_matches(experiment: Experiment, workload_type: str, tier: int = 0) -> bool:
+def _experiment_matches(
+    experiment: Experiment,
+    workload_type: str,
+    tier: int = 0,
+    requires_tools: bool = False,
+    incumbent_model: str = "",
+    task_type: str = "",
+) -> bool:
     """Re-exported match check so the endpoint and traffic_split agree."""
     from traffic_split import pick_experiment
 
-    picked = pick_experiment([experiment], workload=workload_type, tier=tier)
+    picked = pick_experiment(
+        [experiment],
+        workload=workload_type,
+        tier=tier,
+        requires_tools=requires_tools,
+        incumbent_model=incumbent_model,
+        task_type=task_type,
+    )
     return picked is not None
 
 
@@ -4511,6 +4535,9 @@ async def chat_completions(request: Request):
         _experiment,
         workload_type=workload_type,
         request_id=request_id,
+        requires_tools=requires_tools,
+        incumbent_model=decision.selected_model,
+        task_type=routed_task_type,
     )
     _obs.update({k: v for k, v in _exp_obs.items() if k != "shadow_model"})
     if _exp_obs.get("experiment_arm") == "treatment":
