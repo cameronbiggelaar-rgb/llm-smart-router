@@ -115,7 +115,7 @@ experiments:
   # Keep DISABLED until go/no-go is explicit. Flip enabled:true (hot-reloaded)
   # to start; flip back to roll back — no code revert needed.
   - name: v41flash-tool-canary
-    enabled: false
+    enabled: true
     model: deepseek-v4.1-flash:cloud
     provider: ollama-cloud
     mode: split
