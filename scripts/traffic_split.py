@@ -69,6 +69,13 @@ class Experiment:
     # normal_chat. Empty/False means "any", preserving existing behaviour.
     match_requires_tools: bool = False
     match_incumbent_model: str = ""
+    # Optional fine-grained scoping for served splits. When non-empty, a request
+    # whose classified task_type is in this set is excluded from the experiment —
+    # used to keep high-risk task types (debugging/coding/testing) off a cheap
+    # candidate during a canary. fallback_model is the model a treatment-arm miss
+    # must escalate to (e.g. pro) rather than the default highest-tier pick.
+    match_exclude_task_type: Tuple[str, ...] = ()
+    fallback_model: str = ""
     started: str = ""
     notes: str = ""
     # Optional provider for the candidate. A model under test is usually NOT in
@@ -126,6 +133,13 @@ def build_experiment(raw: Dict[str, Any]) -> Optional[Experiment]:
         min_tier = 0
     requires_tools = bool(match.get("requires_tools", False))
     incumbent_model = str(match.get("incumbent_model") or "").strip()
+    exclude_task_type_raw = match.get("exclude_task_type") or ()
+    if isinstance(exclude_task_type_raw, str):
+        exclude_task_type_raw = [exclude_task_type_raw]
+    exclude_task_type = tuple(
+        str(t).strip() for t in exclude_task_type_raw if str(t).strip()
+    )
+    fallback_model = str(raw.get("fallback_model") or "").strip()
     stream = bool(raw.get("stream", False))
 
     return Experiment(
@@ -138,6 +152,8 @@ def build_experiment(raw: Dict[str, Any]) -> Optional[Experiment]:
         match_min_tier=min_tier,
         match_requires_tools=requires_tools,
         match_incumbent_model=incumbent_model,
+        match_exclude_task_type=exclude_task_type,
+        fallback_model=fallback_model,
         started=str(raw.get("started") or ""),
         notes=str(raw.get("notes") or ""),
         provider=str(raw.get("provider") or "").strip(),
@@ -172,6 +188,7 @@ def _matches(
     tier: int,
     requires_tools: bool = False,
     incumbent_model: str = "",
+    task_type: str = "",
 ) -> bool:
     if not exp.enabled:
         return False
@@ -183,6 +200,8 @@ def _matches(
         return False
     if exp.match_incumbent_model and incumbent_model != exp.match_incumbent_model:
         return False
+    if exp.match_exclude_task_type and task_type in exp.match_exclude_task_type:
+        return False
     return True
 
 
@@ -192,10 +211,11 @@ def pick_experiment(
     tier: int = 0,
     requires_tools: bool = False,
     incumbent_model: str = "",
+    task_type: str = "",
 ) -> Optional[Experiment]:
-    """Return the first enabled experiment matching this workload/tier/tools/incumbent."""
+    """Return the first enabled experiment matching this workload/tier/tools/incumbent/task."""
     for exp in experiments:
-        if _matches(exp, workload, tier, requires_tools, incumbent_model):
+        if _matches(exp, workload, tier, requires_tools, incumbent_model, task_type):
             return exp
     return None
 
@@ -266,6 +286,10 @@ def experiment_to_row(exp: Experiment) -> Dict[str, Any]:
         "requires_tools": exp.match_requires_tools,
         "incumbent_model": exp.match_incumbent_model,
     }
+    if exp.match_exclude_task_type:
+        match["exclude_task_type"] = list(exp.match_exclude_task_type)
+    if exp.fallback_model:
+        match["fallback_model"] = exp.fallback_model
     # Only serialise stream when it is set — the default (non-streaming) keeps
     # match_json free of the key so old readers see a clean shape.
     if exp.stream:

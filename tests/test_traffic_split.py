@@ -251,3 +251,68 @@ def test_experiment_stream_absent_in_match_json_when_false():
 
     match = json.loads(row["match_json"])
     assert "stream" not in match
+
+
+# ── split-canary scoping ──────────────────────────────────────────────────────
+
+def test_build_experiment_parses_exclude_task_type():
+    e = build_experiment(
+        {"name": "n", "model": "m", "mode": "split", "percent": 10,
+         "match": {"workload": ["normal_chat"], "requires_tools": True,
+                   "exclude_task_type": ["debugging", "coding", "testing"]}}
+    )
+    assert e.match_exclude_task_type == ("debugging", "coding", "testing")
+
+
+def test_build_experiment_parses_fallback_model():
+    e = build_experiment(
+        {"name": "n", "model": "m", "mode": "split", "percent": 10,
+         "fallback_model": "deepseek-v4-pro"}
+    )
+    assert e.fallback_model == "deepseek-v4-pro"
+
+
+def test_pick_experiment_rejects_excluded_task_type():
+    e = Experiment(
+        name="canary", enabled=True, model="flash", mode="split", percent=10,
+        match_workload=("normal_chat",), match_requires_tools=True,
+        match_exclude_task_type=("debugging", "coding", "testing"),
+    )
+    assert pick_experiment([e], workload="normal_chat",
+                           requires_tools=True, task_type="debugging") is None
+    assert pick_experiment([e], workload="normal_chat",
+                           requires_tools=True, task_type="qa") is e
+
+
+def test_pick_experiment_exclude_task_type_is_optional():
+    """Excluding no task types must behave as before (any task matches)."""
+    e = Experiment(
+        name="canary", enabled=True, model="flash", mode="split", percent=10,
+        match_workload=("normal_chat",), match_requires_tools=True,
+    )
+    assert pick_experiment([e], workload="normal_chat",
+                           requires_tools=True, task_type="coding") is e
+
+
+def test_experiment_fallback_model_serialised_in_match_json():
+    from traffic_split import experiment_to_row
+
+    e = Experiment(name="n", enabled=True, model="m", mode="split", percent=10,
+                   fallback_model="deepseek-v4-pro")
+    row = experiment_to_row(e)
+    import json
+
+    match = json.loads(row["match_json"])
+    assert match["fallback_model"] == "deepseek-v4-pro"
+
+
+def test_experiment_exclude_task_type_serialised_in_match_json():
+    from traffic_split import experiment_to_row
+
+    e = Experiment(name="n", enabled=True, model="m", mode="split", percent=10,
+                   match_exclude_task_type=("debugging", "coding"))
+    row = experiment_to_row(e)
+    import json
+
+    match = json.loads(row["match_json"])
+    assert match["exclude_task_type"] == ["debugging", "coding"]

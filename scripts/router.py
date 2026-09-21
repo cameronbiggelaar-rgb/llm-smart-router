@@ -1164,6 +1164,7 @@ def escalate_on_failure(
     requires_tools: bool = False,
     workload_type: str = "",
     context_tokens: int = 0,
+    prefer_model: str = "",
 ) -> RoutingDecision:
     """Escalate to the next available model after a failure.
 
@@ -1182,6 +1183,10 @@ def escalate_on_failure(
         context_tokens: Size of the failed request. Passed to the summariser
             ladder so per-model context ceilings (e.g. glm-5.3 at 150K) also
             apply to retries, not just first attempts.
+        prefer_model: When set (and available and tool-capable), tool-required
+            escalation lands on this exact model instead of the default
+            most-capable pick. Used by the split canary so a cheap-candidate
+            miss falls to its declared fallback (pro), never the ChatGPT plan.
 
     Returns:
         RoutingDecision for the next model in the chain.
@@ -1327,6 +1332,28 @@ def escalate_on_failure(
     # model, fall DOWN to the next-most-capable available tool model instead of
     # failing closed — this is what lets gpt-5.5 → glm-5.3 when gpt-5.5 caps.
     if requires_tools:
+        # Canary fallback: a cheap-candidate miss must land on its declared
+        # fallback (e.g. pro), never the default most-capable pick (gpt-5.5).
+        # Only honour prefer_model when it is genuinely available and
+        # tool-capable; otherwise fall through to the normal pick unchanged.
+        if prefer_model:
+            pm_key = _normalize_model_name(prefer_model)
+            if (
+                pm_key in TOOL_CAPABLE_MODELS
+                and pm_key not in EXCLUDED_FROM_AUTO_ROUTING
+                and is_model_available(pm_key)
+            ):
+                return RoutingDecision(
+                    selected_model=prefer_model,
+                    selected_provider=_get_provider(prefer_model),
+                    reason=(
+                        f"tool escalation from {failed_model} ({error_type}) — "
+                        f"preferred fallback {prefer_model}"
+                    ),
+                    fallback_chain=_build_tool_fallback_chain(prefer_model),
+                    is_fallback=True,
+                    original_model=failed_model,
+                )
         best_tier = -1
         best_model = ""
         for model in available:

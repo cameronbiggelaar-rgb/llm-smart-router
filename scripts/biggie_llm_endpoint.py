@@ -4504,6 +4504,7 @@ async def chat_completions(request: Request):
         tier=MODEL_CAPABILITY_TIERS.get(decision.selected_model, 0),
         requires_tools=requires_tools,
         incumbent_model=decision.selected_model,
+        task_type=routed_task_type,
     )
     decision.selected_model, _exp_obs = apply_experiment(
         decision.selected_model,
@@ -4750,6 +4751,13 @@ async def chat_completions(request: Request):
         else:
             fail_type = "error"
         logger.warning("Backend %s failed (%s), escalating...", decision.selected_model, fail_type)
+        # If this request was served by a split canary's treatment arm, a miss
+        # must fall to the experiment's declared fallback (pro), never the
+        # default most-capable pick (gpt-5.5). Only applies when we actually
+        # served the candidate.
+        _prefer = ""
+        if _exp_obs.get("experiment_arm") == "treatment" and _experiment is not None:
+            _prefer = getattr(_experiment, "fallback_model", "") or ""
         escalation = escalate_on_failure(
             failed_model=decision.selected_model,
             complexity_score=features["complexity_score"],
@@ -4761,6 +4769,7 @@ async def chat_completions(request: Request):
             # lands on the most-capable tool model.
             workload_type=workload_type,
             context_tokens=features.get("context_tokens", 0),
+            prefer_model=_prefer,
         )
 
         if not escalation.selected_model:

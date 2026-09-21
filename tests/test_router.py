@@ -1082,6 +1082,49 @@ class TestOllamaToolCapableModels:
         # deepseek-v4-pro (tier 8) is now tool-capable, so it is the next pick
         assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}, f"got {decision.selected_model}"
 
+    def test_escalation_prefer_model_wins_when_available(self):
+        """A flash canary miss must land on pro (prefer_model), never gpt-5.5."""
+        from router import escalate_on_failure
+        decision = escalate_on_failure(
+            failed_model="deepseek-v4.1-flash",
+            complexity_score=0.3,
+            error_type="empty_content",
+            requires_tools=True,
+            prefer_model="deepseek-v4-pro",
+        )
+        assert decision.selected_model == "deepseek-v4-pro", f"got {decision.selected_model}"
+        assert not decision.all_exhausted
+
+    def test_escalation_prefer_model_ignored_when_unavailable(self):
+        """If prefer_model is down, escalation falls through to the normal pick."""
+        from router import mark_rate_limited, mark_available, escalate_on_failure
+        mark_rate_limited("deepseek-v4-pro")
+        try:
+            decision = escalate_on_failure(
+                failed_model="deepseek-v4.1-flash",
+                complexity_score=0.3,
+                error_type="empty_content",
+                requires_tools=True,
+                prefer_model="deepseek-v4-pro",
+            )
+            # pro is unavailable, so it must NOT be selected; falls to next tool model
+            assert decision.selected_model != "deepseek-v4-pro", f"got {decision.selected_model}"
+            assert not decision.all_exhausted or decision.selected_model != ""
+        finally:
+            mark_available("deepseek-v4-pro")
+
+    def test_escalation_without_prefer_model_unchanged(self):
+        """The default path (no prefer_model) must keep its historical behaviour."""
+        from router import escalate_on_failure
+        decision = escalate_on_failure(
+            failed_model="deepseek-v4-pro",
+            complexity_score=0.5,
+            error_type="rate_limit",
+            requires_tools=True,
+        )
+        # no prefer_model → unchanged: picks the most-capable tool model
+        assert decision.selected_model in {"gpt-5.5", "glm-5.3", "deepseek-v4-pro"}, f"got {decision.selected_model}"
+
 
 class TestCompressionSkippedForToolRequests:
     """TDD: tool-carrying traffic skips compression EXCEPT giant session

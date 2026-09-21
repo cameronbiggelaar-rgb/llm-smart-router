@@ -103,3 +103,30 @@ experiments:
       Streaming shadow of deepseek-v4.1-flash on tool-bearing normal_chat
       served by deepseek-v4-pro. Measures true streamed cached_tokens and
       cached-rate cost; output discarded; no traffic moves.
+
+  # Served split canary (B36) — moves a bounded slice of tool-bearing
+  # normal_chat OFF deepseek-v4-pro and ONTO deepseek-v4.1-flash for real.
+  # Flash is ~3x cheaper streamed at the same cache rate (proven B35), so this
+  # is the first actual savings step. Scoped conservatively:
+  #   * 10% of eligible requests (stable session hash)
+  #   * only qa/research/planning/other — debugging/coding/testing stay on pro
+  #   * a flash miss escalates to deepseek-v4-pro (fallback_model), NEVER the
+  #     scarce ChatGPT plan (gpt-5.5/5.6)
+  # Keep DISABLED until go/no-go is explicit. Flip enabled:true (hot-reloaded)
+  # to start; flip back to roll back — no code revert needed.
+  - name: v41flash-tool-canary
+    enabled: false
+    model: deepseek-v4.1-flash:cloud
+    provider: ollama-cloud
+    mode: split
+    percent: 10
+    fallback_model: deepseek-v4-pro
+    match:
+      workload: [normal_chat]
+      requires_tools: true
+      incumbent_model: deepseek-v4-pro
+      exclude_task_type: [debugging, coding, testing]
+    notes: >-
+      Serve 10% of low-risk tool-bearing normal_chat from deepseek-v4.1-flash.
+      Excludes debugging/coding/testing; flash miss escalates to pro. DISABLED
+      pending explicit go/no-go.
