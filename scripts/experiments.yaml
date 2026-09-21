@@ -125,8 +125,8 @@ experiments:
       workload: [normal_chat]
       requires_tools: true
       incumbent_model: deepseek-v4-pro
-      exclude_task_type: [debugging, coding, testing]
+      exclude_task_type: [debugging, testing]
     notes: >-
-      Serve 10% of low-risk tool-bearing normal_chat from deepseek-v4.1-flash.
-      Excludes debugging/coding/testing; flash miss escalates to pro. DISABLED
-      pending explicit go/no-go.
+      Serve 10% of tool-bearing normal_chat from deepseek-v4.1-flash.
+      Excludes debugging/testing; coding included (B36a widen) for faster
+      signal. Flash miss escalates to pro. DISABLED pending explicit go/no-go.
