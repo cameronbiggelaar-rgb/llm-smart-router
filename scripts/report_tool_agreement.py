@@ -17,8 +17,9 @@ Usage:
   python3 report_tool_agreement.py --json     # machine-readable
   python3 report_tool_agreement.py --since 24h   # trailing window (default 24h)
 
-Exit code 0 = report produced. Non-zero = could not produce a report (no pairs,
-bad DB, etc.).
+Exit code 0 = report produced (or no pairs — empty stdout for the cron
+watchdog, since shadow arms are disabled in the served-canary era).
+Exit 2 = could not open DB or bad --since value.
 """
 
 import argparse
@@ -168,8 +169,11 @@ def main() -> int:
     score = _score(pairs)
 
     if score["total_pairs"] == 0:
-        print("no shadow/incumbent pairs in window — shadow may not be running yet", file=sys.stderr)
-        return 1
+        # Watchdog contract: shadow arms are disabled (served split canary is
+        # the go-forward), so there are no shadow/incumbent pairs to score.
+        # Exit 0 with empty stdout — a non-zero exit would raise a nightly
+        # error alert for a condition that is expected, not a failure.
+        return 0
 
     if args.json:
         print(json.dumps(score, indent=2))
