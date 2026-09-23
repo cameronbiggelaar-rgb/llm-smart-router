@@ -131,8 +131,11 @@ def test_incumbent_stream_marker_excluded(tmp_path, monkeypatch):
     assert s["tool_agreement"] == 1
 
 
-def test_no_pairs_returns_exit_1(tmp_path, monkeypatch):
+def test_no_pairs_returns_exit_0(tmp_path, monkeypatch):
+    """No shadow pairs is expected (shadow arms disabled since the served
+    canary took over). The watchdog contract requires exit 0 with empty stdout,
+    because no_agent cron raises an error alert on any non-zero exit."""
     db = _mk_db(tmp_path, [])
     monkeypatch.setenv("BIGGIE_ROUTER_DB", db)
     monkeypatch.setattr(sys, "argv", ["report_tool_agreement.py", "--since", "0"])
-    assert rta.main() == 1
+    assert rta.main() == 0
