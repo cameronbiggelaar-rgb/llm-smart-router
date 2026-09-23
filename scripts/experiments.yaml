@@ -119,7 +119,7 @@ experiments:
     model: deepseek-v4.1-flash:cloud
     provider: ollama-cloud
     mode: split
-    percent: 10
+    percent: 30
     fallback_model: deepseek-v4-pro
     match:
       workload: [normal_chat]
@@ -127,6 +127,6 @@ experiments:
       incumbent_model: deepseek-v4-pro
       exclude_task_type: [debugging, testing]
     notes: >-
-      Serve 10% of tool-bearing normal_chat from deepseek-v4.1-flash.
+      Serve 30% of tool-bearing normal_chat from deepseek-v4.1-flash.
       Excludes debugging/testing; coding included (B36a widen) for faster
-      signal. Flash miss escalates to pro. DISABLED pending explicit go/no-go.
+      signal. Flash miss escalates to pro.
