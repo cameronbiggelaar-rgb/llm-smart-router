@@ -139,7 +139,15 @@ def test_tool_bearing_force_model_bypasses_allowlist(clean_state, governor_open)
 
 
 def test_governor_disabled_matches_pre_b37_behaviour(clean_state, monkeypatch):
-    """enabled=false is the rollback lever — identical to today's behaviour."""
+    """enabled=false is the rollback lever — the governor must not interfere.
+
+    Note the assertion is against the **ungoverned tool-capable pick for this
+    request's floor** (tier 10 for cx=0.85 coding), not the unconditional top
+    model. B38 (§9.4) made that pick floor-aware, so this test now pins the
+    governor's *neutrality* rather than a specific model name: with the governor
+    off, the selected model must equal exactly what the ungoverned selector
+    returns, and no budget machinery may engage.
+    """
     cfg = gb.GovernorConfig(
         enabled=False,
         allowlist=[gb.CLASS_ARCHITECTURAL],
@@ -153,10 +161,49 @@ def test_governor_disabled_matches_pre_b37_behaviour(clean_state, monkeypatch):
         prompt="refactor the parse loop",
         requires_tools=True,
     )
-    # Pre-B37: highest-tier tool-capable model = gpt-5.6-sol.
-    assert d.selected_model == "gpt-5.6-sol", d.reason
+    floor = max(
+        router._estimate_min_tier(
+            complexity_score=0.85,
+            task_type="coding",
+            has_niche_references=False,
+            has_format_constraint=False,
+            instruction_count=1,
+            is_subagent=False,
+            parent_model=None,
+            prompt="refactor the parse loop",
+        ),
+        router._architectural_floor("refactor the parse loop"),
+    )
+    expected = router._select_tool_capable_model(floor)
+    assert d.selected_model == expected, d.reason
     assert d.budget_class == ""
     assert d.plan_budget_denied is False
+
+
+def test_high_complexity_tool_work_still_reaches_the_capable_models(clean_state, monkeypatch):
+    """The floor must not be so aggressive that hard tool work is demoted.
+
+    cx=0.85 coding carries a tier-10 floor, so gpt-5.5 remains in play. This is
+    the counterweight to the leak fix: B38 lowers the floor for ORDINARY tool
+    work only — it must not flatten capable routing for genuinely hard work.
+    """
+    cfg = gb.GovernorConfig(
+        enabled=False,
+        allowlist=[gb.CLASS_ARCHITECTURAL],
+        hard_cap_percent=95.0,
+    )
+    monkeypatch.setattr(gb, "load_governor_config", lambda force=False: cfg)
+    monkeypatch.setattr(gb, "fetch_reading", lambda cfg=None, **kw: _reading(0.0))
+    d = router.route_task(
+        complexity_score=0.85,
+        task_type="coding",
+        prompt="refactor the parse loop",
+        requires_tools=True,
+    )
+    assert d.selected_model in ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra",
+                                "gpt-5.6-sol"), (
+        f"hard tool work was demoted below its tier-10 floor: {d.selected_model}"
+    )
 
 
 def test_tool_bearing_denied_but_no_non_plan_model_fails_closed(clean_state, monkeypatch):

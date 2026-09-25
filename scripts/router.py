@@ -935,6 +935,22 @@ def route_task(
     # Check limp-home status
     _check_limp_home()
 
+    # Compute capability tier needed FIRST — both the tool branch below and the
+    # ordinary capability path use it. Hoisted by B38 (§9.4): the tool branch
+    # returns early (see below) and previously ran *before* this was computed, so
+    # the tool-capable pick had no tier floor at all and always took the
+    # highest-tier available model.
+    min_tier = _estimate_min_tier(
+        complexity_score=complexity_score,
+        task_type=task_type,
+        has_niche_references=has_niche_references,
+        has_format_constraint=has_format_constraint,
+        instruction_count=instruction_count,
+        is_subagent=is_subagent,
+        parent_model=parent_model,
+        prompt=prompt,
+    )
+
     # ── Tool capability gate (dominates all other routing) ──────────────
     # ── Native Hermes session-compression workload ─────────────────────
     # Compression requests may carry tool schemas from the parent session even
@@ -974,7 +990,13 @@ def route_task(
     # may pick among eligible tool-capable models but may never downgrade below
     # this capability. If no tool-capable backend is available we FAIL CLOSED.
     if requires_tools:
-        tool_model = _select_tool_capable_model()
+        # Honour the capability floor (B38/§9.4). The floor is the ordinary
+        # estimator's result, raised to 13 when the prompt is architectural — the
+        # estimator alone scans only the request's own task_type, so an
+        # architectural ask tagged `coding` would otherwise yield 11 and be
+        # demoted off gpt-5.6-sol (see _architectural_floor).
+        tool_floor = max(min_tier, _architectural_floor(prompt))
+        tool_model = _select_tool_capable_model(tool_floor)
         if not tool_model:
             return RoutingDecision(
                 selected_model="",
@@ -1018,15 +1040,16 @@ def route_task(
             )
 
         # ── Plan-budget governor (the leak) ──
-        # This branch picks the highest-tier tool-capable model with no
-        # complexity gate, which is how 97.6% of the plan's burn arrived. Ask
+        # This branch picks a tool-capable model honouring the request's
+        # capability floor (B38). Before B38 it took the highest-tier model with
+        # no complexity gate, which is how 97.6% of the plan's burn arrived. Ask
         # the governor before returning; it only ever touches plan-account
         # models, so every ollama-cloud and flash lane is unaffected.
         governed_model, budget_class, denied, closed = _apply_plan_governor(
             tool_model, prompt=prompt, force_model=force_model
         )
         if denied:
-            replacement = _reselect_without_plan()
+            replacement = _reselect_without_plan(tool_floor)
             if not replacement:
                 # Only plan models are tool-capable right now. Fail closed
                 # rather than papering over the gate with a non-tool model.
@@ -1058,7 +1081,8 @@ def route_task(
                 reason=(
                     f"tool-bearing request — plan account denied to class "
                     f"'{budget_class}' by plan governor ({cause}) — selected "
-                    f"{replacement} (tier {MODEL_CAPABILITY_TIERS.get(replacement, 0)})"
+                    f"{replacement} (tier {MODEL_CAPABILITY_TIERS.get(replacement, 0)}, "
+                    f"capability floor {tool_floor})"
                 ),
                 fallback_chain=_build_tool_fallback_chain(replacement, klass=budget_class),
                 budget_class=budget_class,
@@ -1070,7 +1094,8 @@ def route_task(
             selected_provider=_get_provider(governed_model),
             reason=(
                 f"tool-bearing request — selected proven tool-capable model "
-                f"{governed_model} (tier {MODEL_CAPABILITY_TIERS.get(governed_model, 0)})"
+                f"{governed_model} (tier {MODEL_CAPABILITY_TIERS.get(governed_model, 0)}, "
+                f"capability floor {tool_floor})"
                 + (
                     f"; plan governor allowed class '{budget_class}'"
                     if budget_class
@@ -1080,18 +1105,6 @@ def route_task(
             fallback_chain=_build_tool_fallback_chain(governed_model, klass=budget_class or None),
             budget_class=budget_class,
         )
-
-    # Compute capability tier needed (used by both limp-home and normal routing)
-    min_tier = _estimate_min_tier(
-        complexity_score=complexity_score,
-        task_type=task_type,
-        has_niche_references=has_niche_references,
-        has_format_constraint=has_format_constraint,
-        instruction_count=instruction_count,
-        is_subagent=is_subagent,
-        parent_model=parent_model,
-        prompt=prompt,
-    )
 
     # ── Limp-home mode: local models only ──
     if _LIMP_HOME_ACTIVE:
@@ -1276,16 +1289,84 @@ def _normalize_model_name(model: str) -> str:
     return model
 
 
-def _select_tool_capable_model() -> str:
-    """Select the highest-capability available model proven to support Hermes tools.
+def _architectural_floor(prompt: str) -> int:
+    """The capability tier a genuinely architectural prompt requires (13), else 0.
+
+    Why this exists rather than just using ``_estimate_min_tier``: the two
+    mechanisms scope their routing-table scan differently, and the difference is
+    load-bearing.
+
+      * ``gpt_budget.classify_request`` scans **every** task type's sub-types, so
+        ``"rearchitect the storage layer"`` tagged ``coding`` is correctly
+        ``architectural`` (rev 4 fixed exactly this — an allowlist built on the
+        old ``task_type``-scoped detector would deny the requests it exists to
+        protect).
+      * ``_estimate_min_tier`` -> ``match_sub_type(task_type, prompt)`` scans
+        **only the request's own task type**. The tier-13 sub-type lives solely
+        under ``planning`` in routing_table.yaml, so that same architectural
+        prompt tagged ``coding``/``debugging`` yields a floor of **6** (measured;
+        the tier-13 keyword block is simply not consulted), not 13.
+
+    Using the raw ``_estimate_min_tier`` floor in the tool branch would therefore
+    select a far cheaper model for a real architectural request and silently
+    demote it off ``gpt-5.6-sol`` (tier 13) — under-serving precisely the lane this
+    work exists to protect. Composing with this helper keeps routing and
+    classification in agreement (the B37h principle: one shared notion of
+    "architectural" so the two can never disagree).
+
+    Deliberately **independent of governor state**: this is a capability floor,
+    not an entitlement. It applies whether or not the allowlist is armed.
+    """
+    if not prompt or not prompt.strip():
+        return 0
+    try:
+        import gpt_budget
+
+        if gpt_budget.classify_request(None, prompt, False) == gpt_budget.CLASS_ARCHITECTURAL:
+            return gpt_budget._ARCHITECTURAL_MIN_TIER
+    except Exception:
+        # A classifier failure must not invent a floor.
+        return 0
+    return 0
+
+
+def _select_tool_capable_model(min_tier: int = 0) -> str:
+    """Select the cheapest available model proven to support Hermes tools.
 
     Tool capability is a hard gate: only models in TOOL_CAPABLE_MODELS qualify.
-    Among those we prefer the MOST CAPABLE available (highest tier) so tool work
-    keeps the best reasoning quality (gpt-5.5 first), falling back to cheaper
-    tool-capable ollama models (glm-5.3 → deepseek-v4-flash) only when higher
-    tiers are unavailable / circuit-broken. Returns "" when none is available.
+    Among those we pick the **cheapest model that meets ``min_tier``**, walking
+    ``get_available_models()`` (which is already in MODEL_COST_ORDER) — the same
+    semantics as ``_select_model(min_tier)``.
+
+    ``min_tier`` was added by B38 (§9.4). Previously this function took no
+    arguments and always returned the HIGHEST-tier available tool model,
+    ignoring the capability floor entirely — so *every* tool-bearing request,
+    however ordinary, took the top plan model whenever it was up. Measured over
+    30d: 1,267 of the 1,760 ``gpt-5.6-sol`` calls were reached this way, versus
+    **3** via the genuine architectural tier-13 lane, i.e. a tier-13 model was
+    reached by ordinary tool work 422x more often than by the lane it exists for.
+
+    Degradation is deliberate (design line 131): when nothing meets the floor we
+    fall back to the most capable available tool model rather than failing
+    closed, because ``min_tier`` is a quality *floor*, not a capability wall. A
+    tier miss must not throw away a serviceable tool-capable model. Returns ""
+    only when no tool-capable model is available at all, so the caller fails
+    closed on a genuine capability gap.
     """
     available = get_available_models()
+
+    # Cheapest model meeting the floor, in cost order.
+    for model in available:
+        model_key = _normalize_model_name(model)
+        if model_key not in TOOL_CAPABLE_MODELS:
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(model_key, 0)
+        if tier >= min_tier:
+            return model
+
+    # Nothing meets the floor — degrade predictably to the most capable
+    # available tool-capable model (ties resolve to the cheapest, since we only
+    # replace on a strictly greater tier and `available` is in cost order).
     best = ""
     best_tier = -1
     for model in available:
@@ -1430,25 +1511,36 @@ def _apply_plan_governor(
 
 
 def _reselect_without_plan(min_tier: int = 0) -> str:
-    """Highest-tier available TOOL-CAPABLE model NOT on the governed account.
+    """Cheapest available TOOL-CAPABLE model that is NOT on the governed account.
 
     Used by the tool-branch governor hook, where tool capability is the binding
     gate: ordinary capability routing has no such constraint and uses
-    ``_reselect_without_plan_any_tier`` instead. ``min_tier`` is accepted for
-    signature symmetry but the tool branch has no tier floor of its own.
+    ``_reselect_without_plan_any_tier`` instead.
+
+    ``min_tier`` is a real capability floor since B38 (§9.4) — the tool branch now
+    computes one, so a denied architectural-class tool request does not silently
+    land on a model below what the request needs. When nothing meets the floor we
+    return the most capable non-plan tool model available (degrade predictably,
+    design line 131) rather than failing closed, matching
+    ``_select_tool_capable_model``.
     """
-    best = ""
-    best_tier = -1
+    best_meeting = ""
+    best_fallback = ""
+    best_fallback_tier = -1
     for model in get_available_models():
-        if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+        key = _normalize_model_name(model)
+        if key not in TOOL_CAPABLE_MODELS:
             continue
         if _is_plan_model(model):
             continue
-        tier = MODEL_CAPABILITY_TIERS.get(model, 0)
-        if tier > best_tier:
-            best_tier = tier
-            best = model
-    return best
+        tier = MODEL_CAPABILITY_TIERS.get(key, 0)
+        # First (cheapest, by MODEL_COST_ORDER) that meets the floor wins.
+        if tier >= min_tier and not best_meeting:
+            best_meeting = model
+        if tier > best_fallback_tier:
+            best_fallback_tier = tier
+            best_fallback = model
+    return best_meeting or best_fallback
 
 
 def _reselect_without_plan_any_tier(min_tier: int = 0) -> str:

@@ -1022,14 +1022,46 @@ class TestOllamaToolCapableModels:
         assert "deepseek-v4-pro" in TOOL_CAPABLE_MODELS
 
     def test_tool_routing_prefers_most_capable_tool_model(self):
-        """With flash+glm tool-capable, tool work should still prefer gpt-5.5
-        (highest capability), falling to flash/glm only when gpt-5.5 is down."""
+        """Tool work is floored by capability, not blindly pinned to the top model.
+
+        Historically this asserted gpt-5.5 unconditionally — i.e. it encoded the
+        §9.4 defect, where every tool-bearing request took the most capable
+        available tool model regardless of how ordinary it was. B38 made the pick
+        floor-aware: an easy coding request (cx=0.1) carries a tier-4 floor and no
+        longer consumes gpt capacity. What this test still guarantees is that a
+        *sufficient* tool-capable model is chosen.
+        """
         decision = route_task(
             complexity_score=0.1,
             task_type="coding",
             requires_tools=True,
         )
-        assert decision.selected_model == "gpt-5.5"
+        import router as _r
+
+        floor = max(
+            _r._estimate_min_tier(
+                complexity_score=0.1,
+                task_type="coding",
+                has_niche_references=False,
+                has_format_constraint=False,
+                instruction_count=1,
+                is_subagent=False,
+                parent_model=None,
+                prompt=None,
+            ),
+            _r._architectural_floor(""),
+        )
+        expected = _r._select_tool_capable_model(floor)
+        assert decision.selected_model == expected, decision.reason
+        assert _r._normalize_model_name(decision.selected_model) in _r.TOOL_CAPABLE_MODELS
+
+    def test_ordinary_tool_work_no_longer_takes_the_top_model(self):
+        """The §9.4 regression guard, stated as a policy: ordinary tool work must
+        not reach the tier-13 plan model by default."""
+        from router import _select_tool_capable_model
+
+        assert _select_tool_capable_model(0) != "gpt-5.6-sol"
+        assert _select_tool_capable_model(4) != "gpt-5.6-sol"
 
     def test_tool_routing_falls_to_next_model_when_gpt55_down(self):
         """When gpt-5.5 is rate-limited, tool work escalates to the
