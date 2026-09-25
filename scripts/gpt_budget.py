@@ -357,3 +357,67 @@ def load_persisted_reading() -> Optional[Reading]:
         return _reading_from_dict(json.loads(row[0]))
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+# ── Request classification (B37b) ────────────────────────────────────────────
+
+# The two canonical classes the allowlist distinguishes. "architectural" is the
+# only class permitted onto the ChatGPT plan; everything else is routine.
+CLASS_ARCHITECTURAL = "architectural"
+CLASS_ROUTINE = "routine"
+
+# Sub-types at or above this tier are the architectural lane. Only the
+# tier-13 planning sub-type reaches it today (routing_table.yaml).
+_ARCHITECTURAL_MIN_TIER = 13
+
+
+def classify_request(
+    task_type: Optional[str],
+    prompt: Optional[str],
+    force_model: bool,
+) -> str:
+    """Classify a request as architectural or routine.
+
+    Architectural iff:
+      * ``force_model`` is set (the operator's unconditional escape hatch), OR
+      * any task type's sub-type matches the prompt at tier >= 13.
+
+    The scan walks EVERY task type's sub-types, not just ``task_type``. The
+    prior detector keyed on ``task_type``, so an architectural prompt tagged
+    ``debugging`` (which has no tier-13 sub-type) returned None — and
+    ``debugging`` is ~30% of traffic. Reading the signal from the prompt text
+    across the whole table is the fix that makes the allowlist safe.
+
+    The lazy ``router`` import avoids a circular import: router.py will call
+    back into this module at the enforcement points (B37e/f/g).
+    """
+    if force_model:
+        return CLASS_ARCHITECTURAL
+
+    if not prompt or not prompt.strip():
+        return CLASS_ROUTINE
+
+    try:
+        from router import load_routing_table
+
+        table = load_routing_table()
+    except Exception:
+        table = {}
+
+    prompt_lower = prompt.lower()
+    for task_config in table.values():
+        if not isinstance(task_config, dict):
+            continue
+        for sub in task_config.get("sub_types", []):
+            if not isinstance(sub, dict):
+                continue
+            if sub.get("tier", 0) < _ARCHITECTURAL_MIN_TIER:
+                continue
+            keywords = sub.get("keywords", []) or []
+            exact_keywords = sub.get("exact_keywords", []) or []
+            if any(kw in prompt_lower for kw in keywords):
+                return CLASS_ARCHITECTURAL
+            if any(kw in prompt_lower for kw in exact_keywords):
+                return CLASS_ARCHITECTURAL
+
+    return CLASS_ROUTINE
