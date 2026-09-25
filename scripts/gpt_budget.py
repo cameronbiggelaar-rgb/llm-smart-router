@@ -421,3 +421,83 @@ def classify_request(
                 return CLASS_ARCHITECTURAL
 
     return CLASS_ROUTINE
+
+
+# ── Policy evaluation (B37c) ─────────────────────────────────────────────────
+
+VERDICT_OPEN = "open"
+VERDICT_CLOSED = "closed"
+VERDICT_DENIED = "denied"
+
+
+class GovernorConfig:
+    """The plan-budget policy, as loaded from budget_policy.yaml.
+
+    ``enabled`` is the master switch (false == today's behaviour, the rollback
+    lever). ``allowlist`` is the ONLY entitlement: a class must be named here to
+    reach the plan at all. ``hard_cap_percent`` is the reactive backstop for
+    every class. ``routine_ceiling_percent`` is retained for explicitness (0 =
+    routine gets none) but the allowlist — not this knob — is what governs.
+
+    Legacy pacing keys (``slack``, ``final_stretch_seconds``, ``schedule``) are
+    deliberately dropped: those concepts were deleted in design rev 4 and must
+    have no effect if a stale hand-edited file still carries them.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        allowlist: Optional[list] = None,
+        routine_ceiling_percent: float = 0.0,
+        hard_cap_percent: float = 95.0,
+        **legacy: Any,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.allowlist = list(allowlist) if allowlist is not None else [CLASS_ARCHITECTURAL]
+        self.routine_ceiling_percent = float(routine_ceiling_percent)
+        self.hard_cap_percent = float(hard_cap_percent)
+        # legacy keys are intentionally not stored.
+
+
+def _known_classes(allowlist) -> set:
+    return {c for c in allowlist if c in (CLASS_ARCHITECTURAL, CLASS_ROUTINE)}
+
+
+def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str:
+    """Turn a reading + class into a verdict: open / closed / denied.
+
+    Order of precedence (most authoritative first):
+      1. ``enabled=false`` → open for every class (rollback == today).
+      2. Unreadable reading → open (fail-open safety invariant).
+      3. ``reading.allowed is False`` → closed (the account's own verdict).
+      4. ``used >= hard_cap_percent`` → closed (reactive backstop, all classes).
+      5. Allowlist: class in allowlist → open; otherwise → denied.
+
+    ``denied`` (policy) is distinct from ``closed`` (capacity) so observability
+    can tell *why* a request was refused.
+    """
+    if not cfg.enabled:
+        return VERDICT_OPEN
+
+    if reading.source == "unavailable":
+        return VERDICT_OPEN
+
+    if reading.allowed is False:
+        return VERDICT_CLOSED
+
+    w = binding_window(reading)
+    if w is None:
+        # No readable window but no explicit close either → open (fail open).
+        return VERDICT_OPEN
+
+    if w.limit_window_seconds == 0:
+        # Division guard: never throttle on a malformed window.
+        allowed = _known_classes(cfg.allowlist)
+        return VERDICT_OPEN if klass in allowed else VERDICT_DENIED
+
+    if w.used_percent >= cfg.hard_cap_percent:
+        return VERDICT_CLOSED
+
+    allowed = _known_classes(cfg.allowlist)
+    return VERDICT_OPEN if klass in allowed else VERDICT_DENIED
