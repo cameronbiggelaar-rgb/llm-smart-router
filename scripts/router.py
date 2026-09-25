@@ -199,6 +199,8 @@ class RoutingDecision:
     all_exhausted: bool = False     # True when every model is unavailable
     limp_home: bool = False         # True when in limp-home mode (local only)
     limp_home_reason: str = ""      # why we're in limp-home mode
+    budget_class: str = ""          # plan-governor class for reporting ("" = governor off)
+    plan_budget_denied: bool = False  # True when the plan refused this request
 
 
 @dataclass
@@ -991,14 +993,92 @@ def route_task(
                     else "tool capability unavailable on local/limb-home models"
                 ),
             )
+
+        # Operator intent wins over the automatic pick, and over the governor's
+        # allowlist: an explicitly named model is honoured so the operator is
+        # never blocked from the plan on demand (§3.3).
+        forced_tool_model = ""
+        if force_model:
+            forced_key = _normalize_model_name(force_model)
+            if (
+                forced_key in TOOL_CAPABLE_MODELS
+                and is_model_available(force_model)
+                and is_model_available(forced_key)
+            ):
+                forced_tool_model = force_model
+        if forced_tool_model:
+            return RoutingDecision(
+                selected_model=forced_tool_model,
+                selected_provider=_get_provider(forced_tool_model),
+                reason=(
+                    f"tool-bearing request — forced model {forced_tool_model} "
+                    f"(tier {MODEL_CAPABILITY_TIERS.get(forced_tool_model, 0)})"
+                ),
+                fallback_chain=_build_tool_fallback_chain(forced_tool_model),
+            )
+
+        # ── Plan-budget governor (the leak) ──
+        # This branch picks the highest-tier tool-capable model with no
+        # complexity gate, which is how 97.6% of the plan's burn arrived. Ask
+        # the governor before returning; it only ever touches plan-account
+        # models, so every ollama-cloud and flash lane is unaffected.
+        governed_model, budget_class, denied, closed = _apply_plan_governor(
+            tool_model, prompt=prompt, force_model=force_model
+        )
+        if denied:
+            replacement = _reselect_without_plan()
+            if not replacement:
+                # Only plan models are tool-capable right now. Fail closed
+                # rather than papering over the gate with a non-tool model.
+                return RoutingDecision(
+                    selected_model="",
+                    selected_provider="",
+                    reason=(
+                        f"tool-bearing request — plan account denied to class "
+                        f"'{budget_class}' by plan governor (architectural "
+                        f"allowlist; gpt is reserved for architectural loads) "
+                        f"and no non-plan tool-capable model is available "
+                        f"(TOOL_CAPABLE_MODELS minus plan = "
+                        f"{sorted(TOOL_CAPABLE_MODELS - set(models_in_account(_governed_account())))}) "
+                        f"— failing closed"
+                    ),
+                    fallback_chain=[],
+                    all_exhausted=True,
+                    budget_class=budget_class,
+                    plan_budget_denied=True,
+                )
+            cause = (
+                "hard cap reached"
+                if closed
+                else "architectural allowlist; gpt is reserved for architectural loads"
+            )
+            return RoutingDecision(
+                selected_model=replacement,
+                selected_provider=_get_provider(replacement),
+                reason=(
+                    f"tool-bearing request — plan account denied to class "
+                    f"'{budget_class}' by plan governor ({cause}) — selected "
+                    f"{replacement} (tier {MODEL_CAPABILITY_TIERS.get(replacement, 0)})"
+                ),
+                fallback_chain=_build_tool_fallback_chain(replacement, klass=budget_class),
+                budget_class=budget_class,
+                plan_budget_denied=True,
+            )
+
         return RoutingDecision(
-            selected_model=tool_model,
-            selected_provider=_get_provider(tool_model),
+            selected_model=governed_model,
+            selected_provider=_get_provider(governed_model),
             reason=(
                 f"tool-bearing request — selected proven tool-capable model "
-                f"{tool_model} (tier {MODEL_CAPABILITY_TIERS.get(tool_model, 0)})"
+                f"{governed_model} (tier {MODEL_CAPABILITY_TIERS.get(governed_model, 0)})"
+                + (
+                    f"; plan governor allowed class '{budget_class}'"
+                    if budget_class
+                    else ""
+                )
             ),
-            fallback_chain=_build_tool_fallback_chain(tool_model),
+            fallback_chain=_build_tool_fallback_chain(governed_model, klass=budget_class or None),
+            budget_class=budget_class,
         )
 
     # Compute capability tier needed (used by both limp-home and normal routing)
@@ -1140,17 +1220,173 @@ def _select_tool_capable_model() -> str:
     return best
 
 
-def _build_tool_fallback_chain(current_model: str) -> List[str]:
+# ── Plan-budget governor (B37e) ──────────────────────────────────────────────
+# The ChatGPT plan is reserved for the architectural lane only (operator policy).
+# The leak was the tool-bearing branch, which selects the HIGHEST-tier
+# tool-capable model and ignored the complexity signal entirely: 97.6% of the
+# plan's clean-era burn (28.6 of 29.3 Mtok) arrived that way. This governor
+# classifies each request from its prompt and denies the plan to any class the
+# allowlist does not name.
+#
+# Everything here is account-keyed, never name-keyed: a new plan model is
+# governed automatically with no edit to this code.
+
+
+def _governed_account() -> str:
+    """The billing account the governor guards (ChatGPT plan)."""
+    try:
+        import gpt_budget
+
+        return gpt_budget.GOVERNED_ACCOUNT
+    except Exception:
+        return "openai-codex"
+
+
+def _governor_verdict(klass: str) -> str:
+    """Evaluate the plan policy for a class. Fails OPEN on any error.
+
+    An unreadable probe must never starve the plan, and a governor bug must
+    never wedge live traffic: every failure path returns "open".
+    """
+    try:
+        import gpt_budget
+
+        cfg = gpt_budget.load_governor_config()
+        if not getattr(cfg, "enabled", False):
+            return gpt_budget.VERDICT_OPEN
+        reading = gpt_budget.fetch_reading()
+        return gpt_budget.evaluate_policy(reading, cfg, klass=klass)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("plan governor unavailable (%s) — failing open", exc)
+        try:
+            import gpt_budget
+
+            return gpt_budget.VERDICT_OPEN
+        except Exception:
+            return "open"
+
+
+def _plan_classify(prompt: str, force_model: str) -> str:
+    """Classify a request for the plan governor (architectural vs routine).
+
+    ``force_model`` counts as an architectural signal only when it names a
+    plan-account model. The endpoint turns ANY client-supplied model name into
+    ``force_model``, so treating the mere presence of the field as architectural
+    would let a request naming ``glm-5.3`` open the plan — the operator's escape
+    hatch is "reach gpt on demand", not "name any model".
+    """
+    signal = force_model if _is_plan_model(force_model) else ""
+    try:
+        import gpt_budget
+
+        return gpt_budget.classify_request(None, prompt, bool(signal))
+    except Exception:
+        # Never deny on a classifier failure.
+        return "architectural"
+
+
+def _plan_denied_for_class(klass: str) -> bool:
+    """Whether the plan is refused to this class right now."""
+    try:
+        import gpt_budget
+
+        return _governor_verdict(klass) != gpt_budget.VERDICT_OPEN
+    except Exception:
+        return False
+
+
+def _is_plan_model(model: str) -> bool:
+    """Whether a model draws on the governed (ChatGPT plan) account."""
+    if not model:
+        return False
+    try:
+        return get_model_account(model) == _governed_account()
+    except Exception:
+        return False
+
+
+def _apply_plan_governor(
+    selected: str,
+    *,
+    prompt: str,
+    force_model: str = "",
+) -> Tuple[str, str, bool, bool]:
+    """Gate a selected model against the plan budget.
+
+    Returns ``(model, klass, denied, closed)``:
+
+    * ``model`` — unchanged when the plan is entitled to it, else ``""`` so the
+      caller can re-select away from the plan (or fail closed).
+    * ``klass`` — the class the request was assigned (``""`` when the governor is
+      off, so nothing is reported as governed).
+    * ``denied`` — True when the plan refused this request.
+    * ``closed`` — True when the refusal was capacity, not entitlement.
+
+    Only plan-account models are ever touched, so the flash canary and every
+    ollama-cloud lane are structurally unaffected.
+    """
+    if not _is_plan_model(selected):
+        return selected, "", False, False
+
+    try:
+        import gpt_budget
+
+        cfg = gpt_budget.load_governor_config()
+        # enabled=false is the rollback lever: byte-identical to pre-B37 behaviour.
+        if not getattr(cfg, "enabled", False):
+            return selected, "", False, False
+
+        klass = _plan_classify(prompt, force_model)
+        reading = gpt_budget.fetch_reading()
+        verdict = gpt_budget.evaluate_policy(reading, cfg, klass=klass)
+    except Exception as exc:  # pragma: no cover - defensive
+        # A governor bug must never wedge live traffic.
+        logger.warning("plan governor unavailable (%s) — failing open", exc)
+        return selected, "", False, False
+
+    if verdict == gpt_budget.VERDICT_OPEN:
+        return selected, klass, False, False
+
+    closed = verdict == gpt_budget.VERDICT_CLOSED
+    return "", klass, True, closed
+
+
+def _reselect_without_plan() -> str:
+    """Highest-tier available tool-capable model NOT on the governed account."""
+    best = ""
+    best_tier = -1
+    for model in get_available_models():
+        if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+            continue
+        if _is_plan_model(model):
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+        if tier > best_tier:
+            best_tier = tier
+            best = model
+    return best
+
+
+def _build_tool_fallback_chain(current_model: str, *, klass: Optional[str] = None) -> List[str]:
     """Build the escalation chain for a tool-capable model.
 
     Only includes other models that are ALSO proven tool-capable — escalation
     must never downgrade below the tool-capability gate.
+
+    The chain walks *up* in tier, so for a routine request served by
+    ``deepseek-v4-pro`` it would otherwise escalate straight into the ChatGPT
+    plan — the leak re-entering through the back door (§5.5). When ``klass`` is
+    supplied and the governor denies the plan to that class, plan-account models
+    are excluded from the chain.
     """
     current_tier = MODEL_CAPABILITY_TIERS.get(current_model, 0)
     chain = []
     for model in get_available_models():
         if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
             continue
+        if klass is not None and _plan_denied_for_class(klass):
+            if get_model_account(model) == _governed_account():
+                continue
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         if tier > current_tier:
             chain.append(model)

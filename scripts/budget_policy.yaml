@@ -1,0 +1,54 @@
+# Plan-budget governor — the ChatGPT/Codex plan is reserved for the
+# architectural lane only.
+#
+# THIS FILE IS THE ROLLBACK LEVER. `enabled: false` restores exactly today's
+# behaviour; the endpoint hot-reloads it within ~30s, the same idiom as
+# experiments.yaml (no restart, no code change).
+#
+# Why this exists
+# ---------------
+# The plan boom-busted: one day of burn, then ~6 days dark. The cause was not
+# pacing but ENTITLEMENT — the tool-bearing branch selects the HIGHEST-tier
+# tool-capable model with no complexity gate, and that branch was 97.6% of the
+# plan's clean-era burn (28.6 of 29.3 Mtok, Sep 15-21). The genuine
+# architectural lane fired once in 208,530 logged calls.
+#
+# Operator policy: gpt is reserved for the architectural lane. Routine work —
+# including all ordinary tool-bearing traffic — never reaches the plan.
+#
+# Rollout state
+# -------------
+#   enabled: false   -> landing state. Inert; full coverage, nothing blocked.
+#                       Observe-only: quantify the denial before it acts.
+#   enabled: true    -> arm the allowlist. Intended to be flipped at the start
+#                       of a fresh usage window (post-reset), so the first
+#                       governed week begins from a clean one.
+#
+# Escape hatch: the operator is never blocked from gpt on demand. Naming a plan
+# model explicitly (`force_model`) is honoured regardless of this allowlist.
+
+governor:
+  # Master switch. false == today's behaviour. Rollback lever (hot-reloaded).
+  enabled: false
+
+  accounts:
+    # Keyed by BILLING ACCOUNT, not by model name: a new plan model is governed
+    # automatically with no edit here, because a 429 on the account caps every
+    # model that draws on it.
+    openai-codex:
+      # The ONLY class permitted on the plan. A class must be named here to
+      # reach the plan at all; everything else is refused.
+      allowlist: [architectural]
+      # Explicit: routine gets none. Retained for legibility — the allowlist,
+      # not this knob, is what governs.
+      routine_ceiling_percent: 0
+      # Absolute ceiling for every class, reactive backstop. At or above this the
+      # plan is `closed` even for architectural work.
+      hard_cap_percent: 95
+
+  probe:
+    # The signal is the account's own authoritative /usage verdict, never a
+    # modelled estimate: measured capacity varies 3.5x between cap events
+    # (46.7 Mtok vs 163.4 Mtok for a whole window), so estimation cannot work.
+    min_interval_seconds: 300
+    stale_after_seconds: 1800

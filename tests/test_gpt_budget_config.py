@@ -45,10 +45,29 @@ def _write(p, text):
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
-def test_missing_file_defaults_to_architectural_only():
+def test_missing_file_defaults_to_architectural_only(policy_file):
+    """No policy file at all → the architectural-only default, enabled.
+
+    Must point at a path that genuinely does not exist: once the real
+    ``budget_policy.yaml`` ships, a test that reads it would be asserting on
+    whatever the operator last tuned rather than on the default.
+    """
     cfg = gb.load_governor_config(force=True)
     assert cfg.enabled is True
     assert cfg.allowlist == [gb.CLASS_ARCHITECTURAL]
+
+
+def test_landed_policy_file_parses_and_is_inert():
+    """The shipped policy must be valid and land DISARMED (§6 rollout).
+
+    The governor ships ``enabled: false`` so B37e–k land with full coverage but
+    no behavioural change; arming it is a deliberate, separate operator step.
+    """
+    cfg = gb.load_governor_config(force=True)
+    assert cfg.enabled is False, "governor must land inert (observe-only)"
+    assert cfg.allowlist == [gb.CLASS_ARCHITECTURAL]
+    assert cfg.hard_cap_percent == 95.0
+    assert cfg.routine_ceiling_percent == 0.0
 
 
 def test_allowlist_missing_defaults_to_architectural_only(policy_file):
