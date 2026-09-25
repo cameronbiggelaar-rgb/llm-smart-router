@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field, replace
@@ -423,6 +424,40 @@ def classify_lane(reason: str, tier: int = 0, *, escalated: bool = False) -> str
     if tier >= _ARCHITECTURAL_MIN_TIER:
         return LANE_RETHINK_REARCHITECT
     return LANE_NORMAL
+
+
+# ── Stored-history classification (B37k) ─────────────────────────────────────
+#
+# Replay cannot see the prompt: `router_logs` stores `prompt_length`, not text.
+# So calibration reads the logged reason instead. The tier the router NEEDED is
+# recorded as "capability tier N needed", while the tier it CHOSE appears as
+# "selected X (tier N)" — including in the tool branch, where a tier-13 model can
+# be chosen for a request that needed tier ≤8. Reading the selected tier as the
+# needed one would make replay claim the governor spares traffic it denies, which
+# is the exact error that would hide an over-denial.
+_TIER_NEEDED_RE = re.compile(r"tier\s+(\d+)\s+needed")
+
+
+def classify_stored_request(reason: str, model: str = "", *, escalated: bool = False) -> str:
+    """Classify a HISTORICAL row for calibration replay.
+
+    Conservative by construction: an architectural verdict requires a positive
+    signal (the ``force_model`` override, or an explicit "tier 13 needed"
+    clause). Everything else is routine. Because the prompt is unavailable, this
+    can only under-detect architectural work — never over-detect it — so the
+    replay's denial count is an upper bound.
+    """
+    r = reason or ""
+    if "forced model" in r:
+        return CLASS_ARCHITECTURAL
+    m = _TIER_NEEDED_RE.search(r)
+    if m:
+        try:
+            if int(m.group(1)) >= _ARCHITECTURAL_MIN_TIER:
+                return CLASS_ARCHITECTURAL
+        except ValueError:  # pragma: no cover - regex guarantees digits
+            pass
+    return CLASS_ROUTINE
 
 
 def classify_request(
