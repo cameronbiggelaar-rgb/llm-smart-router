@@ -1,11 +1,13 @@
 # Design — ChatGPT plan budget governor (B37)
 
-Status: **design rev 2 / not implemented**. Supersedes rev 1's even-burn policy;
-§10 records what changed and why. Awaiting the decisions in §9.
+Status: **design rev 4 / not implemented**. Supersedes rev 3's routine-ceiling +
+architectural-reserve split; §10 records what changed and why. Awaiting the
+decisions in §9.
 
-**Policy under design (operator's ask):** burn up to **50%** of the plan window on
-routine work, **reserve the other 50%** for architectural work, and make that
-percentage **variable** when the shape of upcoming work is known.
+**Policy under design (operator's decision, rev 4):** gpt is reserved for the
+**architectural lane only** — "just keep it for the architectural lane." There is
+no routine share: routine traffic, including all ordinary tool-bearing requests,
+never reaches the plan.
 
 ## 1. Problem
 
@@ -95,8 +97,8 @@ Supporting evidence:
   *lost capability*, not lost service.
 - **Architectural work is genuinely token-heavy:** `gpt-5.6-sol` averages
   **52.2K tokens/call**; the tier-13 and `force_model` lanes average ~50–62K,
-  versus 3.1K for gpt-5.5 on non-tool work. The reserve must be measured in
-  **budget share**, never call count.
+  versus 3.1K for gpt-5.5 on non-tool work. The window must therefore be measured
+  in **budget share**, never call count.
 
 Existing partial mechanisms (do not duplicate):
 
@@ -114,23 +116,27 @@ Existing partial mechanisms (do not duplicate):
 
 **Goals**
 
-1. Enforce the operator's split: routine work may consume at most **50%** of the
-   plan window; **50% is reserved** for architectural work.
-2. Make that percentage **variable by known work shape** (config + dated
-   overrides), no code change or restart.
+1. Enforce the operator's decision: **gpt is reserved for the architectural lane
+   only.** Routine work — including all ordinary tool-bearing traffic — never
+   reaches the plan.
+2. Make the boundary **config-driven** (the architectural tier / keyword set lives
+   in `routing_table.yaml`), no code change or restart to adjust.
 3. Close the actual leak (§1.1): govern the tool-bearing branch, which is what
    drains the window.
 4. Protect the architectural lanes: tier-13 rethink/rearchitect and `force_model`
-   are never paced out — they draw on the reserve.
+   always reach the plan. Escalation **inherits the originating request's class** —
+   a failed architectural request may escalate into the plan; a failed routine
+   request escalates only to non-plan models (otherwise the leak re-enters through
+   the failover path).
 5. Degrade predictably to `deepseek-v4-pro` (tier 8) — the downgrade already
    proven at 99.97% success.
 6. Be observable and **fail open**.
 
 **Non-goals**
 
-- Not a cost governor. The plan is fixed-price; the lever is *when* capacity is
-  spent, not dollars.
-- Not a replacement for the 429 path. The governor paces; `mark_rate_limited`
+- Not a cost governor. The plan is fixed-price; the lever is *what is entitled to
+  it*, not dollars.
+- Not a replacement for the 429 path. The governor gates by class; `mark_rate_limited`
   remains the reactive backstop.
 - Not applied to `force_model` (operator intent wins) or compression (barred).
 - Not a fix for the tool branch's highest-tier preference itself — see §9.4, a
@@ -180,49 +186,53 @@ class PlanReading:
   → fail open (§3.5).
 - Persisted to `router_state.db` so a restart does not force a cold probe.
 
-### 3.2 Policy: routine ceiling, architectural reserve, variable by shape
+### 3.2 Policy: allowlist — the plan is for the architectural lane, full stop
 
-Expressed against the window (100% = full 7-day plan window):
-
-```
-routine_ceiling_percent   (default 50)   routine may consume up to this
-architectural_reserve     (default 50)   = 100 - routine_ceiling_percent
-```
-
-**Routine pacing.** Routine consumption is paced linearly toward its ceiling, so
-the ceiling is a *rate* limit rather than a cliff:
+**Operator decision (rev 4, supersedes the 50/50 split entirely): "Just keep it
+for the architectural lane."** There is no routine ceiling to tune and no routine
+share to pace, because **routine is not entitled to the plan account at all**:
 
 ```
-routine_allowance_now = routine_ceiling_percent
-                        * (1 - reset_after_seconds / limit_window_seconds)
-
-routine verdict (in this order):
-  used >= hard_cap_percent (95)                      -> closed     (all classes)
-  used > routine_allowance_now + slack (3)           -> paced out  (routine only)
-  reset_after_seconds <= final_stretch_seconds (10h) -> open       (spend the tail)
-  otherwise                                          -> open
+plan_account_allowlist:
+  - architectural            # the ONLY class permitted on the plan
+routine_ceiling_percent: 0   # explicit: routine gets nothing
 ```
 
-**Daily form** — the operator's "by end of day" checkpoint. The window is 7 days,
-so the daily pacing share is `routine_ceiling_percent / 7`:
+The whole of §3.2's earlier pacing apparatus (linear ramp, daily checkpoints,
+`slack`, schedule overrides) existed to answer *"how much routine is allowed?"*.
+The answer is now **none**, so that machinery is **deleted, not tuned**. A
+`final_stretch` tail release is likewise removed: releasing the tail to *routine*
+was the point of it, and routine is no longer eligible.
 
-| checkpoint | routine window budget allowed |
-|---|---|
-| end of day 1 | 7.1% of window |
-| end of day 2 | 14.3% |
-| end of day 4 | 28.6% |
-| end of day 7 (window end) | **50.0%** ← the ceiling |
+**Verdict, in this order — one rule now:**
 
-So "burn up to 50% and reserve the rest" is enforced continuously; by window end
-routine has had its 50% and architectural retained 50% throughout. The reserve is
-**never paced** — available from hour one, which is the point of reserving it.
+```
+architectural (allowlisted class):
+    used >= hard_cap_percent (95)  -> closed     # genuine hard stop, all classes
+    otherwise                       -> open      # never paced; always available
+else (routine):
+    used >= hard_cap_percent (95)  -> closed
+    otherwise                       -> denied     # select outside the plan account
+```
 
-**Architectural reserve** — available immediately, always, up to `hard_cap`:
+`hard_cap_percent` stays because an allowlist is not a licence to run the plan to
+literal 100%: at 95% the last 5% absorbs in-flight requests that cannot be
+redirected mid-call, and a hard 429 on a live architectural session is the exact
+failure this design exists to prevent. It is the *only* number left to calibrate.
 
-| class | members | governed by |
-|---|---|---|
-| **architectural (reserve)** | the tier-13 rethink/rearchitect lane (detected from `prompt` — see §3.3.1); `force_model`; escalate-on-failure promotions | hard cap only |
-| **routine** | every other auto-routed plan-account request, **incl. the tool-bearing branch** | routine ceiling, paced |
+**What survives from earlier revisions:** the signal (§3.1, authoritative
+`/usage`), account-keyed enforcement (§3.3), fail-open (§3.5), and the hard cap.
+**What is deleted:** routine pacing, the daily ramp table, `slack`, and the
+`schedule:` variability knob — all of which only made sense while routine had a
+share to divide. `routine_ceiling_percent` is retained as an explicit `0` so the
+intent is legible in config rather than implied by absence.
+
+**Reserve is not a budget any more, it is a whole.** With no routine draw the plan
+window serves architectural demand only, so "will the reserve last?" becomes "will
+architectural demand alone exhaust the window?" — measured at **~0 Mtok/wk today**
+(§3.4: the lane is dormant), against 46.7–163.4 Mtok/wk of capacity. That is the
+*safest* configuration available at this capacity, and it is why removing routine
+is better than rationing it: there is no rationing arithmetic left to get wrong.
 
 **The architectural class must be detected from the prompt, not from `min_tier`.**
 The canonical architectural signal is a *sub-type keyword match* in
@@ -239,62 +249,62 @@ planning:
       tier: 8
 ```
 
-Verified firing: `"rearchitect the router …"` → sub-type 13 → `min_tier` 13;
-`"let's rethink the budget approach"` → 13; `"review the architecture of the
-endpoint"` → 13. **`match_sub_type(task_type, prompt)` is therefore the
-classifier** — and `prompt` is already a `route_task` parameter, available before
-the tool branch, so the governor can classify correctly on *both* hooks. Reuse
-the existing helper; do not invent a second keyword list.
+**But the detector as written is keyed on `task_type`, and that is a defect this
+design must fix — measured:**
 
-**Why this matters more than it looks.** The tool branch returns *before*
-`_estimate_min_tier` runs, so a tool-bearing architectural request (83% of
-`planning` is tool-bearing — 4,377 of 5,296) would otherwise be classified from a
-tier that was never computed. Classifying from `prompt` also means the
-architectural class survives the branch that was stealing it (§1.1): with the
-governor in place, "rearchitect the X" reaches the reserve through the tool
-branch, which is what "keep gpt for architectural loads" requires.
+| prompt (identical) | classified `task_type` | `match_sub_type` |
+|---|---|---|
+| `"rearchitect the budget governor"` | `planning` | **13** |
+| `"rearchitect the budget governor"` | `debugging` | **None** |
+| `"rearchitect the budget governor"` | `coding` | **None** |
+| `"design the architecture for it and implementation and test plans"` | `planning` | **8** (not 13) |
 
-**Variability by work shape** (the operator's explicit ask). Dated overrides
-raise or lower the ceiling when the shape of work is known:
+Two failures, both fatal to an allowlist:
 
-```yaml
-routine_ceiling_percent: 50
-schedule:
-  - { from: 2026-09-28, ceiling_percent: 35, reason: "design sprint — hold reserve for architecture" }
-  - { from: 2026-10-05, ceiling_percent: 70, reason: "bulk routine tool work expected" }
+1. **`match_sub_type` is scoped to one `task_type`.** It reads
+   `table.get(task_type)` and returns `None` for everything else. Real traffic is
+   **~30% `debugging`** and only **~11% `planning`** (last 13d; compression is the
+   largest share at ~42%). An architectural
+   request classified as `debugging` — the common case, since architectural work
+   usually starts as "this is wrong, fix it" — is **invisible** to the detector.
+   Production evidence: the tier-13 capability clause has fired **once in 208,530
+   logged calls** (the single `"capability tier 13 needed"` row) — it is effectively
+   dormant. Every other `sol` selection (1,760 total) is either the tool-bearing
+   branch (1,267) or a tool-failover escalation (~490). An allowlist gated on a
+   dormant detector would deny the plan to almost all genuine architectural work
+   and silently starve the exact lane the operator asked to protect.
+2. **The operator's own canonical sentence scores tier 8, not 13.**
+   `"design the architecture for it and implementation and test plans"` matches the
+   tier-8 `architecture` keyword, not the tier-13 list. It is a near-miss on
+   wording, and wording is exactly what an allowlist must not depend on.
+
+**Fix — the governor scans the sub-type table globally, not per-`task_type`:**
+
+```
+architectural(prompt) := any sub-type with tier >= 13 matches, across ALL
+                         task types in routing_table.yaml
+                      OR force_model is set
 ```
 
-Resolved as: the **last** schedule entry whose `from` date has passed wins;
-absent any, the top-level value applies. **Hot-reloaded** (same ~30s mechanism as
-`experiments.yaml`), so the ceiling moves mid-window without a restart. A
-tightening override takes effect immediately — the useful direction when work
-shape changes.
+The tier-13 keyword list itself is unchanged (`rethink`, `rearchitect`, `redesign
+the architecture`, `find failure states`, `update the plans`, `review the
+architecture`, `perform a deep review`), but it is **hoisted out of the `planning`
+namespace** so a `debugging`-classified request can still match it. This is a
+small, testable change with a large blast radius if omitted: without it the
+allowlist protects a class that almost never fires.
 
-**Why `slack` is now 3pp, not 15pp.** In rev 1 slack absorbed "don't throttle a
-legitimate burst". With an explicit *ceiling* the operator has already chosen the
-burst allowance, so slack only absorbs pacing noise; a large slack would silently
-spend the reserve. The reserve boundary is now the control and must be tight.
+**The residual risk is real and must be stated:** a genuine architectural request
+phrased as `"fix the tool failures"` still matches nothing and is treated as
+routine. Keywords cannot be complete. Two mitigations, both cheap:
+- **`force_model` is an unconditional escape hatch** — `force_model: gpt-5.6-sol`
+  always reaches the plan, so the operator is never *blocked* from gpt on demand.
+- **Calibration (§5.7) reports how often routine requests were denied a plan model
+  they would previously have taken**, so over-denial is visible rather than silent,
+  and the keyword list can be extended from evidence.
 
-#### 3.2.1 A constant conflict this design must avoid
-
-`final_stretch_seconds` and `hard_cap_percent` are compatible only for certain
-values. On an even burn the used-percentage at the start of the final stretch is
-`100 * (1 - FINAL_STRETCH/window)`. If that exceeds the hard cap, the cap closes
-first and **the final-stretch rule can never fire** — the tail is silently wasted
-every window. Measured for the 7-day window at a 95% cap:
-
-| `final_stretch` | even-burn used at stretch start | outcome |
-|---|---|---|
-| 2h | 98.8% | dead |
-| 6h | 96.4% | dead |
-| 8h | 95.2% | dead |
-| **10h** | **94.0%** | **live** |
-| 12h | 92.9% | live |
-
-**Constraint: `final_stretch > (1 - hard_cap/100) * window_seconds`** — for 7d at
-95% that is **> 8.4h**. Default is **10h**. This is an **asserted test invariant**
-(§5.1), not a comment: the constants live in different config blocks and would
-otherwise drift apart, and the failure mode is invisible.
+This is why the earlier `schedule:` ceiling knob is **deleted rather than
+tuned** — with a dormant detector, a tunable ceiling would have looked
+healthy while denying almost everything. Fixing the detector is the actual work.
 
 ### 3.3 Enforcement points — two hooks, because one branch returns early
 
@@ -305,24 +315,24 @@ hooks are needed in `route_task`:
 route_task()
  ├─ if requires_tools:                       # <-- THE ACTUAL LEAK (98.5% of the burn)
  │     tool_model = _select_tool_capable_model()   # highest tier; ignores min_tier
- │     [NEW] _apply_plan_governor(tool_model, klass=routine)
+ │     [NEW] _apply_plan_governor(tool_model)  # classify from prompt → deny if routine
  │     return RoutingDecision(...)                 # early return, ~line 994
  │
  └─ else:
        min_tier = _estimate_min_tier(...)
        selected = _select_model(min_tier)
-       [NEW] _apply_plan_governor(selected, klass=routine)
+       [NEW] _apply_plan_governor(selected)   # classify from prompt → deny if routine
        return RoutingDecision(...)
 ```
 
 **Hook 1 is the one that matters.**
 
-Plus the escalation paths, so a paced-out plan model cannot be reached by
+Plus the escalation paths, so a denied plan model cannot be reached by
 fallback either:
 
 - `escalate_on_failure(...)` — respect the governor when `prefer_model` targets a
   plan model.
-- `_build_tool_fallback_chain(...)` — must not *contain* a paced-out plan model.
+- `_build_tool_fallback_chain(...)` — must not *contain* a denied plan model.
   Care needed: the chain walks *up* in tier (`if tier > current_tier`), so for a
   routine request served by `deepseek-v4-pro` it would otherwise escalate
   straight into gpt — **the leak re-entering through the back door**.
@@ -332,14 +342,17 @@ fallback either:
 governed automatically with no governor edit, mirroring the provider-level
 `COMPRESSION_RESERVED_PROVIDERS` idiom.
 
-**Class determination** reuses existing logic rather than inventing a second
-classifier:
+**Class determination** — one class is permitted, so the classifier's only job is
+to decide *architectural or not*, and it must be right for the operator's sake:
 
-1. **Architectural** — `match_sub_type(task_type, prompt)` returns a tier ≥13
-   sub-type (the `planning` rethink/rearchitect keywords), **or** `force_model` is
-   set, **or** the request is an escalate-on-failure promotion. Computed from
-   `prompt`, so it is available on the tool branch too (§3.2.1).
+1. **Architectural** — a tier ≥13 sub-type matches **scanning every `task_type` in
+   `routing_table.yaml`** (not one namespace — see the defect in §3.2), **or**
+   `force_model` is set. Computed from `prompt`, so it is available on the tool
+   branch too.
 2. **Routine** — everything else, including every ordinary tool-bearing request.
+3. **Escalation inherits** the originating request's class: a failed architectural
+   request may escalate into the plan; a failed routine request may not (the
+   escalation chain must not contain a denied plan model — §3.3, §5.5).
 
 The lane names used for reporting (`force_model`, `escalation`,
 `rethink_rearchitect`) come from the classifier already in
@@ -348,61 +361,63 @@ routing and reporting cannot disagree — but note the **routing** classifier mu
 additionally use the prompt match, because the reason string is not written yet at
 enforcement time, and because the tool branch never records a tier clause.
 
-When paced out, re-select with the plan account excluded. Never return an empty
+When denied, re-select with the plan account excluded. Never return an empty
 decision — fall through to the existing `all_exhausted` path.
 
 Reason string must name cause and class, e.g.:
 
 ```
-tool-bearing request — gpt-5.6-sol paced out by plan governor
-  (routine used 71.2% vs ceiling 50% paced to 38.4%) — selected deepseek-v4-pro (tier 8)
+tool-bearing request — plan account denied to class 'routine' by plan governor
+  (architectural allowlist; gpt is reserved for architectural loads)
+  — selected deepseek-v4-pro (tier 8)
+architectural request — plan account allowed (hard cap 95%, at 41.2%)
+  — selected gpt-5.6-sol (tier 13)
 ```
 
-### 3.4 The honest consequence (understand before enabling)
+### 3.4 The honest consequence (measured, current era)
 
-Routine tool-bearing demand is **3,374/day** (47,244 over 14d). A 50% routine
-ceiling does not fund that. Sizing from the measured cap at ~47.7K tokens per plan
-tool call:
+With the allowlist, **routine never reaches the plan**, so the relevant question is
+no longer "how much routine can we afford?" but "what does the plan serve today,
+and what will it serve after?" Measured on the **clean era** — Sep 15–21, the 6
+days *after* compression closed and *before* gpt went dark — because any earlier
+window is polluted by compression, which was then the plan's single largest draw
+(39.1 Mtok in Sep 12–15 alone, 56% of that era) and is now gone:
 
-| capacity estimate (§1.2) | 50% routine allowance | ≈ plan calls/wk | ≈ plan calls/day | share of routine tool demand |
-|---|---|---|---|---|
-| 46.7 Mtok/wk (Sep-21 event) | 23.4 Mtok/wk | ~490 | ~70 | **2.1%** |
-| 163.4 Mtok/wk (Sep-12 event) | 81.7 Mtok/wk | ~1,713 | ~245 | **7.3%** |
+| lane served on the plan (clean era, 6d) | Mtok | share | after the allowlist |
+|---|---|---|---|
+| **tool-branch (theft)** | 28.6 | **97.6%** | **denied** → `deepseek-v4-pro` |
+| escalation (tool-failover) | 0.1 | 0.5% | denied (it is the tool branch failing over, not architecture) |
+| other tier-gated (planning/debugging via `min_tier`) | 0.6 | 1.9% | denied |
+| **genuine architectural demand** | **0.0** | **0.0%** | **this is what the plan is for — and it is currently dormant** |
 
-**So a 50% ceiling effectively makes gpt an architectural-only resource.** Routine
-tool work moves to `deepseek-v4-pro` almost entirely. That is the *intended*
-tradeoff of "reserve the rest for bigger architectural things" — and the operator
-confirmed it (§9.2). The 3.5× capacity uncertainty is exactly why the governor
-reads `used_percent` instead of predicting from this table; these figures set
-expectations only.
+Three facts the operator should see plainly, because they are the whole argument:
 
-**Reserve adequacy — measured on genuine architectural demand only.** An earlier
-draft cited 14.4 Mtok/wk; that figure was **wrong** because it was measured from
-*served* traffic, which is mostly the tool branch leaking into the plan (§1.1), not
-architectural work. Re-measured from the lanes themselves (30d):
+1. **The plan serves essentially one thing today: the tool branch, 97.6%.**
+   Denying routine removes virtually all of the plan's current draw at a stroke —
+   which is exactly the operator's instruction, and the single biggest change this
+   design makes.
+2. **Compression needs no governor action.** It *was* the largest draw (39.1 Mtok
+   in Sep 12–15), but the reserved-provider rule closed it: **1,341 gpt compression
+   calls / 103.5 Mtok in Sep 10–15, and 0 since Sep 15**. It must not be
+   double-counted as demand the governor must manage.
+3. **The architectural lane is currently dormant — 1 call in 30 days.** The
+   tier-13 `rethink`/`rearchitect` sub-type clause has fired **once across
+   208,530 logged calls** (the single `"capability tier 13 needed"` row);
+   escalation, once its compression component is stripped, is ~0.1 Mtok/6d and is
+   itself tool-failover, not architecture. This is the finding the allowlist
+   depends on: **"keep gpt for the architectural lane" is not a capacity problem
+   at all** — the lane has no draw to ration. The plan will sit nearly idle
+   (correctly — that is the point of reserving it) and be available in full the
+   moment a genuine architectural session begins.
 
-| genuine plan demand (excludes the tool leak) | Mtok/wk |
-|---|---|
-| escalate-on-failure promoted into the plan | 10.5 |
-| `force_model` lane | 2.0 |
-| tier-13 architecture sub-type → `gpt-5.6-x` | 0.1 |
-| **total** | **12.6** |
-
-At a 50% reserve (23.4 Mtok/wk at the low capacity estimate) that is **1.9×
-headroom**, and **6.5×** at the high estimate. Comfortable at the low estimate,
-which is a better position than the earlier figure suggested — but the reserve's
-*shape* matters as much as its size: a single long agentic architectural session
-at ~47.7K tokens/call can consume a large slice in one sitting, so the governor
-must never pace the architectural class (it only ever meets `hard_cap`), and
-calibration (§5.7) must check reserve consumption per window.
-
-**One more thing the numbers say:** `escalation` (10.5 Mtok/wk) is the largest
-genuine plan demand and 489 of `sol`'s calls arrived that way. Because escalation
-is classified architectural, it bypasses pacing — which is correct (a failed
-request legitimately needs the stronger model) but means escalation is the lane to
-watch if the reserve ever runs short. It is also why §5.5's fallback-chain
-containment test matters: the chain must not manufacture plan demand that the
-governor then treats as architectural.
+**Therefore the sizing conclusion inverts:** there is no headroom arithmetic to get
+wrong, because genuine architectural demand is ~0 today, against 46.7–163.4 Mtok/wk
+of capacity. The **residual risk is not capacity but detection** — that a genuine
+architectural request is phrased `"fix the tool failures"`, matches no keyword, and
+is denied while the plan sits idle. That is why §5.7 calibration reports denial
+counts by class, and why `force_model` is the unconditional escape hatch: the
+operator must never be blocked from gpt on demand, because the whole point of the
+allowlist is to have gpt ready *for* those sessions, not to ration them.
 
 ### 3.5 Failure modes — fail open
 
@@ -411,7 +426,7 @@ governor then treats as architectural.
 | Probe network error / timeout | Last good cache; if none or stale → **treat as open** |
 | Token expired (401) | Refresh once (reuse `_refresh_expired_codex_probe_token`); on failure → open |
 | Unparseable body | Log once → open |
-| `rate_limit.allowed == false` | **closed** — authoritative, overrides pacing |
+| `rate_limit.allowed == false` | **closed** — authoritative, overrides the allowlist |
 | State DB unwritable | In-memory for the process; never block routing |
 
 Stance: **an unreadable probe must never starve the plan.** Silent under-use is
@@ -426,15 +441,12 @@ governor:
   enabled: true                     # master switch; false == today's behaviour
   accounts:
     openai-codex:
-      routine_ceiling_percent: 50   # operator's lever; reserve = 100 - this
+      allowlist: [architectural]    # the ONLY class permitted on the plan (§3.2)
+      routine_ceiling_percent: 0    # explicit: routine gets none
       hard_cap_percent: 95          # absolute ceiling for all classes
-      slack_percent: 3              # pacing noise only (see §3.2)
-      final_stretch_seconds: 36000  # 10h; must exceed (1 - hard_cap/100) * window
-      reserve_lanes: [force_model, rethink_rearchitect]
   probe:
     min_interval_seconds: 300
     stale_after_seconds: 1800
-  schedule: []                      # dated ceiling overrides (see §3.2)
 ```
 
 Rollback = `enabled: false` (hot-reloaded ~30s). Same lever shape as the canary —
@@ -442,14 +454,14 @@ one operational idiom in this repo, not two.
 
 ### 3.7 Observability
 
-- Routing reason carries class + pacing arithmetic (§3.3).
-- New columns `router_logs.paced_out` (INTEGER DEFAULT 0) and
+- Routing reason carries class + decision (§3.3).
+- New columns `router_logs.plan_budget_denied` (INTEGER DEFAULT 0) and
   `router_logs.budget_class` (TEXT), so both are queryable.
-- `recovery_log` events `plan_paced_out` / `plan_closed` / `plan_probe_open`.
-- CLI `router_ops.py plan-budget`: current reading, ceiling, paced allowance,
-  reserve consumed, today's throttle count by class.
-- Nightly digest line: window used %, routine ceiling, reserve headroom,
-  throttled count.
+- `recovery_log` events `plan_denied_routine` / `plan_closed` / `plan_probe_open`.
+- CLI `router_ops.py plan-budget`: current reading, hard cap, class allowlist,
+  window used %, denial count by class today.
+- Nightly digest line: window used %, denial count by class, architectural call
+  count.
 
 ## 4. Implementation plan
 
@@ -458,21 +470,21 @@ TDD throughout — RED first per batch, one test file per batch, commit per batc
 | Batch | Deliverable | Test file |
 |---|---|---|
 | **B37a** | `gpt_budget.py`: readings, `fetch_reading()`, cache/staleness, fail-open. No routing wiring | `test_gpt_budget_reading.py` |
-| **B37b** | **`classify_request()`** — architectural (prompt sub-type ≥13 / `force_model` / escalation) vs routine, from `match_sub_type` | `test_gpt_budget_class.py` |
-| **B37c** | `evaluate_policy(reading, cfg, *, klass) -> Verdict` — pure function, §3.2/§3.3 tables | `test_gpt_budget_policy.py` |
-| **B37d** | `budget_policy.yaml` loader, hot reload, schedule resolution | `test_gpt_budget_config.py` |
+| **B37b** | **`classify_request()`** — architectural vs routine, scanning **all** task types for a tier ≥13 sub-type (fixing the `planning`-only scoping defect, §3.2), plus `force_model` and escalation-inheritance | `test_gpt_budget_class.py` |
+| **B37c** | `evaluate_policy(reading, cfg, *, klass) -> Verdict` — pure function, §3.2 truth table | `test_gpt_budget_policy.py` |
+| **B37d** | `budget_policy.yaml` loader, hot reload | `test_gpt_budget_config.py` |
 | **B37e** | **Hook 1** — `_apply_plan_governor` on the tool-bearing early-return path (the leak) | `test_gpt_budget_tool_branch.py` |
 | **B37f** | **Hook 2** — `_select_model(min_tier)` path | `test_gpt_budget_routing.py` |
 | **B37g** | Escalation + `_build_tool_fallback_chain` containment | `test_gpt_budget_escalation.py` |
 | **B37h** | Shared lane classifier extracted from `check-routing-stats.py` (reporting side) | `test_budget_classifier.py` |
 | **B37i** | Observability: columns, events, `router_ops.py plan-budget` | `test_gpt_budget_observability.py` |
 | **B37j** | Nightly digest line | `test_routing_stats_plan_budget.py` |
-| **B37k** | Calibration replay; set `slack`; confirm reserve adequacy | `test_gpt_budget_calibration.py` |
+| **B37k** | Calibration replay; confirm the allowlist denies routine without starving architecture | `test_gpt_budget_calibration.py` |
 
 Ordering: B37a–d are inert (no routing risk). **B37b lands before the hooks because
 class detection decides whether "keep gpt for architectural loads" actually
-works** — if an architectural keyword is misclassified as routine it gets paced
-out, and the operator's requirement fails silently. **B37e lands before B37f
+works** — if an architectural keyword is misclassified as routine it is denied the
+plan, and the operator's requirement fails silently. **B37e lands before B37f
 deliberately** — the tool branch is the actual leak and the highest-value hook.
 Each batch: new tests green **plus** full suite green before commit (currently
 782 passed / 1 pre-existing prod-DB failure, deselected as known-bad — not
@@ -487,37 +499,41 @@ riding in on the governor.
 
 ### 5.1 Unit — policy truth table (B37c, highest value)
 
-- `used=0, elapsed=0` → open.
-- Exactly at allowance (`used == ceiling*elapsed`) → open (boundary inclusive).
-- `used > allowance + slack` → paced out (routine only).
-- **Ceiling arithmetic:** `ceiling=50`, `elapsed=50` → allowance 25%, so
-  `used=30` → **paced out** (a naive even-burn test would wrongly pass this).
+- **Allowlist, architectural:** `used=0..94` → open; `used=96` → **closed**.
+- **Allowlist, routine:** `used=0` → **denied** (the decisive change — routine is
+  refused even in a pristine window, because it is not entitled to the plan at all).
+- **Routine is never `open`:** for `used` in 0..94 and every `reset_after`, routine
+  → denied. *Regression test against re-introducing a routine share.*
 - `used=96` → closed, **all classes** including architectural.
-- `used=100, elapsed=19.11, reset_after=165300` — the real 2026-09-25 state →
+- `used=100, elapsed=19.11, reset_after=165300` — the real 2026-09-21 state →
   **closed**. *Regression test for the actual incident.*
-- `used=94, reset_after=36000` → open (final stretch).
-- **Invariant (§3.2.1):** assert
-  `final_stretch_seconds > (1 - hard_cap/100) * secondary_window_seconds` for
-  every account in the shipped config.
-- `limit_window_seconds=0` → open (no division-guard throttle).
-- **Architectural class while routine is paced out → open** (reserve wins).
-- **Architectural class at `used=96` → closed** (hard cap beats reserve).
-- `enabled=false` → open, always.
+- `limit_window_seconds=0` → open for architectural (division guard; never
+  throttle on bad input).
+- `enabled=false` → open for **all** classes (rollback == today's behaviour).
+- **Deleted-concept guards (assert the machinery is gone, not merely unused):**
+  no `slack`/`final_stretch`/`schedule` key is read; a config carrying them still
+  loads and they have **no effect** on the verdict.
 - **Architectural detection (the operator's requirement, tested directly):**
-  - `match_sub_type("planning", "rearchitect the governor")` → tier 13 → class
-    **architectural**.
+  - `"rearchitect the budget governor"` → tier 13 → **architectural**.
   - `"let's rethink the budget approach"` → 13 → architectural.
   - `"review the architecture of the endpoint"` → 13 → architectural.
+  - **The cross-`task_type` fix (§3.2 defect) — the highest-value tests here:**
+    the *same* `"rearchitect the budget governor"` prompt must classify
+    architectural when the request is classified `debugging`, `coding`,
+    `session_compression`, or `research` — not only `planning`. A
+    `planning`-only regression fails these.
   - `"write a quick plan for the canary"` → 5 → **routine** (must not be
-    over-classified as architectural; a keyword list that only greps "plan" would
-    wrongly protect it).
-  - `"refactor the monitor script"`/`"fix the test failure"` → routine.
+    over-classified; a list that only greps "plan" would wrongly protect it).
+  - `"refactor the monitor script"`/`"fix the failing test"` → routine.
   - Plain tool-bearing request with no architectural keyword → routine.
   - **Tool-bearing + architectural keyword → architectural** (the case the branch
-    was stealing — §1.1). Must reach the reserve, not be paced out.
-  - Classifier is derived from `routing_table.yaml`, so a sub-type promoted to
-    tier ≥13 by config becomes architectural **without a code change**; a test
-    asserts a config-driven promotion is honoured.
+    was stealing — §1.1). Must reach the plan, not be denied.
+  - `force_model` → architectural regardless of prompt (the escape hatch).
+  - Classifier reads `routing_table.yaml`, so a sub-type promoted to tier ≥13 by
+    config becomes architectural **without a code change**; a test asserts a
+    config-driven promotion is honoured.
+  - **Known limitation asserted as a limitation:** `"fix the tool failures"` →
+    routine. Pinned so the gap is documented, not discovered in production.
 
 ### 5.2 Unit — probe and cache (B37a)
 
@@ -532,35 +548,35 @@ riding in on the governor.
 - **Hot-path guard:** second call within `min_interval_seconds` makes **zero** HTTP
   calls (counting fake client).
 
-### 5.3 Schedule / variability (B37d)
+### 5.3 Config surface (B37d)
 
-- No entries → top-level ceiling.
-- One passed entry → its ceiling.
-- Multiple passed → **last** wins (ordering test).
-- Future-dated entry → ignored (must not take effect early).
-- Tightening override mid-window takes effect on reload without restart.
-- Malformed entry → ignored with a warning, top-level ceiling retained (never fail
-  closed on bad config).
+- Allowlist missing → defaults to `[architectural]`, never "all classes".
+- Unknown class name in `allowlist` → architectural-only retained, warning logged
+  (never fail open into permitting routine).
+- `allowlist: []` → **no class permitted**; assert this is rejected as a
+  misconfiguration (an empty allowlist would silently black-hole the plan).
+- Tightening/loosening takes effect on reload without restart.
+- Malformed YAML → ignore the file, keep last good config, warning (never fail
+  closed on bad config, never fail *open into routine* either).
 
 ### 5.4 Integration — the leak (B37e, the critical batch)
 
-- **Tool-bearing + routine + paced out → `deepseek-v4-pro`, not gpt.** *The* test
-  for the reported problem: a plain tool-bearing request must not take
-  `gpt-5.6-sol` once routine is paced out.
-- Tool-bearing + architectural (rethink/rearchitect prompt) + paced out →
-  **still gpt-5.6-sol**.
-- Tool-bearing + `force_model=gpt-5.5` + closed → honoured.
-- `paced_out=1`, `budget_class='routine'` recorded.
+- **Tool-bearing + routine → `deepseek-v4-pro`, not gpt.** *The* test for the
+  reported problem: a plain tool-bearing request must not take `gpt-5.6-sol`.
+- Tool-bearing + architectural (rearchitect prompt) → **still gpt-5.6-sol**.
+- Tool-bearing + architectural + `used=96` → closed → non-plan model.
+- Tool-bearing + `force_model=gpt-5.5` → honoured (bypasses the allowlist).
+- `plan_budget_denied=1`, `budget_class='routine'` recorded.
 - Tool branch with governor disabled → identical to pre-B37 behaviour (captured
   baseline decision set).
 - Non-tool path (B37f) — same matrix.
-- **No empty decision:** only a plan model available and it paced out → verify the
+- **No empty decision:** only a plan model available and it denied → verify the
   `all_exhausted` fallback, not a crash or empty model.
 
 ### 5.5 Regression guards
 
 - **`_build_tool_fallback_chain` containment:** for a routine request served by
-  `deepseek-v4-pro`, the chain must **not** contain a paced-out plan model.
+  `deepseek-v4-pro`, the chain must **not** contain a denied plan model.
   (Back-door leak — the chain escalates upward in tier.)
 - `CHATGPT_PLAN_RESERVED_FROM_COMPRESSION` still holds, governor on or off.
 - `EXCLUDED_FROM_AUTO_ROUTING` (`gpt-6-astra`) never auto-selected.
@@ -586,9 +602,10 @@ riding in on the governor.
 
 Replay recorded history through the policy; report what it *would* have served per
 day by class. Success = a smoothed curve (no 700-then-6) **with the architectural
-lanes never throttled**, and reserve consumption ≤ 50% so headroom is retained. If
-the architectural lane is ever paced out during replay, the ceiling is too high and
-must come down before enabling. Set `slack` from observed pacing noise.
+lane never denied, and routine denial counts tracked per day** so the operator can
+see both the leakage removed and any over-denial of genuine architectural work. If
+the architectural lane is ever denied during replay, the detector's keyword
+coverage is too narrow and must be widened before enabling (§3.2).
 
 ## 6. Rollout
 
@@ -598,55 +615,50 @@ must come down before enabling. Set `slack` from observed pacing noise.
    counterfactual before it can block anything. Recommended, cheap.
 4. Enable at the **post-reset window start** (Sunday), so the first governed week
    begins from a clean window.
-5. Watch `paced_out` by class + digest for one full window; confirm the reserve is
-   not exhausted by architectural work.
+5. Watch `plan_budget_denied` by class + digest for one full window; confirm
+   routine denial is high and architectural denial is zero.
 6. Rollback: `enabled: false`.
 
 ## 7. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Routine tool work loses gpt almost entirely (§3.4) | Accepted by operator (§9.2); `routine_ceiling_percent` is the dial; observe-only quantifies it first |
-| Under-use: throttling too hard wastes paid capacity | Calibration §5.7; `final_stretch` releases the tail; nightly reserve-headroom line |
+| Routine tool work loses gpt entirely (§3.4) | This is the operator's decision, the whole point of the change; observe-only quantifies it first |
+| **Over-denial: a genuine architectural request missed by the keyword detector** | Calibration §5.7 reports denial-by-class; the detector gap is the residual risk (§3.4); `force_model` is the escape hatch |
 | Back-door leak via the fallback chain | §5.5 containment test |
 | Probe treats token expiry as "capped" (as it does today) | Fail-open on 401 + refresh; `source` visible |
-| Governor masks a capability regression by silently downgrading | Every throttle logged with class + arithmetic, counted, surfaced nightly |
-| Second mechanism diverging from `mark_rate_limited` | Composed by design: governor = predictive pacing, 429 = reactive backstop |
-| Constant drift (§3.2.1) | Asserted invariant test |
-| Ceiling override misfires (wrong date, bad edit) | Schedule resolution tests; malformed entry ignored, never fail-closed |
+| Governor masks a capability regression by silently downgrading | Every denial logged with class + decision, counted, surfaced nightly |
+| Second mechanism diverging from `mark_rate_limited` | Composed by design: governor = class gate, 429 = reactive backstop |
+| Detector scoped to one `task_type` and misses others (§3.2) | Cross-`task_type` scan; test matrix in §5.1 |
+| Allowlist edit misfires (typo, empty list) | §5.3 config-surface tests; malformed/empty rejected, never fail-open into routine |
 
 ## 8. Open questions
 
-1. **5h window semantics.** Design paces the 7d window. Should the 5h window get
-   its own routine ceiling (it moves ~4.8× faster per unit time), or is a 429 on
-   it sufficient? Current answer: rely on the reactive path for the 5h, pace only
-   the 7d.
+1. **5h window semantics.** Design gates the 7d window. Should the 5h window get
+   its own treatment (it moves ~4.8× faster per unit time), or is the 429 on it
+   sufficient? Current answer: rely on the reactive path for the 5h, gate only the
+   7d.
 2. **Reset-credit interaction.** 3 spare "reset usage" redemptions exist. When
    `closed` with >24h remaining, should the governor *recommend* redeeming one?
    Out of scope for B37; candidate follow-up.
-3. **Throttle-onset alert.** One-shot notification when routine first paces out in
-   a window, rather than only in the nightly digest.
-4. **Should the tool branch keep its highest-tier preference when *not* paced
-   out?** See §9.4 — independent of the governor.
+3. **Denial-onset alert.** One-shot notification when the first routine request is
+   denied in a window (i.e. the allowlist is actually blocking), rather than only
+   in the nightly digest.
+4. **Should the tool branch keep its highest-tier preference when *not* denied?**
+   See §9.4 — independent of the governor.
 
 ## 9. Decisions
 
-1. **Ceiling semantics — read as (a), awaiting final confirmation.** "Burn up to
-   50% by end of day" is implemented as **(a): the routine ceiling is 50% of the
-   7-day window, paced linearly (~7.1%/day), leaving 50% reserved.** Alternatives
-   are ~3.5× different in reserve size:
-   - **(a) as implemented** — ceiling 50% of the *window*, paced. Reserve 50%.
-   - **(b) per-day even share** — routine capped at ~7.1% of window *per day*,
-     i.e. ~93% reserve.
-   - **(c) front-loaded** — 50% of *remaining* budget each day (drains the week in
-     ~3 days).
-   (a) and (b) differ by one config value; (c) is a different policy function.
-   The clarify prompt timed out so (a) is what is specified — a one-value change
-   if (b) was meant.
-2. **RESOLVED — "Keep gpt for architectural type loads."** §3.4's consequence is
-   accepted: gpt becomes architectural-only for routine work (~2–7% of routine
-   tool calls keep it), and the architectural class is protected via the prompt
-   sub-type match (§3.2.1) plus `force_model` and escalation.
+1. **Policy model — RESOLVED by operator: "Just keep it for the architectural
+   lane."** Supersedes the earlier "burn up to X% and reserve the rest" split.
+   The design is now an **allowlist**: `[architectural]` only, routine gets zero.
+   The earlier (a)/(b)/(c) ceiling-semantics question is moot — there is no routine
+   share to pace.
+2. **RESOLVED — architectural detection.** Class is architectural iff a tier ≥13
+   sub-type matches scanning **all** `task_type`s (§3.2), or `force_model` is set.
+   Escalation inherits the originating request's class (a failed architectural
+   request may escalate into the plan; a failed routine one may not). The
+   `planning`-only scoping defect is fixed as part of this batch (§3.2, §5.1).
 3. **Observe-only phase** before enabling, or enable directly post-reset?
    *Recommendation: observe-only — it quantifies §3.4 on real traffic at zero
    risk, and GPT is dark until Sunday anyway.*
@@ -661,7 +673,44 @@ must come down before enabling. Set `slack` from observed pacing noise.
 
 ## 10. Revision history
 
-**rev 2 (this document) — policy, enforcement point, and reserve sizing all
+**rev 4 (this document) — policy becomes an allowlist: architectural lane only.**
+
+- **Policy changed** from rev 3's routine-ceiling + architectural-reserve split to
+  an **allowlist**: `[architectural]` only, `routine_ceiling_percent: 0`. Routine
+  traffic — including ordinary tool-bearing requests — is denied at any window
+  level, not merely paced (§3.2). This is the operator's decision, taken verbatim:
+  *"Just keep it for the architectural lane."*
+- **Deleted the pacing apparatus:** the linear ramp, daily checkpoints, `slack`,
+  `final_stretch` tail release, and the `schedule:` variability knob. None of them
+  answer a question that still exists — with routine fully excluded there is no
+  routine share to pace. `hard_cap_percent` remains as the only arithmetic (§3.2,
+  §3.6).
+- **Fixed a classification defect the allowlist would have made fatal.** The
+  detector keyed architectural detection on `task_type='planning'`, so a
+  `"rearchitect …"` prompt classified `debugging`/`coding`/`session_compression`
+  (~30% `debugging` alone) was invisible — and an allowlist built on it would *deny*
+  the requests it exists to protect. The classifier now scans **all** `task_type`s in
+  `routing_table.yaml` for a tier ≥13 sub-type (§3.2, §3.3, §5.1).
+- **Consequence re-measured on the clean era** (Sep 15–21, after compression closed
+  and before gpt went dark): the plan serves the tool branch (97.6%), then
+  escalation (~0.5%, itself tool-failover), then tier-gated planning/debugging
+  (1.9%). **Genuine architectural demand is ~0 — the tier-13 clause has fired once
+  across 208,530 calls.** Compression (once the largest draw) is already
+  closed by the reserved-provider rule (0 calls since Sep 15). The residual risk is
+  detection, not capacity: over-denial of a mis-worded architectural request (§3.4).
+- **Escalation reclassified.** Escalation is tool-failover, not architecture, so it
+  no longer counts as architectural; it *inherits* the originating request's class
+  (a failed routine request must not fail over into the plan — the leak re-entering
+  through the back door).
+- **Known limitation documented rather than hidden:** `"fix the tool failures"`
+  matches no keyword and is denied (§5.1); `force_model` remains the escape hatch.
+
+**rev 3 — architectural class from prompt, reserve resize, batch reorder.** (Changes
+were folded into the text at commit `295aed6`: architectural class detected from
+`prompt` via `match_sub_type` ≥13, reserve re-sized to 12.6 Mtok/wk, B37b reordered
+to the classifier.)
+
+**rev 2 — policy, enforcement point, and reserve sizing all
 corrected after measurement.**
 
 - **Policy changed** from even-burn (symmetric, `slack=15pp`) to the operator's
