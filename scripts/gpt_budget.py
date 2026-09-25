@@ -31,6 +31,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
 # The billing account the ChatGPT plan lives under. The governor keys on this
 # account, not on individual model names, because a 429 on the account caps
 # every model that draws on it.
@@ -501,3 +506,120 @@ def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str
 
     allowed = _known_classes(cfg.allowlist)
     return VERDICT_OPEN if klass in allowed else VERDICT_DENIED
+
+
+# ── Config loading (B37d) ────────────────────────────────────────────────────
+
+# Path to the operator-tunable policy file. Tests monkeypatch this to a
+# throwaway path before any call.
+BUDGET_POLICY_PATH = str(
+    Path(__file__).resolve().parent / "budget_policy.yaml"
+)
+
+# Re-read cadence, matching experiments.yaml's hot-reload idiom (~30s).
+_POLICY_TTL = 30.0
+
+_policy_cache: Optional[GovernorConfig] = None
+_policy_cache_time: float = 0.0
+_policy_load_error_logged: bool = False
+
+
+def _default_config() -> GovernorConfig:
+    return GovernorConfig(
+        enabled=True,
+        allowlist=[CLASS_ARCHITECTURAL],
+        routine_ceiling_percent=0,
+        hard_cap_percent=95.0,
+    )
+
+
+def _parse_policy(text: str) -> Optional[GovernorConfig]:
+    """Parse the policy file text into a GovernorConfig, or None if invalid.
+
+    Malformed YAML returns None (caller keeps the last good config). An
+    ``allowlist: []`` is treated as a misconfiguration and rejected (None) so
+    the plan can never be silently black-holed. Unknown class names are dropped,
+    not used to widen entitlement.
+    """
+    if yaml is None:
+        return None
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    governor = data.get("governor") or {}
+    if not isinstance(governor, dict):
+        return _default_config()
+
+    enabled = bool(governor.get("enabled", True))
+
+    accounts = governor.get("accounts") or {}
+    account = accounts.get(GOVERNED_ACCOUNT) if isinstance(accounts, dict) else None
+    if not isinstance(account, dict):
+        account = {}
+
+    allowlist = account.get("allowlist", [CLASS_ARCHITECTURAL])
+    if not isinstance(allowlist, list):
+        allowlist = [CLASS_ARCHITECTURAL]
+    # Drop unknown class names; never let an unknown token widen entitlement.
+    allowlist = [c for c in allowlist if c in (CLASS_ARCHITECTURAL, CLASS_ROUTINE)]
+    if not allowlist:
+        # Empty allowlist would black-hole the plan — reject the whole file.
+        return None
+
+    hard_cap_percent = float(account.get("hard_cap_percent", 95.0))
+    routine_ceiling_percent = float(account.get("routine_ceiling_percent", 0.0))
+
+    return GovernorConfig(
+        enabled=enabled,
+        allowlist=allowlist,
+        routine_ceiling_percent=routine_ceiling_percent,
+        hard_cap_percent=hard_cap_percent,
+    )
+
+
+def load_governor_config(force: bool = False) -> GovernorConfig:
+    """Load the current policy, cached with a ~30s TTL for hot reload.
+
+    On any parse failure (malformed YAML, empty allowlist) the last good config
+    is retained and a warning is logged once — never fail closed (starve the
+    plan) and never fail open into routine (re-open the leak).
+    """
+    global _policy_cache, _policy_cache_time, _policy_load_error_logged
+
+    now = _now_epoch()
+    if _policy_cache is not None and not force and (now - _policy_cache_time) < _POLICY_TTL:
+        return _policy_cache
+
+    try:
+        text = Path(BUDGET_POLICY_PATH).read_text()
+    except OSError:
+        # No file yet → default (architectural-only, enabled).
+        cfg = _default_config()
+        _policy_cache = cfg
+        _policy_cache_time = now
+        return cfg
+
+    parsed = _parse_policy(text)
+    if parsed is None:
+        if not _policy_load_error_logged:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "budget_policy.yaml is invalid or has an empty allowlist — "
+                "keeping the last good config (or the architectural-only default)"
+            )
+            _policy_load_error_logged = True
+        # Keep the last good config; fall back to default if none yet.
+        cfg = _policy_cache if _policy_cache is not None else _default_config()
+    else:
+        cfg = parsed
+        _policy_load_error_logged = False
+
+    _policy_cache = cfg
+    _policy_cache_time = now
+    return cfg
