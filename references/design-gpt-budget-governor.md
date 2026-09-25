@@ -139,8 +139,10 @@ Existing partial mechanisms (do not duplicate):
 - Not a replacement for the 429 path. The governor gates by class; `mark_rate_limited`
   remains the reactive backstop.
 - Not applied to `force_model` (operator intent wins) or compression (barred).
-- Not a fix for the tool branch's highest-tier preference itself — see §9.4, a
-  separate decision worth making anyway.
+- Not a fix for the tool branch's highest-tier preference itself — see §9.4. That
+  follow-up is now **done** as B38 (commit `2ad68dd`); the governor and the floor
+  fix are complementary: the floor stops *ordinary* tool work reaching the plan,
+  the allowlist stops whatever still arrives.
 
 ## 3. Architecture
 
@@ -495,6 +497,16 @@ Each batch: new tests green **plus** full suite green before commit (currently
 traffic" defect at source, and it deserves its own batch + review rather than
 riding in on the governor.
 
+**RESOLVED — implemented as B38 (commit `2ad68dd`).** `_select_tool_capable_model`
+now takes `min_tier` and returns the cheapest tool-capable model meeting it (cost
+order is `MODEL_COST_ORDER`, which is price-based: `deepseek-v4-pro` tier 8 is
+cheaper than `glm-5.3` tier 6). `min_tier` is now computed *above* the tool-branch
+early return, and the branch composes it with a new `_architectural_floor(prompt)`
+term — necessary because `_estimate_min_tier` scans only the request's own
+`task_type` while the tier-13 sub-type lives solely under `planning`, so a genuine
+architectural ask tagged `coding` scored 6 and would have been demoted off
+`gpt-5.6-sol`. See `references/build-b38-tool-branch-tier-floor.md`.
+
 ## 5. Test plan
 
 ### 5.1 Unit — policy truth table (B37c, highest value)
@@ -645,7 +657,10 @@ coverage is too narrow and must be widened before enabling (§3.2).
    denied in a window (i.e. the allowlist is actually blocking), rather than only
    in the nightly digest.
 4. **Should the tool branch keep its highest-tier preference when *not* denied?**
-   See §9.4 — independent of the governor.
+   See §9.4 — **RESOLVED as B38 (`2ad68dd`)**: it should not. The branch now honours
+   `min_tier`, composed with an architectural floor. Consequence: 10.0% of
+   tool-branch picks change (sol 1,267 / glm-5.3 476 / terra 224 / luna 2 → all
+   `deepseek-v4-pro`), worth −$987.71 over the 30d window measured.
 
 ## 9. Decisions
 
