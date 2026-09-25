@@ -37,6 +37,10 @@ SWITCH_ISO = SWITCH_DT.isoformat()
 # correctly instead of silently falling back to tier 0 / 1.0x.
 from models import MODEL_REGISTRY  # noqa: E402
 
+# Lane classification is shared with the router (B37h) so the report and the
+# routing decision can never disagree about which lane fired.
+from gpt_budget import classify_lane as _classify_lane  # noqa: E402
+
 TIERS = {name: cfg["tier"] for name, cfg in MODEL_REGISTRY.items()}
 
 # Compute units (relative to deepseek-v4-flash = 1.0) — derived from
@@ -187,18 +191,16 @@ def main():
             tt = r["task_type"] or r["workload_type"] or "unknown"
             router_task_types[tt] = router_task_types.get(tt, 0) + 1
             # Classify which routing lane fired, from the logged routing_reason.
+            # Delegated to the shared helper (B37h) so routing and reporting can
+            # never disagree about what a lane is — a drifted report would show
+            # a leak that is not there, or hide one that is.
             reason = (r["routing_reason"] if "routing_reason" in r.keys() else "") or ""
             model = canonical_model(r["final_model"] or r["model_used"] or "unknown")
-            if "forced model" in reason:
-                router_lanes["force_model"] += 1
-            elif r["escalated"] or "escalation" in reason:
-                router_lanes["escalation"] += 1
-            elif TIERS.get(model, 0) >= 13:
-                # The rethink/rearchitect trigger is the ONLY normal-routing path to
-                # tier 13+ (gpt-5.6-sol); escalation/force are handled above.
-                router_lanes["rethink_rearchitect"] += 1
-            else:
-                router_lanes["normal"] += 1
+            router_lanes[_classify_lane(
+                reason=reason,
+                tier=TIERS.get(model, 0),
+                escalated=bool(r["escalated"]),
+            )] += 1
             if r["success"]:
                 completion_success += 1
             else:

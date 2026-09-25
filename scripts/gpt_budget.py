@@ -376,6 +376,55 @@ CLASS_ROUTINE = "routine"
 _ARCHITECTURAL_MIN_TIER = 13
 
 
+# ── Lane classification (B37h) ───────────────────────────────────────────────
+#
+# One question — "which routing lane fired?" — with two consumers: the router
+# (at enforcement time) and check-routing-stats.py (reporting, from the logged
+# reason). Two implementations would drift, and a drifted report is worse than
+# none: it would show a leak that is not there, or hide one that is.
+#
+# The names below are the reporting vocabulary already in use, and the
+# precedence is load-bearing — changing it silently re-buckets history.
+LANE_FORCE_MODEL = "force_model"
+LANE_ESCALATION = "escalation"
+LANE_RETHINK_REARCHITECT = "rethink_rearchitect"
+LANE_NORMAL = "normal"
+
+
+def classify_lane(reason: str, tier: int = 0, *, escalated: bool = False) -> str:
+    """Classify which routing lane a logged request used.
+
+    Precedence, highest first — matching the counts
+    ``check-routing-stats.py`` has always reported:
+
+    1. ``force_model`` — an explicit operator override.
+    2. ``escalation`` — a retry after a failure (the ``escalated`` column is
+       authoritative, so a terse reason still buckets correctly).
+    3. ``rethink_rearchitect`` — the tier-13+ architectural trigger, the only
+       normal-routing path to gpt-5.6-sol.
+    4. ``normal`` — everything else.
+
+    A **denial** is never the architectural lane, even though denial reasons
+    quote the allowlist and therefore contain the word "architectural". Denials
+    are recognised by their ``plan account denied`` marker and are explicitly
+    excluded before the architectural check, so the operator's view of the
+    architectural lane cannot be inflated by routine traffic that was refused
+    the plan.
+    """
+    r = reason or ""
+    if "forced model" in r:
+        return LANE_FORCE_MODEL
+    if escalated or "escalation" in r:
+        return LANE_ESCALATION
+    # A refusal is never architectural work. Checked before the tier test
+    # because a denial reason quotes the allowlist wording.
+    if "plan account denied" in r:
+        return LANE_NORMAL
+    if tier >= _ARCHITECTURAL_MIN_TIER:
+        return LANE_RETHINK_REARCHITECT
+    return LANE_NORMAL
+
+
 def classify_request(
     task_type: Optional[str],
     prompt: Optional[str],

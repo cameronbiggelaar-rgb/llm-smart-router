@@ -173,3 +173,72 @@ def test_report_json_has_lane_block(tmp_path):
     assert lanes["escalation"] == 1
     assert lanes["force_model"] == 1
     assert lanes["normal"] == 1
+
+
+def test_report_buckets_governor_denials_as_normal_not_architectural(tmp_path):
+    """B37h integration: a routine denial must not inflate the architectural lane.
+
+    This is the failure the shared classifier exists to prevent. A denial reason
+    quotes the allowlist ("architectural allowlist"), so a naive substring test
+    on the word would report every refused routine request as architectural work
+    — showing the operator a busy protected lane that is in fact dormant.
+    """
+    state_db = str(tmp_path / "state.db")
+    router_db = str(tmp_path / "router_logs.db")
+    _make_state_db(state_db)
+    _make_router_db(router_db)
+
+    # Append a denial row and a governed architectural row to the fixture DB.
+    conn = sqlite3.connect(router_db)
+    ts = datetime.now(timezone.utc).isoformat()
+    denial = (
+        ts, "s1", "deepseek-v4-pro", "cloud", "coding", 1, 1, 1, 1, 1,
+        100, 50, 1.0, 0.0, 1, 0, 0, 0, "", 0.85, 0, 0, 0, 0, "", 0, 0, 0, 0,
+        0, "", "off", 0.0, 0.0, "r5", "biggie-router", 0, "normal_chat", 1,
+        0, 0, 1, 0, "deepseek-v4-pro",
+        "tool-bearing request \u2014 plan account denied to class 'routine' by plan "
+        "governor (architectural allowlist; gpt is reserved for architectural "
+        "loads) \u2014 selected deepseek-v4-pro (tier 8)",
+    )
+    governed_arch = (
+        ts, "s1", "gpt-5.6-sol", "openai-codex", "planning", 1, 1, 1, 1, 1,
+        100, 50, 1.0, 0.0, 1, 0, 0, 0, "", 0.9, 0, 0, 0, 0, "", 0, 0, 0, 0,
+        0, "", "off", 0.0, 0.0, "r6", "biggie-router", 0, "normal_chat", 1,
+        0, 0, 1, 0, "gpt-5.6-sol",
+        "capability tier 13 needed, selected gpt-5.6-sol (tier 13); "
+        "plan governor allowed class 'architectural'",
+    )
+    conn.executemany(
+        """INSERT INTO router_logs (
+            timestamp, session_id, model_used, provider, task_type,
+            prompt_length, context_length, tool_call_count, contains_code_blocks,
+            has_keywords, input_tokens, output_tokens, latency_seconds,
+            estimated_cost_usd, success, retry_count, escalated, user_corrected,
+            error_type, complexity_score, instruction_count, has_format_constraint,
+            has_niche_references, is_subagent, parent_model, delegation_depth,
+            user_correction_count, model_switched, session_message_count,
+            cheaper_model_would_work, recommended_model, compression_level,
+            compression_savings_pct, compression_time_ms, request_id,
+            requested_model, streaming, workload_type, requires_tools,
+            context_tokens, empty_stream, saw_content, saw_tool_calls, final_model,
+            routing_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?)""",
+        [denial, governed_arch],
+    )
+    conn.commit()
+    conn.close()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        crs.STATE_DB = state_db
+        crs.ROUTER_LOGS = router_db
+        sys.argv = ["check-routing-stats.py", "--json"]
+        crs.main()
+    sys.argv = ["check-routing-stats.py"]
+
+    lanes = json.loads(buf.getvalue())["router_endpoint"]["lanes"]
+    # The denial joined `normal`; only the genuine tier-13 row is architectural.
+    assert lanes["normal"] == 2, lanes
+    assert lanes["rethink_rearchitect"] == 2, lanes
