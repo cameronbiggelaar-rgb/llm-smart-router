@@ -44,8 +44,27 @@ Mechanism, verified in `router.py`:
   however ordinary the request. Tool-bearing volume is **3,374/day** (47,244
   over 14d). There is no complexity gate on this path at all.
 
+**And it does worse than leak — it steals architectural traffic.** `gpt-5.6-sol`
+is tier 13, so it always wins the highest-tier tool pick. Of **1,760** `sol` calls
+in 30d:
+
+| how `sol` was reached | calls |
+|---|---|
+| **tool branch** (ignores `min_tier`) | **1,267** |
+| escalation | 489 |
+| **architectural tier-13 lane** | **3** |
+| `force_model` | 1 |
+
+`sol` is *the* architectural model, and the architectural lane accounts for
+**0.2%** of its calls. **83%** of `planning` traffic is tool-bearing (4,377 of
+5,296). So when you ask for a rethink/rearchitect, the request is normally
+claimed by the tool branch *before* the tier-13 architecture rule is ever
+consulted — it lands on `sol` by accident, at 47.7K tokens/call, for reasons that
+have nothing to do with the request being architectural.
+
 That is the boom-bust engine: one ordinary tool-bearing workload can drain a
-week of plan capacity in a day.
+week of plan capacity in a day, and the fix cannot be tier-based alone because
+the tier is computed *after* the branch that matters.
 
 ### 1.2 Why no internal capacity model is possible (validates §3.1)
 
@@ -202,8 +221,38 @@ routine has had its 50% and architectural retained 50% throughout. The reserve i
 
 | class | members | governed by |
 |---|---|---|
-| **architectural (reserve)** | tier-13+ rethink/rearchitect lane; `force_model` | hard cap only |
+| **architectural (reserve)** | the tier-13 rethink/rearchitect lane (detected from `prompt` — see §3.3.1); `force_model`; escalate-on-failure promotions | hard cap only |
 | **routine** | every other auto-routed plan-account request, **incl. the tool-bearing branch** | routine ceiling, paced |
+
+**The architectural class must be detected from the prompt, not from `min_tier`.**
+The canonical architectural signal is a *sub-type keyword match* in
+`routing_table.yaml`:
+
+```yaml
+planning:
+  default_tier: 7
+  sub_types:
+    - keywords: ["rethink", "rearchitect", "redesign the architecture",
+                 "find failure states", "update the plans", "review the architecture"]
+      tier: 13
+    - keywords: ["architecture", "system design", "production", "scalable", "migration"]
+      tier: 8
+```
+
+Verified firing: `"rearchitect the router …"` → sub-type 13 → `min_tier` 13;
+`"let's rethink the budget approach"` → 13; `"review the architecture of the
+endpoint"` → 13. **`match_sub_type(task_type, prompt)` is therefore the
+classifier** — and `prompt` is already a `route_task` parameter, available before
+the tool branch, so the governor can classify correctly on *both* hooks. Reuse
+the existing helper; do not invent a second keyword list.
+
+**Why this matters more than it looks.** The tool branch returns *before*
+`_estimate_min_tier` runs, so a tool-bearing architectural request (83% of
+`planning` is tool-bearing — 4,377 of 5,296) would otherwise be classified from a
+tier that was never computed. Classifying from `prompt` also means the
+architectural class survives the branch that was stealing it (§1.1): with the
+governor in place, "rearchitect the X" reaches the reserve through the tool
+branch, which is what "keep gpt for architectural loads" requires.
 
 **Variability by work shape** (the operator's explicit ask). Dated overrides
 raise or lower the ceiling when the shape of work is known:
@@ -283,10 +332,21 @@ fallback either:
 governed automatically with no governor edit, mirroring the provider-level
 `COMPRESSION_RESERVED_PROVIDERS` idiom.
 
-**Class determination** reuses the classifier already in
-`check-routing-stats.py` (distinguishes `force_model`, `escalation`, and tier-13+
-`rethink_rearchitect`), extracted to a shared helper so routing and reporting
-cannot disagree.
+**Class determination** reuses existing logic rather than inventing a second
+classifier:
+
+1. **Architectural** — `match_sub_type(task_type, prompt)` returns a tier ≥13
+   sub-type (the `planning` rethink/rearchitect keywords), **or** `force_model` is
+   set, **or** the request is an escalate-on-failure promotion. Computed from
+   `prompt`, so it is available on the tool branch too (§3.2.1).
+2. **Routine** — everything else, including every ordinary tool-bearing request.
+
+The lane names used for reporting (`force_model`, `escalation`,
+`rethink_rearchitect`) come from the classifier already in
+`check-routing-stats.py` (reason-string based). Extract that to a shared helper so
+routing and reporting cannot disagree — but note the **routing** classifier must
+additionally use the prompt match, because the reason string is not written yet at
+enforcement time, and because the tool branch never records a tier clause.
 
 When paced out, re-select with the plan account excluded. Never return an empty
 decision — fall through to the existing `all_exhausted` path.
@@ -301,27 +361,48 @@ tool-bearing request — gpt-5.6-sol paced out by plan governor
 ### 3.4 The honest consequence (understand before enabling)
 
 Routine tool-bearing demand is **3,374/day** (47,244 over 14d). A 50% routine
-ceiling does not fund that. Sizing from the measured cap at ~52K tokens per plan
+ceiling does not fund that. Sizing from the measured cap at ~47.7K tokens per plan
 tool call:
 
 | capacity estimate (§1.2) | 50% routine allowance | ≈ plan calls/wk | ≈ plan calls/day | share of routine tool demand |
 |---|---|---|---|---|
-| 46.7 Mtok/wk (Sep-21 event) | 23.4 Mtok/wk | ~447 | ~64 | **1.9%** |
-| 163.4 Mtok/wk (Sep-12 event) | 81.7 Mtok/wk | ~1,564 | ~223 | **6.6%** |
+| 46.7 Mtok/wk (Sep-21 event) | 23.4 Mtok/wk | ~490 | ~70 | **2.1%** |
+| 163.4 Mtok/wk (Sep-12 event) | 81.7 Mtok/wk | ~1,713 | ~245 | **7.3%** |
 
 **So a 50% ceiling effectively makes gpt an architectural-only resource.** Routine
 tool work moves to `deepseek-v4-pro` almost entirely. That is the *intended*
-tradeoff of "reserve the rest for bigger architectural things" — but it is a
-large behavioural change and the operator should confirm it is what they mean
-(§9.2). The 3.5× capacity uncertainty is exactly why the governor reads
-`used_percent` instead of predicting from this table; these figures set
+tradeoff of "reserve the rest for bigger architectural things" — and the operator
+confirmed it (§9.2). The 3.5× capacity uncertainty is exactly why the governor
+reads `used_percent` instead of predicting from this table; these figures set
 expectations only.
 
-**Reserve adequacy:** architectural demand measures **14.4 Mtok/week** (tier-13+
-lane 11.6 + force_model 2.8, from 30d of traffic) — **1.6× headroom** at the low
-capacity estimate, **5.7×** at the high one. *At the low estimate the reserve is
-adequate but not generous*, which is why `routine_ceiling_percent` must be a
-tuning knob and calibration (§5.7) must check it.
+**Reserve adequacy — measured on genuine architectural demand only.** An earlier
+draft cited 14.4 Mtok/wk; that figure was **wrong** because it was measured from
+*served* traffic, which is mostly the tool branch leaking into the plan (§1.1), not
+architectural work. Re-measured from the lanes themselves (30d):
+
+| genuine plan demand (excludes the tool leak) | Mtok/wk |
+|---|---|
+| escalate-on-failure promoted into the plan | 10.5 |
+| `force_model` lane | 2.0 |
+| tier-13 architecture sub-type → `gpt-5.6-x` | 0.1 |
+| **total** | **12.6** |
+
+At a 50% reserve (23.4 Mtok/wk at the low capacity estimate) that is **1.9×
+headroom**, and **6.5×** at the high estimate. Comfortable at the low estimate,
+which is a better position than the earlier figure suggested — but the reserve's
+*shape* matters as much as its size: a single long agentic architectural session
+at ~47.7K tokens/call can consume a large slice in one sitting, so the governor
+must never pace the architectural class (it only ever meets `hard_cap`), and
+calibration (§5.7) must check reserve consumption per window.
+
+**One more thing the numbers say:** `escalation` (10.5 Mtok/wk) is the largest
+genuine plan demand and 489 of `sol`'s calls arrived that way. Because escalation
+is classified architectural, it bypasses pacing — which is correct (a failed
+request legitimately needs the stronger model) but means escalation is the lane to
+watch if the reserve ever runs short. It is also why §5.5's fallback-chain
+containment test matters: the chain must not manufacture plan demand that the
+governor then treats as architectural.
 
 ### 3.5 Failure modes — fail open
 
@@ -377,25 +458,34 @@ TDD throughout — RED first per batch, one test file per batch, commit per batc
 | Batch | Deliverable | Test file |
 |---|---|---|
 | **B37a** | `gpt_budget.py`: readings, `fetch_reading()`, cache/staleness, fail-open. No routing wiring | `test_gpt_budget_reading.py` |
-| **B37b** | `evaluate_policy(reading, cfg, *, klass) -> Verdict` — pure function, §3.2/§3.3 tables | `test_gpt_budget_policy.py` |
-| **B37c** | `budget_policy.yaml` loader, hot reload, schedule resolution | `test_gpt_budget_config.py` |
-| **B37d** | **Hook 1** — `_apply_plan_governor` on the tool-bearing early-return path | `test_gpt_budget_tool_branch.py` |
-| **B37e** | **Hook 2** — `_select_model(min_tier)` path | `test_gpt_budget_routing.py` |
-| **B37f** | Escalation + `_build_tool_fallback_chain` containment | `test_gpt_budget_escalation.py` |
-| **B37g** | Shared lane classifier extracted from `check-routing-stats.py` | `test_budget_classifier.py` |
-| **B37h** | Observability: columns, events, `router_ops.py plan-budget` | `test_gpt_budget_observability.py` |
-| **B37i** | Nightly digest line | `test_routing_stats_plan_budget.py` |
-| **B37j** | Calibration replay; set `slack`; confirm reserve adequacy | `test_gpt_budget_calibration.py` |
+| **B37b** | **`classify_request()`** — architectural (prompt sub-type ≥13 / `force_model` / escalation) vs routine, from `match_sub_type` | `test_gpt_budget_class.py` |
+| **B37c** | `evaluate_policy(reading, cfg, *, klass) -> Verdict` — pure function, §3.2/§3.3 tables | `test_gpt_budget_policy.py` |
+| **B37d** | `budget_policy.yaml` loader, hot reload, schedule resolution | `test_gpt_budget_config.py` |
+| **B37e** | **Hook 1** — `_apply_plan_governor` on the tool-bearing early-return path (the leak) | `test_gpt_budget_tool_branch.py` |
+| **B37f** | **Hook 2** — `_select_model(min_tier)` path | `test_gpt_budget_routing.py` |
+| **B37g** | Escalation + `_build_tool_fallback_chain` containment | `test_gpt_budget_escalation.py` |
+| **B37h** | Shared lane classifier extracted from `check-routing-stats.py` (reporting side) | `test_budget_classifier.py` |
+| **B37i** | Observability: columns, events, `router_ops.py plan-budget` | `test_gpt_budget_observability.py` |
+| **B37j** | Nightly digest line | `test_routing_stats_plan_budget.py` |
+| **B37k** | Calibration replay; set `slack`; confirm reserve adequacy | `test_gpt_budget_calibration.py` |
 
-Ordering: B37a–c are inert (no routing risk). **B37d lands before B37e
+Ordering: B37a–d are inert (no routing risk). **B37b lands before the hooks because
+class detection decides whether "keep gpt for architectural loads" actually
+works** — if an architectural keyword is misclassified as routine it gets paced
+out, and the operator's requirement fails silently. **B37e lands before B37f
 deliberately** — the tool branch is the actual leak and the highest-value hook.
 Each batch: new tests green **plus** full suite green before commit (currently
 782 passed / 1 pre-existing prod-DB failure, deselected as known-bad — not
 "fixed").
 
+**Not in B37, deliberately:** the §9.4 fix to `_select_tool_capable_model` (honour
+`min_tier`). It is a routing-behaviour change that fixes the "steals architectural
+traffic" defect at source, and it deserves its own batch + review rather than
+riding in on the governor.
+
 ## 5. Test plan
 
-### 5.1 Unit — policy truth table (B37b, highest value)
+### 5.1 Unit — policy truth table (B37c, highest value)
 
 - `used=0, elapsed=0` → open.
 - Exactly at allowance (`used == ceiling*elapsed`) → open (boundary inclusive).
@@ -413,6 +503,21 @@ Each batch: new tests green **plus** full suite green before commit (currently
 - **Architectural class while routine is paced out → open** (reserve wins).
 - **Architectural class at `used=96` → closed** (hard cap beats reserve).
 - `enabled=false` → open, always.
+- **Architectural detection (the operator's requirement, tested directly):**
+  - `match_sub_type("planning", "rearchitect the governor")` → tier 13 → class
+    **architectural**.
+  - `"let's rethink the budget approach"` → 13 → architectural.
+  - `"review the architecture of the endpoint"` → 13 → architectural.
+  - `"write a quick plan for the canary"` → 5 → **routine** (must not be
+    over-classified as architectural; a keyword list that only greps "plan" would
+    wrongly protect it).
+  - `"refactor the monitor script"`/`"fix the test failure"` → routine.
+  - Plain tool-bearing request with no architectural keyword → routine.
+  - **Tool-bearing + architectural keyword → architectural** (the case the branch
+    was stealing — §1.1). Must reach the reserve, not be paced out.
+  - Classifier is derived from `routing_table.yaml`, so a sub-type promoted to
+    tier ≥13 by config becomes architectural **without a code change**; a test
+    asserts a config-driven promotion is honoured.
 
 ### 5.2 Unit — probe and cache (B37a)
 
@@ -427,7 +532,7 @@ Each batch: new tests green **plus** full suite green before commit (currently
 - **Hot-path guard:** second call within `min_interval_seconds` makes **zero** HTTP
   calls (counting fake client).
 
-### 5.3 Schedule / variability (B37c)
+### 5.3 Schedule / variability (B37d)
 
 - No entries → top-level ceiling.
 - One passed entry → its ceiling.
@@ -437,7 +542,7 @@ Each batch: new tests green **plus** full suite green before commit (currently
 - Malformed entry → ignored with a warning, top-level ceiling retained (never fail
   closed on bad config).
 
-### 5.4 Integration — the leak (B37d, the critical batch)
+### 5.4 Integration — the leak (B37e, the critical batch)
 
 - **Tool-bearing + routine + paced out → `deepseek-v4-pro`, not gpt.** *The* test
   for the reported problem: a plain tool-bearing request must not take
@@ -448,7 +553,7 @@ Each batch: new tests green **plus** full suite green before commit (currently
 - `paced_out=1`, `budget_class='routine'` recorded.
 - Tool branch with governor disabled → identical to pre-B37 behaviour (captured
   baseline decision set).
-- Non-tool path (B37e) — same matrix.
+- Non-tool path (B37f) — same matrix.
 - **No empty decision:** only a plan model available and it paced out → verify the
   `all_exhausted` fallback, not a crash or empty model.
 
@@ -477,7 +582,7 @@ Each batch: new tests green **plus** full suite green before commit (currently
    the whole change.*
 5. Measure real capacity against §3.4's table and correct it from observation.
 
-### 5.7 Calibration (B37j)
+### 5.7 Calibration (B37k)
 
 Replay recorded history through the policy; report what it *would* have served per
 day by class. Success = a smoothed curve (no 700-then-6) **with the architectural
@@ -487,8 +592,8 @@ must come down before enabling. Set `slack` from observed pacing noise.
 
 ## 6. Rollout
 
-1. Land B37a–c with `enabled: false`. Inert.
-2. Land B37d–j with `enabled: false`. Full coverage, still inert.
+1. Land B37a–d with `enabled: false`. Inert.
+2. Land B37e–k with `enabled: false`. Full coverage, still inert.
 3. **Observe-only** (`enabled: false` + shadow log of decisions): real-traffic
    counterfactual before it can block anything. Recommended, cheap.
 4. Enable at the **post-reset window start** (Sunday), so the first governed week
@@ -501,7 +606,7 @@ must come down before enabling. Set `slack` from observed pacing noise.
 
 | Risk | Mitigation |
 |---|---|
-| Routine tool work loses gpt almost entirely (§3.4) | Surfaced for decision (§9.2); `routine_ceiling_percent` is the dial; observe-only quantifies it first |
+| Routine tool work loses gpt almost entirely (§3.4) | Accepted by operator (§9.2); `routine_ceiling_percent` is the dial; observe-only quantifies it first |
 | Under-use: throttling too hard wastes paid capacity | Calibration §5.7; `final_stretch` releases the tail; nightly reserve-headroom line |
 | Back-door leak via the fallback chain | §5.5 containment test |
 | Probe treats token expiry as "capped" (as it does today) | Fail-open on 401 + refresh; `source` visible |
@@ -524,33 +629,40 @@ must come down before enabling. Set `slack` from observed pacing noise.
 4. **Should the tool branch keep its highest-tier preference when *not* paced
    out?** See §9.4 — independent of the governor.
 
-## 9. Decisions needed
+## 9. Decisions
 
-1. **Ceiling semantics — confirm the reading.** "Burn up to 50% by end of day" was
-   read as **(a): the routine ceiling is 50% of the 7-day window, paced linearly
-   (~7.1%/day), leaving 50% reserved.** Alternatives are ~3.5× different in
-   reserve size:
+1. **Ceiling semantics — read as (a), awaiting final confirmation.** "Burn up to
+   50% by end of day" is implemented as **(a): the routine ceiling is 50% of the
+   7-day window, paced linearly (~7.1%/day), leaving 50% reserved.** Alternatives
+   are ~3.5× different in reserve size:
    - **(a) as implemented** — ceiling 50% of the *window*, paced. Reserve 50%.
    - **(b) per-day even share** — routine capped at ~7.1% of window *per day*,
      i.e. ~93% reserve.
    - **(c) front-loaded** — 50% of *remaining* budget each day (drains the week in
      ~3 days).
-   One config value differs between (a) and (b); (c) is a different policy
-   function. **Please confirm (a), or name the intended one** — the clarify prompt
-   timed out, so (a) is what is specified above.
-2. **Confirm §3.4 is acceptable:** a 50% ceiling makes gpt effectively
-   architectural-only (~2–7% of routine tool calls keep it). Intended?
+   (a) and (b) differ by one config value; (c) is a different policy function.
+   The clarify prompt timed out so (a) is what is specified — a one-value change
+   if (b) was meant.
+2. **RESOLVED — "Keep gpt for architectural type loads."** §3.4's consequence is
+   accepted: gpt becomes architectural-only for routine work (~2–7% of routine
+   tool calls keep it), and the architectural class is protected via the prompt
+   sub-type match (§3.2.1) plus `force_model` and escalation.
 3. **Observe-only phase** before enabling, or enable directly post-reset?
+   *Recommendation: observe-only — it quantifies §3.4 on real traffic at zero
+   risk, and GPT is dark until Sunday anyway.*
 4. **Separate fix for the tool branch?** `_select_tool_capable_model` ignores
-   `min_tier`, so *every* tool request prefers the top plan model. Complexity-gating
-   it (e.g. only ≥0.85 tool work may take a plan model) would reduce the leak at
-   source and is arguably the cleaner fix — but it is a routing-behaviour change
-   independent of the governor. Want it scoped as a follow-up?
+   `min_tier`, so *every* tool request prefers the top plan model — including
+   1,267 of the 1,760 `sol` calls that should have been tier-gated. This is
+   arguably the cleaner root-cause fix (honour `min_tier` as a floor, keeping the
+   architectural tier-13 lane reachable) and would make the governor's routine
+   class far smaller. Independent of the governor; scoped as a follow-up if
+   wanted. **It is also the change that fixes the "steals architectural traffic"
+   defect in §1.1**, so it is worth doing regardless of the governor.
 
 ## 10. Revision history
 
-**rev 2 (this document) — policy and enforcement point both corrected after
-measurement.**
+**rev 2 (this document) — policy, enforcement point, and reserve sizing all
+corrected after measurement.**
 
 - **Policy changed** from even-burn (symmetric, `slack=15pp`) to the operator's
   **routine ceiling + architectural reserve** (50/50 default, variable by
@@ -561,13 +673,25 @@ measurement.**
   **98.5% of the capping window was the tool-bearing branch** (`gpt-5.6-sol`),
   which **returns early before `min_tier` is computed** and ignores `min_tier`
   entirely. rev 2 adds Hook 1 on that path (§3.3) — the actual fix.
+- **Found that the tool branch also *steals* architectural traffic.** `sol` is
+  tier 13 so it always wins the highest-tier pick; of 1,760 `sol` calls, **1,267
+  came from the tool branch and only 3 from the architectural tier-13 lane**
+  (§1.1). 83% of `planning` is tool-bearing. This is why the architectural class
+  must be detected from `prompt`, not `min_tier` (§3.2.1).
+- **Class detection specified concretely:** `match_sub_type(task_type, prompt)`
+  returning a tier ≥13 sub-type — the `planning` rethink/rearchitect keywords —
+  rather than a new keyword list (§3.2.1, §3.3).
+- **Reserve sizing corrected (was wrong).** rev 2's earlier 14.4 Mtok/wk figure
+  was measured from *served* traffic and therefore mostly counted the tool-branch
+  leak. Re-measured on the genuine lanes: **12.6 Mtok/wk** (escalation 10.5 +
+  force_model 2.0 + architecture sub-type 0.1) → **1.9× headroom** at the low
+  capacity estimate. §3.4 also notes escalation is the reserve lane to watch and
+  why §5.5's fallback-chain containment test protects it.
 - **Capacity modelling abandoned as unsound.** Two cap events imply 46.7 vs 163.4
   Mtok for "100%" — a **3.5× spread** — so rev 1's token arithmetic is not usable
   for control; only the endpoint's `used_percent` is. (This *confirms* rev 1's
   signal choice while invalidating its estimates.)
-- **Reserve sized from measured demand:** architectural need is **14.4 Mtok/week**
-  (tier-13+ 11.6 + force_model 2.8) → **1.6× headroom** at the low capacity
-  estimate, tight enough to flag for calibration.
-- **Added §3.4** quantifying the honest consequence for routine tool traffic.
+- **Added §3.4** quantifying the honest consequence for routine tool traffic;
+  operator accepted it (§9.2).
 - **Kept from rev 1:** endpoint-probe signal, account-keyed enforcement, fail-open
   semantics, reserve concept, and the §3.2.1 constant-conflict finding.
