@@ -1521,6 +1521,7 @@ def escalate_on_failure(
     workload_type: str = "",
     context_tokens: int = 0,
     prefer_model: str = "",
+    budget_class: str = "",
 ) -> RoutingDecision:
     """Escalate to the next available model after a failure.
 
@@ -1543,6 +1544,12 @@ def escalate_on_failure(
             escalation lands on this exact model instead of the default
             most-capable pick. Used by the split canary so a cheap-candidate
             miss falls to its declared fallback (pro), never the ChatGPT plan.
+        budget_class: The plan-governor class of the ORIGINATING request,
+            inherited rather than re-derived. Escalation is tool-failover, not
+            architecture (§3.1): a 429 is evidence about availability, never
+            about the nature of the work, so the class must come from the
+            request that spawned the failure. ``""`` means ungoverned (legacy
+            callers), which preserves pre-B37 behaviour exactly.
 
     Returns:
         RoutingDecision for the next model in the chain.
@@ -1698,6 +1705,14 @@ def escalate_on_failure(
                 pm_key in TOOL_CAPABLE_MODELS
                 and pm_key not in EXCLUDED_FROM_AUTO_ROUTING
                 and is_model_available(pm_key)
+                # The canary's declared fallback is ollama-cloud, but honour the
+                # inherited class anyway: a routine request must not be routed
+                # onto the reserved plan by a preference, however configured.
+                and not (
+                    budget_class
+                    and _is_plan_model(pm_key)
+                    and _plan_denied_for_class(budget_class)
+                )
             ):
                 return RoutingDecision(
                     selected_model=prefer_model,
@@ -1706,9 +1721,12 @@ def escalate_on_failure(
                         f"tool escalation from {failed_model} ({error_type}) — "
                         f"preferred fallback {prefer_model}"
                     ),
-                    fallback_chain=_build_tool_fallback_chain(prefer_model),
+                    fallback_chain=_build_tool_fallback_chain(
+                        prefer_model, klass=budget_class or None
+                    ),
                     is_fallback=True,
                     original_model=failed_model,
+                    budget_class=budget_class,
                 )
         best_tier = -1
         best_model = ""
@@ -1716,6 +1734,12 @@ def escalate_on_failure(
             if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
                 continue
             if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+                continue
+            # Inherited class: a failed ROUTINE request must not fail over into
+            # the plan. The tool ladder picks the most-capable tool model, which
+            # is gpt-5.6-sol — so without this the leak re-enters through
+            # failover (§3.1). An architectural request keeps the plan.
+            if budget_class and _is_plan_model(model) and _plan_denied_for_class(budget_class):
                 continue
             tier = MODEL_CAPABILITY_TIERS.get(model, 0)
             if tier > best_tier:
@@ -1726,9 +1750,12 @@ def escalate_on_failure(
                 selected_model=best_model,
                 selected_provider=_get_provider(best_model),
                 reason=f"tool escalation from {failed_model} ({error_type}) — fell to most-capable tool model {best_model}",
-                fallback_chain=_build_tool_fallback_chain(best_model),
+                fallback_chain=_build_tool_fallback_chain(
+                    best_model, klass=budget_class or None
+                ),
                 is_fallback=True,
                 original_model=failed_model,
+                budget_class=budget_class,
             )
 
     for model in available:
@@ -1739,14 +1766,65 @@ def escalate_on_failure(
         # Models reserved for explicit lanes must never be reached by escalation
         if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
             continue
+        # Inherited class: the capability ladder walks UP in tier, so a routine
+        # request failing on deepseek-v4-pro (tier 8) would otherwise escalate
+        # straight into the plan at tier 10.
+        if budget_class and _is_plan_model(model) and _plan_denied_for_class(budget_class):
+            continue
         if tier > failed_tier:
             return RoutingDecision(
                 selected_model=model,
                 selected_provider=_get_provider(model),
                 reason=f"escalation from {failed_model} ({error_type})",
-                fallback_chain=_build_fallback_chain(model, context_tokens),
+                fallback_chain=_contain_plan_in_chain(
+                    _build_fallback_chain(model, context_tokens), budget_class
+                ),
                 is_fallback=True,
                 original_model=failed_model,
+                budget_class=budget_class,
+            )
+
+    # Inherited class with no upward move available: every model above the
+    # failed one is on the reserved plan. Degrade to the best available
+    # NON-PLAN model rather than plunging to local (tier 1) — the same
+    # "fall DOWN to the next-most-capable" principle the tool ladder above
+    # already applies, and the predictable degradation of design §131. Only
+    # reachable when a class is governed, so an ungoverned rollback is
+    # unaffected.
+    if budget_class and _plan_denied_for_class(budget_class):
+        fallback = ""
+        fallback_tier = -1
+        for model in available:
+            if _is_plan_model(model):
+                continue
+            if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+                continue
+            if _normalize_model_name(model) == failed_model_key:
+                continue
+            if requires_tools and _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
+                continue
+            if not _within_declared_window(model, context_tokens):
+                continue
+            tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+            if tier > fallback_tier:
+                fallback_tier = tier
+                fallback = model
+        if fallback:
+            return RoutingDecision(
+                selected_model=fallback,
+                selected_provider=_get_provider(fallback),
+                reason=(
+                    f"escalation from {failed_model} ({error_type}) — every model "
+                    f"above it is on the plan, denied to class '{budget_class}' "
+                    f"by plan governor; degraded to most-capable non-plan model "
+                    f"{fallback} (tier {fallback_tier})"
+                ),
+                fallback_chain=_contain_plan_in_chain(
+                    _build_fallback_chain(fallback, context_tokens), budget_class
+                ),
+                is_fallback=True,
+                original_model=failed_model,
+                budget_class=budget_class,
             )
 
     # Nothing available — try local as last resort (only for non-tool work,
@@ -1763,6 +1841,7 @@ def escalate_on_failure(
             fallback_chain=["llama3.1:8b"],
             is_fallback=True,
             original_model=failed_model,
+            budget_class=budget_class,
         )
 
     # Truly nothing available (or tool-capable models exhausted)

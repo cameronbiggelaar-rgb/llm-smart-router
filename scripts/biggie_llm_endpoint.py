@@ -4797,6 +4797,12 @@ async def chat_completions(request: Request):
             workload_type=workload_type,
             context_tokens=features.get("context_tokens", 0),
             prefer_model=_prefer,
+            # Inherit the plan-governor class of the ORIGINATING request rather
+            # than re-deriving it from the failure. Escalation is tool-failover,
+            # not architecture: a 429 says nothing about the nature of the work,
+            # so a failed routine request must not fail over into the reserved
+            # plan while a failed architectural one may still use it.
+            budget_class=decision.budget_class,
         )
 
         if not escalation.selected_model:
