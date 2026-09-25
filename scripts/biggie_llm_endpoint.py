@@ -300,6 +300,12 @@ _COST_OBS_COLUMNS = {
     # IS available at the call site. Without it, per-session churn analysis was
     # impossible and the blank key made distinct sessions look like one.
     "session_id_source": "TEXT NOT NULL DEFAULT ''",
+    # Plan-budget observability (B37i). The governor removes a measurable leak,
+    # so the refusal and the classification must be queryable columns — a reason
+    # string is prose and cannot be aggregated. Defaults are the UNGOVERNED
+    # state, so historical rows read as "no governor", never as a denial.
+    "plan_budget_denied": "INTEGER NOT NULL DEFAULT 0",
+    "budget_class": "TEXT NOT NULL DEFAULT ''",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -2854,6 +2860,8 @@ def _log_request_to_db(
     session_id_source: str = "",
     tool_names: str = "",
     tool_args_sig: str = "",
+    plan_budget_denied: bool = False,
+    budget_class: str = "",
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -2929,9 +2937,10 @@ def _log_request_to_db(
                 saw_tool_calls, final_model, routing_reason,
                 cost_usd, cost_unknown, quality_score, quality_method,
                 pricing_version, experiment, experiment_arm, is_shadow, finish_reason,
-                cached_tokens, session_id_source, tool_names, tool_args_sig
+                cached_tokens, session_id_source, tool_names, tool_args_sig,
+                plan_budget_denied, budget_class
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     session_id or "",
@@ -2972,6 +2981,8 @@ def _log_request_to_db(
                     session_id_source or "",
                     tool_names or "",
                     tool_args_sig or "",
+                    1 if plan_budget_denied else 0,
+                    budget_class or "",
                     ),
                     )
         db.commit()
@@ -4613,6 +4624,8 @@ async def chat_completions(request: Request):
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
                 routing_reason=decision.reason,
+                plan_budget_denied=decision.plan_budget_denied,
+                budget_class=decision.budget_class,
                 **_obs,
             )
             _stream_stats: Dict[str, Any] = {"saw_content": False, "saw_tool_calls": False}
@@ -4659,6 +4672,8 @@ async def chat_completions(request: Request):
                     saw_content=_stream_stats.get("saw_content", False),
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     routing_reason=decision.reason,
+                    plan_budget_denied=decision.plan_budget_denied,
+                    budget_class=decision.budget_class,
                     finish_reason=_stream_stats.get("finish_reason", ""),
                     tool_names=_stream_stats.get("tool_names", ""),
                     tool_args_sig=_stream_stats.get("tool_args_sig", ""),
@@ -4755,6 +4770,8 @@ async def chat_completions(request: Request):
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
                 routing_reason=decision.reason,
+                plan_budget_denied=decision.plan_budget_denied,
+                budget_class=decision.budget_class,
                 cost_usd=_cost,
                 cost_unknown=_cost_unknown,
                 pricing_version=_pricing_version(),
@@ -4912,6 +4929,8 @@ async def chat_completions(request: Request):
                     saw_tool_calls=_stream_stats.get("saw_tool_calls", False),
                     final_model=_final_model,
                     routing_reason=escalation.reason,
+                    plan_budget_denied=escalation.plan_budget_denied,
+                    budget_class=escalation.budget_class,
                     finish_reason=_stream_stats.get("finish_reason", ""),
                     tool_names=_stream_stats.get("tool_names", ""),
                     tool_args_sig=_stream_stats.get("tool_args_sig", ""),
@@ -4989,6 +5008,8 @@ async def chat_completions(request: Request):
                 compression_savings_pct=compression_stats["savings_pct"],
                 compression_time_ms=compression_stats["compression_time_ms"],
                 routing_reason=escalation.reason,
+                plan_budget_denied=escalation.plan_budget_denied,
+                budget_class=escalation.budget_class,
                 session_id=session_id,
                 session_id_source=session_id_source,
                 tool_names=_tool_names_from_response(result)[0],

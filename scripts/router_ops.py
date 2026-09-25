@@ -23,7 +23,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -454,6 +454,111 @@ def cmd_quality(conn, args) -> int:
     return 0
 
 
+# ── Plan-budget visibility (B37i) ────────────────────────────────────────────
+
+def _log_columns(conn: sqlite3.Connection) -> set:
+    """Column names present on ``router_logs`` (migrations are additive)."""
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(router_logs)")}
+    except sqlite3.Error:
+        return set()
+
+
+def format_plan_budget(conn: sqlite3.Connection, days: int = 7) -> str:
+    """Report plan-governor activity: denials, classes, and plan burn by class.
+
+    Answers the only two questions the governor's justification rests on:
+    is the leak actually closed (denials happening), and is the architectural
+    lane still being served (it must never be starved). A row with
+    ``budget_class = ''`` predates the governor or was routed while it was
+    disabled, so those rows are reported as ``ungoverned`` rather than folded
+    into either class.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cols = _log_columns(conn)
+    if "budget_class" not in cols:
+        return (
+            "Plan budget: `budget_class` column not present yet — "
+            "the endpoint migration runs on next start (B37i)."
+        )
+
+    rows = conn.execute(
+        """
+        SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
+               COALESCE(plan_budget_denied, 0) AS denied,
+               COUNT(*) AS calls,
+               COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
+        FROM router_logs
+        WHERE timestamp >= ?
+        GROUP BY klass, denied
+        ORDER BY klass, denied
+        """,
+        (since,),
+    ).fetchall()
+
+    if not rows:
+        return f"Plan budget: no routed requests in the last {days}d."
+
+    lines = [f"Plan budget — last {days}d", ""]
+    lines.append(f"{'class':<16}{'denied':<9}{'calls':>8}{'tokens':>14}")
+    served: dict = {}
+    denied_by: dict = {}
+    for klass, denied, calls, tokens in rows:
+        lines.append(f"{klass:<16}{('yes' if denied else 'no'):<9}{calls:>8}{tokens:>14,}")
+        if denied:
+            denied_by[klass] = denied_by.get(klass, 0) + calls
+        else:
+            served[klass] = served.get(klass, 0) + calls
+    lines.append("")
+
+    arch_served = served.get("architectural", 0)
+    routine_denied = denied_by.get("routine", 0)
+    if arch_served == 0 and routine_denied > 0:
+        lines.append(
+            "NOTE: the architectural lane served 0 calls while routine denials "
+            "were recorded — check the classifier before trusting the policy."
+        )
+    lines.append(
+        f"routine denied (leak closed): {routine_denied:,} | "
+        f"architectural served: {arch_served:,}"
+    )
+    return "\n".join(lines)
+
+
+def cmd_plan_budget(conn, args) -> int:
+    """Show plan-governor activity: denials, classes, and plan burn by class."""
+    if getattr(args, "json", False):
+        days = getattr(args, "days", 7)
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cols = _log_columns(conn)
+        if "budget_class" not in cols:
+            print(json.dumps({"available": False, "days": days}))
+            return 0
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
+                   COALESCE(plan_budget_denied, 0) AS denied,
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
+            FROM router_logs
+            WHERE timestamp >= ?
+            GROUP BY klass, denied
+            """,
+            (since,),
+        ).fetchall()
+        print(json.dumps({
+            "available": True,
+            "days": days,
+            "buckets": [
+                {"class": k, "denied": bool(d), "calls": c, "tokens": t}
+                for k, d, c, t in rows
+            ],
+        }, indent=2))
+        return 0
+    print(format_plan_budget(conn, getattr(args, "days", 7)))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -496,6 +601,10 @@ def main() -> int:
     q = sub.add_parser("quality", help="sampled compression-quality measurements")
     q.add_argument("--json", action="store_true")
 
+    pb = sub.add_parser("plan-budget", help="plan-governor activity: denials and class burn")
+    pb.add_argument("--days", type=int, default=7)
+    pb.add_argument("--json", action="store_true")
+
     mt = sub.add_parser("maintain", help="daily job: rollup + purge + report + propose")
     mt.add_argument("--days", type=int, default=3)
     mt.add_argument("--retention", type=int, default=DEFAULT_KEEP_DAYS)
@@ -514,6 +623,7 @@ def main() -> int:
         "maintain": cmd_maintain,
         "quality": cmd_quality,
         "allowance": cmd_allowance,
+        "plan-budget": cmd_plan_budget,
         "deploy-check": cmd_deploy_check,
     }[args.cmd](conn, args)
 

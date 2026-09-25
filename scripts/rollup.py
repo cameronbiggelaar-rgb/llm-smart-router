@@ -66,6 +66,16 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     # which can collide across sessions sharing an opening prompt. Without the
     # label, a derived key would be silently read as proof of a distinct session.
     "session_id_source": "TEXT NOT NULL DEFAULT ''",
+    # Plan-budget observability (B37i). The governor's whole justification is
+    # that it removes a measurable leak, so the leak and the governed decision
+    # must both be queryable — a routing reason string is prose, not a column,
+    # and cannot be aggregated. `plan_budget_denied` counts refusals;
+    # `budget_class` records what the request was classified as, so the
+    # architectural lane can be shown to survive the policy rather than assumed
+    # to. Both default to the ungoverned state so historical rows read as "no
+    # governor", not as a denial.
+    "plan_budget_denied": "INTEGER NOT NULL DEFAULT 0",
+    "budget_class": "TEXT NOT NULL DEFAULT ''",
 }
 
 # ── New tables ────────────────────────────────────────────────────────────────
