@@ -61,6 +61,82 @@ def fmt_num(n):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dict:
+    """Summarise plan-governor activity for the digest (B37j).
+
+    Never raises. The nightly report is the operator's only routine view of the
+    system, so a missing column, an unreadable probe, or a governor bug must
+    degrade to a note — a traceback here would turn an information problem into
+    a monitoring outage that reads as "everything is broken".
+
+    ``available: False`` (rather than zeros) when the columns are absent, because
+    "no denials" and "no data" are opposite facts and the first must never be
+    reported when the second is true.
+    """
+    summary: dict = {
+        "available": False,
+        "window_used_percent": None,
+        "routine_denied": None,
+        "architectural_served": None,
+        "ungoverned": None,
+        "note": "",
+    }
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(router_logs)")}
+    except sqlite3.Error as exc:
+        summary["note"] = f"router_logs unreadable: {exc}"
+        return summary
+
+    if "budget_class" not in cols:
+        summary["note"] = "budget_class column not present yet (migration pending)"
+        _attach_probe(summary)
+        return summary
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
+                   COALESCE(plan_budget_denied, 0) AS denied,
+                   COUNT(*) AS calls
+            FROM router_logs
+            WHERE timestamp >= ?
+            GROUP BY klass, denied
+            """,
+            (period_start_iso,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        summary["note"] = f"plan-budget query failed: {exc}"
+        _attach_probe(summary)
+        return summary
+
+    summary["available"] = True
+    summary["routine_denied"] = 0
+    summary["architectural_served"] = 0
+    summary["ungoverned"] = 0
+    for klass, denied, calls in rows:
+        if klass == "ungoverned":
+            summary["ungoverned"] += calls
+        elif denied:
+            if klass == "routine":
+                summary["routine_denied"] += calls
+        elif klass == "architectural":
+            summary["architectural_served"] += calls
+    _attach_probe(summary)
+    return summary
+
+
+def _attach_probe(summary: dict) -> None:
+    """Best-effort: current window used %. An unreadable probe leaves it None."""
+    try:
+        import gpt_budget
+
+        reading = gpt_budget.fetch_reading()
+        w = gpt_budget.binding_window(reading)
+        summary["window_used_percent"] = round(w.used_percent, 1) if w else None
+    except Exception:
+        summary["window_used_percent"] = None
+
+
 def main():
     brief = "--brief" in sys.argv
     as_json = "--json" in sys.argv
@@ -145,6 +221,17 @@ def main():
     router_requested = {}
     router_task_types = {}
     router_lanes = {"rethink_rearchitect": 0, "escalation": 0, "force_model": 0, "normal": 0}
+    # Initialised here: the router_logs block below is wrapped in try/except, so
+    # an unreadable DB leaves this at its "no data" default rather than raising
+    # UnboundLocalError at report-assembly time.
+    plan_budget = {
+        "available": False,
+        "window_used_percent": None,
+        "routine_denied": None,
+        "architectural_served": None,
+        "ungoverned": None,
+        "note": "router_logs unreadable",
+    }
     corrections = 0
     routing_misses = 0
     completion_success = 0
@@ -216,6 +303,21 @@ def main():
         rconn.close()
     except Exception:
         pass
+
+    # Plan-budget digest (B37j). Deliberately OUTSIDE the block above and in its
+    # own guarded read: that block is a broad `except Exception: pass`, so any
+    # unrelated failure (a column this query does not use) would otherwise
+    # silently erase the plan-budget line — the one line that reports whether the
+    # governor is working. Independent read, independent failure mode.
+    try:
+        _pbconn = sqlite3.connect(ROUTER_LOGS)
+        try:
+            plan_budget = _plan_budget_summary(_pbconn, period_start_iso)
+        finally:
+            _pbconn.close()
+    except Exception as exc:
+        plan_budget = dict(plan_budget)
+        plan_budget["note"] = f"router_logs unreadable: {exc}"
 
     # ── Split canary (v41flash-tool-canary) ────────────────────────────────
     # Served split: a slice of tool-bearing normal_chat goes to flash
@@ -299,6 +401,7 @@ def main():
                 "requested_models": router_requested,
                 "selected_models": router_selected,
                 "lanes": router_lanes,
+                "plan_budget": plan_budget,
                 "note": (
                     "Direct-vs-routed stats are available only for requests that hit "
                     "the Biggie endpoint. Hermes state.db does not label provider calls "
@@ -398,6 +501,20 @@ def main():
                 "normal": "normal routing",
             }[lane]
             print(f" {label:28s} {count:6d}")
+        print()
+
+        # ── Plan budget (B37j) ─────────────────────────────────────────────
+        # Rendered even when unavailable: "no data" and "zero denials" are
+        # opposite facts, and silence would read as the reassuring one.
+        print(" Plan Budget (ChatGPT plan — architectural lane only) ")
+        if not plan_budget.get("available"):
+            print(f"  Not available — {plan_budget.get('note') or 'no data'}")
+        else:
+            used = plan_budget.get("window_used_percent")
+            print(f"  Window used:                {used if used is not None else 'n/a'}%")
+            print(f"  Routine denied (leak closed): {plan_budget.get('routine_denied', 0):6d}")
+            print(f"  Architectural calls served:   {plan_budget.get('architectural_served', 0):6d}")
+            print(f"  Ungoverned (pre-governor):    {plan_budget.get('ungoverned', 0):6d}")
         print()
 
         # ── Split canary (v41flash-tool-canary) ────────────────────────────
