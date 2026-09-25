@@ -19,17 +19,25 @@
 # Rollout state
 # -------------
 #   enabled: false   -> landing state. Inert; full coverage, nothing blocked.
-#                       Observe-only: quantify the denial before it acts.
-#   enabled: true    -> arm the allowlist. Intended to be flipped at the start
-#                       of a fresh usage window (post-reset), so the first
-#                       governed week begins from a clean one.
+#   enabled: true    -> arm the allowlist (CURRENT). Flipped 2026-09-25 while the
+#                       plan was dark, so the switch itself could not strand live
+#                       work: with every plan model rate-limited, no request was
+#                       reaching the plan to be denied. The first governed window
+#                       therefore begins from the Sunday 06:45 AEST reset.
+#
+# The observe-only phase (§6 step 3) was satisfied ahead of arming by the B37k
+# calibration replay rather than by live shadow logging: replayed against 30d of
+# recorded plan traffic it showed 14,115 routine denials / 505.7 Mtok that would
+# no longer reach the plan, with the architectural lane served 19 times and denied
+# 0 — so the denial was quantified before the policy could act.
 #
 # Escape hatch: the operator is never blocked from gpt on demand. Naming a plan
 # model explicitly (`force_model`) is honoured regardless of this allowlist.
 
 governor:
-  # Master switch. false == today's behaviour. Rollback lever (hot-reloaded).
-  enabled: false
+  # Master switch. true == the architectural-lane allowlist is enforced.
+  # false == today's behaviour (rollback lever, hot-reloaded in ~30s).
+  enabled: true
 
   accounts:
     # Keyed by BILLING ACCOUNT, not by model name: a new plan model is governed

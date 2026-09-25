@@ -997,6 +997,22 @@ class TestOllamaToolCapableModels:
         for m in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
             mark_rate_limited(m)
 
+        # These tests pin the TOOL-CAPABILITY preference (highest-tier tool model
+        # wins), not plan-budget policy. With the governor armed, a routine
+        # tool request is denied the plan by design, so gpt-5.5 would never be
+        # selected and every assertion here would fail for a reason that belongs
+        # to another suite. Stub the governor off; tests/test_gpt_budget_*.py
+        # owns the governed behaviour.
+        import gpt_budget as gb
+        self._governor = gb.load_governor_config
+        gb.load_governor_config = lambda force=False: gb.GovernorConfig(
+            enabled=False, allowlist=[gb.CLASS_ARCHITECTURAL],
+            routine_ceiling_percent=0, hard_cap_percent=95.0)
+
+    def teardown_method(self):
+        import gpt_budget as gb
+        gb.load_governor_config = self._governor
+
     def test_glm53_is_tool_capable(self):
         from router import TOOL_CAPABLE_MODELS
         assert "glm-5.3" in TOOL_CAPABLE_MODELS

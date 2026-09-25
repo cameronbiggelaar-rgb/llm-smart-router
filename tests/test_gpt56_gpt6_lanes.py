@@ -62,6 +62,26 @@ def _all_models_available():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _ungoverned_plan(monkeypatch):
+    """These tests pin CAPABILITY routing, not budget policy.
+
+    Once the plan-budget governor is armed (budget_policy.yaml), a plan model is
+    only reachable for the architectural class *and* only while the account is
+    open — and the live account is at 100% until the Sunday reset, so every plan
+    route here would be declined for capacity. That is the governor working, not
+    a capability regression, so it is stubbed out and tested in its own suite
+    (tests/test_gpt_budget_*.py). Without this, these tests' meaning silently
+    changes with a policy file they do not own.
+    """
+    import gpt_budget as gb
+
+    monkeypatch.setattr(gb, "load_governor_config",
+                        lambda force=False: gb.GovernorConfig(
+                            enabled=False, allowlist=[gb.CLASS_ARCHITECTURAL],
+                            routine_ceiling_percent=0, hard_cap_percent=95.0))
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 

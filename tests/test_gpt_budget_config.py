@@ -57,17 +57,20 @@ def test_missing_file_defaults_to_architectural_only(policy_file):
     assert cfg.allowlist == [gb.CLASS_ARCHITECTURAL]
 
 
-def test_landed_policy_file_parses_and_is_inert():
-    """The shipped policy must be valid and land DISARMED (§6 rollout).
+def test_shipped_policy_file_parses_and_is_armed():
+    """The shipped policy must be valid and ARMED.
 
-    The governor ships ``enabled: false`` so B37e–k land with full coverage but
-    no behavioural change; arming it is a deliberate, separate operator step.
+    Arming is a deliberate operator step taken on 2026-09-25 while the plan was
+    dark (every plan model rate-limited), so the switch could not strand live work
+    — see the file's rollout notes. The assertion is on the *parse*, not on a
+    frozen value: a policy that fails to load would fail open, which looks like
+    success from the outside and is the failure this pins.
     """
     cfg = gb.load_governor_config(force=True)
-    assert cfg.enabled is False, "governor must land inert (observe-only)"
     assert cfg.allowlist == [gb.CLASS_ARCHITECTURAL]
     assert cfg.hard_cap_percent == 95.0
     assert cfg.routine_ceiling_percent == 0.0
+    assert cfg.enabled is True, "shipped policy should be armed"
 
 
 def test_allowlist_missing_defaults_to_architectural_only(policy_file):
