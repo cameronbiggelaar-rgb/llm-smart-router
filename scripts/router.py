@@ -1140,6 +1140,10 @@ def route_task(
     # by normalized name (e.g. "glm-5.3"), while a client may send a
     # provider-suffixed alias ("glm-5.3:cloud"). A name with no state row is
     # unknown and stays forceable (is_model_available returns True).
+    #
+    # Operator intent also wins over the plan governor's allowlist (§3.3): the
+    # P0 reserve exists so the operator is never blocked from the plan on
+    # demand, so this block sits BEFORE the governor below.
     if force_model:
         forced_key = _normalize_model_name(force_model)
         if not is_model_available(force_model) or not is_model_available(forced_key):
@@ -1159,6 +1163,9 @@ def route_task(
             selected_provider=_get_provider(force_model),
             reason=f"forced model: {force_model}",
             fallback_chain=_build_fallback_chain(force_model, context_tokens),
+            budget_class=(
+                _plan_classify(prompt, force_model) if _is_plan_model(force_model) else ""
+            ),
         )
 
     # ── Native Hermes session-compression workload ─────────────────────
@@ -1181,12 +1188,83 @@ def route_task(
             all_exhausted=True,
         )
 
+    # ── Plan-budget governor (Hook 2 — the ordinary capability path) ──
+    # `_select_model` walks get_available_models() and returns the first model
+    # meeting the needed tier, with no notion of entitlement. For routine
+    # tier-10 work that is gpt-5.5 (a plan model) — 1.2% of the clean-era plan
+    # burn. Only plan-account models are touched, so every ollama-cloud and
+    # flash lane, and the canary at percent 100, are structurally unaffected.
+    budget_class = ""
+    if _is_plan_model(selected):
+        governed, budget_class, denied, closed = _apply_plan_governor(
+            selected, prompt=prompt, force_model=force_model
+        )
+        if denied:
+            # Design §131: degrade PREDICTABLY to deepseek-v4-pro (tier 8)
+            # rather than fail closed. `min_tier` here is a quality floor, not a
+            # capability wall — unlike the tool branch, where tool-capability is
+            # a hard gate and nothing may paper over it (§5.5). Failing closed
+            # on ordinary capability routing would trade a real answer for an
+            # error on the largest class of traffic.
+            replacement = _reselect_without_plan_any_tier(0)
+            if not replacement:
+                # Only reachable when every non-plan model is rate-limited or
+                # circuit-broken — genuinely nothing left to serve.
+                return RoutingDecision(
+                    selected_model="",
+                    selected_provider="",
+                    reason=(
+                        f"plan account denied to class '{budget_class}' by plan "
+                        f"governor ("
+                        f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
+                        f") and no non-plan model is available — failing closed"
+                    ),
+                    fallback_chain=[],
+                    all_exhausted=True,
+                    budget_class=budget_class,
+                    plan_budget_denied=True,
+                )
+            replaced_tier = MODEL_CAPABILITY_TIERS.get(replacement, 0)
+            degraded = replaced_tier < min_tier
+            return RoutingDecision(
+                selected_model=replacement,
+                selected_provider=_get_provider(replacement),
+                reason=(
+                    f"capability tier {min_tier} needed — plan account denied to "
+                    f"class '{budget_class}' by plan governor ("
+                    f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
+                    f") — selected {replacement} "
+                    f"(tier {replaced_tier}{'; below the computed floor, degraded by design' if degraded else ''})"
+                ),
+                fallback_chain=_contain_plan_in_chain(
+                    _build_fallback_chain(replacement, context_tokens), budget_class
+                ),
+                budget_class=budget_class,
+                plan_budget_denied=True,
+            )
+        selected = governed or selected
+
     return RoutingDecision(
         selected_model=selected,
         selected_provider=_get_provider(selected),
-        reason=f"capability tier {min_tier} needed, selected {selected} (tier {MODEL_CAPABILITY_TIERS.get(selected, 0)})",
-        fallback_chain=fallback_chain,
+        reason=(
+            f"capability tier {min_tier} needed, selected {selected} "
+            f"(tier {MODEL_CAPABILITY_TIERS.get(selected, 0)})"
+            + (
+                f"; plan governor allowed class '{budget_class}'"
+                if budget_class
+                else ""
+            )
+        ),
+        fallback_chain=(
+            _build_fallback_chain(selected, context_tokens)
+            if not budget_class
+            else _contain_plan_in_chain(
+                _build_fallback_chain(selected, context_tokens), budget_class
+            )
+        ),
         all_exhausted=all_exhausted,
+        budget_class=budget_class,
     )
 
 
@@ -1351,8 +1429,14 @@ def _apply_plan_governor(
     return "", klass, True, closed
 
 
-def _reselect_without_plan() -> str:
-    """Highest-tier available tool-capable model NOT on the governed account."""
+def _reselect_without_plan(min_tier: int = 0) -> str:
+    """Highest-tier available TOOL-CAPABLE model NOT on the governed account.
+
+    Used by the tool-branch governor hook, where tool capability is the binding
+    gate: ordinary capability routing has no such constraint and uses
+    ``_reselect_without_plan_any_tier`` instead. ``min_tier`` is accepted for
+    signature symmetry but the tool branch has no tier floor of its own.
+    """
     best = ""
     best_tier = -1
     for model in get_available_models():
@@ -1365,6 +1449,42 @@ def _reselect_without_plan() -> str:
             best_tier = tier
             best = model
     return best
+
+
+def _reselect_without_plan_any_tier(min_tier: int = 0) -> str:
+    """Like ``_reselect_without_plan`` but for the non-tool capability path.
+
+    The tool path is gated on tool capability, so it may only choose within
+    ``TOOL_CAPABLE_MODELS``. Ordinary capability routing has no such gate — it
+    may use any available non-plan model that still meets ``min_tier``.
+    """
+    best = ""
+    best_tier = -1
+    for model in get_available_models():
+        if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
+            continue
+        if _is_plan_model(model):
+            continue
+        tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+        if tier < min_tier:
+            continue
+        if tier > best_tier:
+            best_tier = tier
+            best = model
+    return best
+
+
+def _contain_plan_in_chain(chain: List[str], klass: str) -> List[str]:
+    """Strip plan-account models from a fallback chain when the class is denied.
+
+    The chain walks *up* in tier, so a routine request served by
+    ``deepseek-v4-pro`` would otherwise escalate straight into the ChatGPT plan
+    — the leak re-entering through failover (§5.5). Architectural work keeps its
+    full chain.
+    """
+    if not klass or not _plan_denied_for_class(klass):
+        return chain
+    return [m for m in chain if not _is_plan_model(m)]
 
 
 def _build_tool_fallback_chain(current_model: str, *, klass: Optional[str] = None) -> List[str]:
