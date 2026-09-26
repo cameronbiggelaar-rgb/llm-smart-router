@@ -79,6 +79,8 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
         "routine_denied": None,
         "architectural_served": None,
         "ungoverned": None,
+        "governed": None,
+        "armed": None,
         "note": "",
     }
     try:
@@ -113,6 +115,7 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
     summary["routine_denied"] = 0
     summary["architectural_served"] = 0
     summary["ungoverned"] = 0
+    summary["governed"] = 0
     for klass, denied, calls in rows:
         if klass == "ungoverned":
             summary["ungoverned"] += calls
@@ -121,15 +124,32 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
                 summary["routine_denied"] += calls
         elif klass == "architectural":
             summary["architectural_served"] += calls
+        if klass != "ungoverned":
+            summary["governed"] += calls
     _attach_probe(summary)
     return summary
 
 
 def _attach_probe(summary: dict) -> None:
-    """Best-effort: current window used %. An unreadable probe leaves it None."""
+    """Best-effort: current window used % and whether the governor is armed.
+
+    ``armed`` distinguishes "armed but idle" (governor on, class recorded, yet no
+    plan model selected so no denial) from "off / pre-governor" (empty class on
+    every row) — the exact ambiguity behind the recurring "governor looks inert"
+    flag. An unreadable probe leaves the fields None.
+    """
     try:
         import gpt_budget
+    except Exception:
+        summary["window_used_percent"] = None
+        return
 
+    try:
+        cfg = gpt_budget.load_governor_config()
+        summary["armed"] = bool(getattr(cfg, "enabled", False))
+    except Exception:
+        summary["armed"] = None
+    try:
         reading = gpt_budget.fetch_reading()
         w = gpt_budget.binding_window(reading)
         summary["window_used_percent"] = round(w.used_percent, 1) if w else None
@@ -511,10 +531,15 @@ def main():
             print(f"  Not available — {plan_budget.get('note') or 'no data'}")
         else:
             used = plan_budget.get("window_used_percent")
+            armed = plan_budget.get("armed")
+            print(f"  Governor:                   {'ARMED' if armed else 'off' if armed is False else 'unknown'}")
             print(f"  Window used:                {used if used is not None else 'n/a'}%")
             print(f"  Routine denied (leak closed): {plan_budget.get('routine_denied', 0):6d}")
             print(f"  Architectural calls served:   {plan_budget.get('architectural_served', 0):6d}")
+            print(f"  Governed (class recorded):    {plan_budget.get('governed', 0):6d}")
             print(f"  Ungoverned (pre-governor):    {plan_budget.get('ungoverned', 0):6d}")
+            if armed and plan_budget.get("governed", 0) == 0 and plan_budget.get("ungoverned", 0) == 0:
+                print("  (armed, no governed traffic in window — idle, not inert)")
         print()
 
         # ── Split canary (v41flash-tool-canary) ────────────────────────────

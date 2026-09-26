@@ -1205,57 +1205,60 @@ def route_task(
     # `_select_model` walks get_available_models() and returns the first model
     # meeting the needed tier, with no notion of entitlement. For routine
     # tier-10 work that is gpt-5.5 (a plan model) — 1.2% of the clean-era plan
-    # burn. Only plan-account models are touched, so every ollama-cloud and
+    # burn. Only plan-account models are ever *denied*; every ollama-cloud and
     # flash lane, and the canary at percent 100, are structurally unaffected.
-    budget_class = ""
-    if _is_plan_model(selected):
-        governed, budget_class, denied, closed = _apply_plan_governor(
-            selected, prompt=prompt, force_model=force_model
-        )
-        if denied:
-            # Design §131: degrade PREDICTABLY to deepseek-v4-pro (tier 8)
-            # rather than fail closed. `min_tier` here is a quality floor, not a
-            # capability wall — unlike the tool branch, where tool-capability is
-            # a hard gate and nothing may paper over it (§5.5). Failing closed
-            # on ordinary capability routing would trade a real answer for an
-            # error on the largest class of traffic.
-            replacement = _reselect_without_plan_any_tier(0)
-            if not replacement:
-                # Only reachable when every non-plan model is rate-limited or
-                # circuit-broken — genuinely nothing left to serve.
-                return RoutingDecision(
-                    selected_model="",
-                    selected_provider="",
-                    reason=(
-                        f"plan account denied to class '{budget_class}' by plan "
-                        f"governor ("
-                        f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
-                        f") and no non-plan model is available — failing closed"
-                    ),
-                    fallback_chain=[],
-                    all_exhausted=True,
-                    budget_class=budget_class,
-                    plan_budget_denied=True,
-                )
-            replaced_tier = MODEL_CAPABILITY_TIERS.get(replacement, 0)
-            degraded = replaced_tier < min_tier
+    # B39: the governor is consulted unconditionally (not gated on selecting a
+    # plan model) so the class is recorded even for non-plan picks — the only way
+    # the report can tell "armed and idle" from "off". _apply_plan_governor
+    # returns denied=False for any non-plan pick, so this block is a no-op for
+    # them apart from the classification.
+    governed, budget_class, denied, closed = _apply_plan_governor(
+        selected, prompt=prompt, force_model=force_model
+    )
+    if denied:
+        # Design §131: degrade PREDICTABLY to deepseek-v4-pro (tier 8)
+        # rather than fail closed. `min_tier` here is a quality floor, not a
+        # capability wall — unlike the tool branch, where tool-capability is
+        # a hard gate and nothing may paper over it (§5.5). Failing closed
+        # on ordinary capability routing would trade a real answer for an
+        # error on the largest class of traffic.
+        replacement = _reselect_without_plan_any_tier(0)
+        if not replacement:
+            # Only reachable when every non-plan model is rate-limited or
+            # circuit-broken — genuinely nothing left to serve.
             return RoutingDecision(
-                selected_model=replacement,
-                selected_provider=_get_provider(replacement),
+                selected_model="",
+                selected_provider="",
                 reason=(
-                    f"capability tier {min_tier} needed — plan account denied to "
-                    f"class '{budget_class}' by plan governor ("
+                    f"plan account denied to class '{budget_class}' by plan "
+                    f"governor ("
                     f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
-                    f") — selected {replacement} "
-                    f"(tier {replaced_tier}{'; below the computed floor, degraded by design' if degraded else ''})"
+                    f") and no non-plan model is available — failing closed"
                 ),
-                fallback_chain=_contain_plan_in_chain(
-                    _build_fallback_chain(replacement, context_tokens), budget_class
-                ),
+                fallback_chain=[],
+                all_exhausted=True,
                 budget_class=budget_class,
                 plan_budget_denied=True,
             )
-        selected = governed or selected
+        replaced_tier = MODEL_CAPABILITY_TIERS.get(replacement, 0)
+        degraded = replaced_tier < min_tier
+        return RoutingDecision(
+            selected_model=replacement,
+            selected_provider=_get_provider(replacement),
+            reason=(
+                f"capability tier {min_tier} needed — plan account denied to "
+                f"class '{budget_class}' by plan governor ("
+                f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
+                f") — selected {replacement} "
+                f"(tier {replaced_tier}{'; below the computed floor, degraded by design' if degraded else ''})"
+            ),
+            fallback_chain=_contain_plan_in_chain(
+                _build_fallback_chain(replacement, context_tokens), budget_class
+            ),
+            budget_class=budget_class,
+            plan_budget_denied=True,
+        )
+    selected = governed or selected
 
     return RoutingDecision(
         selected_model=selected,
@@ -1476,17 +1479,17 @@ def _apply_plan_governor(
 
     * ``model`` — unchanged when the plan is entitled to it, else ``""`` so the
       caller can re-select away from the plan (or fail closed).
-    * ``klass`` — the class the request was assigned (``""`` when the governor is
-      off, so nothing is reported as governed).
+    * ``klass`` — the class the request was assigned. Recorded whenever the
+      governor is **armed**, even when no plan model is in play, so the report can
+      tell "armed and idle" apart from "no governor". ``""`` when the governor is
+      off (the rollback contract: no row is reported as governed) or when the
+      classifier failed.
     * ``denied`` — True when the plan refused this request.
     * ``closed`` — True when the refusal was capacity, not entitlement.
 
     Only plan-account models are ever touched, so the flash canary and every
     ollama-cloud lane are structurally unaffected.
     """
-    if not _is_plan_model(selected):
-        return selected, "", False, False
-
     try:
         import gpt_budget
 
@@ -1494,14 +1497,42 @@ def _apply_plan_governor(
         # enabled=false is the rollback lever: byte-identical to pre-B37 behaviour.
         if not getattr(cfg, "enabled", False):
             return selected, "", False, False
-
-        klass = _plan_classify(prompt, force_model)
-        reading = gpt_budget.fetch_reading()
-        verdict = gpt_budget.evaluate_policy(reading, cfg, klass=klass)
     except Exception as exc:  # pragma: no cover - defensive
         # A governor bug must never wedge live traffic.
         logger.warning("plan governor unavailable (%s) — failing open", exc)
         return selected, "", False, False
+
+    # Classify BEFORE the plan-model test (B39). The class is an observation about
+    # the request, not a consequence of selecting a plan model: while GPT was dark
+    # no request selected one, so conditioning the classification on that left
+    # ``budget_class`` empty on every row and the nightly digest reported the whole
+    # table as ``ungoverned`` — which reads as "the governor looks inert" when in
+    # fact it was never asked.
+    #
+    # A classifier failure must not invent a class. ``_plan_classify`` fails safe
+    # to ``architectural`` (never deny on a bug), which is right for *gating* and
+    # wrong for *reporting*: it would mark every unclassifiable request as the one
+    # lane gpt is reserved for.
+    try:
+        klass = _plan_classify(prompt, force_model)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("plan classifier unavailable (%s) — recording no class", exc)
+        return selected, "", False, False
+
+    if not klass:
+        return selected, "", False, False
+
+    # No plan model in play — nothing to gate. The class is still recorded, and
+    # the (expensive) account probe is skipped entirely.
+    if not _is_plan_model(selected):
+        return selected, klass, False, False
+
+    try:
+        reading = gpt_budget.fetch_reading()
+        verdict = gpt_budget.evaluate_policy(reading, cfg, klass=klass)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("plan governor unavailable (%s) — failing open", exc)
+        return selected, klass, False, False
 
     if verdict == gpt_budget.VERDICT_OPEN:
         return selected, klass, False, False
@@ -1592,13 +1623,18 @@ def _build_tool_fallback_chain(current_model: str, *, klass: Optional[str] = Non
     are excluded from the chain.
     """
     current_tier = MODEL_CAPABILITY_TIERS.get(current_model, 0)
+    # Hoisted out of the loop (B39): the verdict is a property of the request
+    # class, not of each candidate model, so recomputing it per model scaled cost
+    # with the candidate count (~14 x 87 µs). Compute once, and only when a real
+    # class is present (``klass`` is None when the governor is off or the caller
+    # declined to pass a class; empty string means "no class recorded").
+    deny_plan = bool(klass) and _plan_denied_for_class(klass)
     chain = []
     for model in get_available_models():
         if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
             continue
-        if klass is not None and _plan_denied_for_class(klass):
-            if get_model_account(model) == _governed_account():
-                continue
+        if deny_plan and get_model_account(model) == _governed_account():
+            continue
         tier = MODEL_CAPABILITY_TIERS.get(model, 0)
         if tier > current_tier:
             chain.append(model)
