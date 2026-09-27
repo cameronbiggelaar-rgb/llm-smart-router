@@ -108,7 +108,9 @@ PRIVATE_CHAT_SCRIPT = str(Path.home() / ".hermes" / "skills" / "security" / "pri
 # Hermes can execute (not prose like "Tool call: terminal").
 #
 # Verified 2026-08-10 via direct Ollama Cloud API probe (test_ollama_tools*.py):
-#   - deepseek-v4-flash: emits tool_calls with valid JSON args; continues cleanly
+#   - deepseek-v4.1-flash: emits tool_calls with valid JSON args; continues cleanly;
+#     promoted after the B35/B36 served canary completed with zero escalation and
+#     zero hard failures in the eligible cohort
 #   - glm-5.3:            emits tool_calls with valid JSON args; continues cleanly
 #   - qwen3.5:            emits tool_calls but re-invokes (loop tendency) — NOT added
 # gpt-5.5 remains tool-capable (ChatGPT). These let tool work fall to cheaper
@@ -120,6 +122,7 @@ TOOL_CAPABLE_MODELS = {
  "gpt-5.6-terra", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
  "gpt-5.6-sol", # verified 2026-09-05: emits clean tool_calls + finish_reason (streaming, single-tool)
  "deepseek-v4-pro", # verified 2026-08-15: emits clean tool_calls + finish_reason (streaming + non-streaming, multi-tool)
+ "deepseek-v4.1-flash", # promoted from B36 served canary
  "glm-5.3",
 }
 
@@ -997,6 +1000,12 @@ def route_task(
         # demoted off gpt-5.6-sol (see _architectural_floor).
         tool_floor = max(min_tier, _architectural_floor(prompt))
         tool_model = _select_tool_capable_model(tool_floor)
+        tool_model = _promote_flash_tool_model(
+            tool_model,
+            workload_type=workload_type or "normal_chat",
+            task_type=task_type,
+            requires_tools=requires_tools,
+        )
         if not tool_model:
             return RoutingDecision(
                 selected_model="",
@@ -1333,6 +1342,31 @@ def _architectural_floor(prompt: str) -> int:
     return 0
 
 
+def _promote_flash_tool_model(
+    selected_model: str,
+    *,
+    workload_type: str,
+    task_type: str,
+    requires_tools: bool,
+) -> str:
+    """Promote the completed B36 canary cohort into ordinary routing.
+
+    The served experiment deliberately replaced only a ``deepseek-v4-pro``
+    baseline for tool-bearing normal chat, excluding debugging/testing. Keeping
+    the incumbent equality check is important: this policy may save money by
+    replacing pro, but must never demote an architectural/high-floor GPT pick.
+    """
+    if not requires_tools or workload_type != "normal_chat":
+        return selected_model
+    if task_type in {"debugging", "testing"}:
+        return selected_model
+    if _normalize_model_name(selected_model) != "deepseek-v4-pro":
+        return selected_model
+    if not is_model_available("deepseek-v4.1-flash"):
+        return selected_model
+    return "deepseek-v4.1-flash"
+
+
 def _select_tool_capable_model(min_tier: int = 0) -> str:
     """Select the cheapest available model proven to support Hermes tools.
 
@@ -1358,10 +1392,16 @@ def _select_tool_capable_model(min_tier: int = 0) -> str:
     """
     available = get_available_models()
 
-    # Cheapest model meeting the floor, in cost order.
+    # Cheapest baseline model meeting the floor, in cost order. Flash is a
+    # qualified tool model but its direct-production scope is narrower than the
+    # generic selector (former B36 cohort), so `_promote_flash_tool_model` applies
+    # it after this baseline pick. Do not let it bypass debugging/testing or
+    # demote a higher-floor baseline merely because it is cheapest.
     for model in available:
         model_key = _normalize_model_name(model)
         if model_key not in TOOL_CAPABLE_MODELS:
+            continue
+        if model_key == "deepseek-v4.1-flash":
             continue
         tier = MODEL_CAPABILITY_TIERS.get(model_key, 0)
         if tier >= min_tier:

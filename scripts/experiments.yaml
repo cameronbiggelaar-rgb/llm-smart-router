@@ -104,18 +104,11 @@ experiments:
       served by deepseek-v4-pro. Measures true streamed cached_tokens and
       cached-rate cost; output discarded; no traffic moves.
 
-  # Served split canary (B36) — moves a bounded slice of tool-bearing
-  # normal_chat OFF deepseek-v4-pro and ONTO deepseek-v4.1-flash for real.
-  # Flash is ~3x cheaper streamed at the same cache rate (proven B35), so this
-  # is the first actual savings step. Scoped conservatively:
-  #   * 10% of eligible requests (stable session hash)
-  #   * only qa/research/planning/other — debugging/coding/testing stay on pro
-  #   * a flash miss escalates to deepseek-v4-pro (fallback_model), NEVER the
-  #     scarce ChatGPT plan (gpt-5.5/5.6)
-  # Keep DISABLED until go/no-go is explicit. Flip enabled:true (hot-reloaded)
-  # to start; flip back to roll back — no code revert needed.
+  # Retired served split canary (B36/B40). Its proven cohort is now expressed
+  # directly in router.py; keep this disabled block as rollout history/rollback
+  # documentation, not as an active traffic mechanism.
   - name: v41flash-tool-canary
-    enabled: true
+    enabled: false
     model: deepseek-v4.1-flash:cloud
     provider: ollama-cloud
     mode: split
@@ -127,7 +120,7 @@ experiments:
       incumbent_model: deepseek-v4-pro
       exclude_task_type: [debugging, testing]
     notes: >-
-      Serve 100% of tool-bearing normal_chat from deepseek-v4.1-flash (full
-      flip, B36d). Excludes debugging/testing, which stay on pro. Flash miss
-      escalates to pro via fallback_model. Rollback = percent 100 -> 0 or
-      enabled:false (hot-reloaded, no restart).
+      Retired in B40 after the 100% served rollout remained healthy. Production
+      routing now applies this cohort directly in router.py, with the ordinary
+      tool fallback chain taking flash failures first to deepseek-v4-pro. This
+      disabled block is retained only as experiment history.

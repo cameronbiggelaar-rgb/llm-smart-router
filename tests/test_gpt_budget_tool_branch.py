@@ -214,7 +214,7 @@ def test_tool_bearing_denied_but_no_non_plan_model_fails_closed(clean_state, mon
     # cooldown is required: `availability = False` alone is undone by the
     # `probe_all_recovering()` sweep at the top of route_task.
     far_future = time.time() + 3600
-    for m in ("deepseek-v4-pro", "glm-5.3"):
+    for m in ("deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3"):
         st = router._MODEL_STATUSES[m]
         st.available = False
         st.rate_limited_until = far_future

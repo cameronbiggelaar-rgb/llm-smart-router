@@ -55,10 +55,10 @@ import models  # noqa: E402
 import router  # noqa: E402
 
 # Tool-capable, in MODEL_COST_ORDER (cheap -> expensive), with tiers:
-#   glm-5.3 6 | deepseek-v4-pro 8 | gpt-5.5 10 | gpt-5.6-luna 11
-#   gpt-5.6-terra 12 | gpt-5.6-sol 13
-TOOL_CAPABLE = ["glm-5.3", "deepseek-v4-pro", "gpt-5.5", "gpt-5.6-luna",
-                "gpt-5.6-terra", "gpt-5.6-sol"]
+#   deepseek-v4.1-flash 3 | glm-5.3 6 | deepseek-v4-pro 8 | gpt-5.5 10 |
+#   gpt-5.6-luna 11 | gpt-5.6-terra 12 | gpt-5.6-sol 13
+TOOL_CAPABLE = ["deepseek-v4.1-flash", "glm-5.3", "deepseek-v4-pro", "gpt-5.5",
+                "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 ALL_STATUS = TOOL_CAPABLE + ["llama3.1:8b", "dolphin3", "gpt-6-astra"]
 
 
@@ -264,8 +264,8 @@ def test_cost_order_is_price_based_and_pinned():
     slice AND the price facts that justify it, so a price-book change that
     reorders these models fails loudly here rather than silently re-routing."""
     order = [m for m in models.MODEL_COST_ORDER if m in TOOL_CAPABLE]
-    assert order == ["deepseek-v4-pro", "glm-5.3", "gpt-5.5", "gpt-5.6-luna",
-                     "gpt-5.6-terra", "gpt-5.6-sol"], (
+    assert order == ["deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5",
+                     "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"], (
         f"tool-capable cost order changed: {order}"
     )
     # pro must be cheaper than glm-5.3 for the ordering above to be coherent.

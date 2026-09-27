@@ -1051,7 +1051,13 @@ class TestOllamaToolCapableModels:
             ),
             _r._architectural_floor(""),
         )
-        expected = _r._select_tool_capable_model(floor)
+        baseline = _r._select_tool_capable_model(floor)
+        expected = _r._promote_flash_tool_model(
+            baseline,
+            workload_type="normal_chat",
+            task_type="coding",
+            requires_tools=True,
+        )
         assert decision.selected_model == expected, decision.reason
         assert _r._normalize_model_name(decision.selected_model) in _r.TOOL_CAPABLE_MODELS
 
@@ -1088,8 +1094,10 @@ class TestOllamaToolCapableModels:
             task_type="coding",
             requires_tools=True,
         )
-        # deepseek-v4-pro (tier 8) is now the most capable tool model below gpt-5.5
-        assert decision.selected_model in {"deepseek-v4-pro", "glm-5.3"}
+        # Eligible normal_chat coding now uses the promoted B36 flash model.
+        assert decision.selected_model in {
+            "deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3"
+        }
         assert not decision.all_exhausted
         mark_available("gpt-5.5")
 
@@ -1103,7 +1111,7 @@ class TestOllamaToolCapableModels:
         """CRITICAL: if every tool-capable model is unavailable, tool work must
         STILL fail closed — never leak to a non-tool-capable model like qwen."""
         from router import mark_rate_limited
-        for m in ("deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
+        for m in ("deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_rate_limited(m)
         decision = route_task(
             complexity_score=0.5,
@@ -1113,7 +1121,7 @@ class TestOllamaToolCapableModels:
         assert decision.selected_model == ""
         assert decision.all_exhausted
         # restore
-        for m in ("deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
+        for m in ("deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "gpt-5.5"):
             mark_available(m)
 
     def test_escalation_from_gpt55_falls_to_next_tool_model(self):
