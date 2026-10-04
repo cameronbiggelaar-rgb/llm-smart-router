@@ -208,3 +208,756 @@ Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
  The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
 
 Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-16:
+  2026-09-14 rolled up (27 model/workload rows)
+  2026-09-15 rolled up (19 model/workload rows)
+  2026-09-16 rolled up (14 model/workload rows)
+
+Deleted 0 of 0 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-17)
+VACUUM: not needed
+
+Unit cost — since 2026-09-13
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                session_compression       259     319.34    1.23297      n/a
+gpt-5.5                    session_compression       259     308.35    1.19053      n/a
+deepseek-v4.1-flash:cloud  session_compression      8912     131.14    0.01472      n/a
+deepseek-v4-pro            session_compression      1182      95.46    0.08076      n/a
+gpt-5.5                    normal_chat               431      42.67    0.09901      n/a
+glm-5.3                    session_compression       133      26.42    0.19867      n/a
+qwen3.5                    normal_chat               976      18.20    0.01864      n/a
+gpt-5.6-terra              session_compression        13      11.71    0.90071      n/a
+gpt-5.6-luna               normal_chat                81       6.93    0.08553      n/a
+deepseek-v4-flash:cloud    session_compression       287       6.58    0.02294      n/a
+glm-5.3:cloud              session_compression        34       5.89    0.17335      n/a
+deepseek-v4-pro            normal_chat               454       4.76    0.01047      n/a
+deepseek-v4.1-flash:cloud  session_compression_     2003       4.17    0.00208      n/a
+gpt-5.6-luna               session_compression         2       3.55    1.77498      n/a
+deepseek-v4-flash          session_compression       307       2.10    0.00684      n/a
+deepseek-v4-flash:cloud    session_compression_      193       1.89    0.00981      n/a
+gpt-5.6-terra              normal_chat                 7       0.64    0.09182      n/a
+deepseek-v4-flash          session_compression_      285       0.54    0.00190      n/a
+gpt-5.6-sol                normal_chat                 4       0.27    0.06873      n/a
+glm-5.3:cloud              normal_chat                22       0.21    0.00933      n/a
+glm-5.2:cloud              session_compression         1       0.16    0.15957      n/a
+deepseek-v4.1-flash:cloud  normal_chat                17       0.02    0.00135      n/a
+deepseek-v4-flash:cloud    normal_chat                18       0.00    0.00017      n/a
+glm-5.3                    normal_chat                11       0.00    0.00011      n/a
+glm-5.2:cloud              normal_chat                 1       0.00    0.00007      n/a
+llama3.1:8b                normal_chat               438       0.00    0.00000      n/a
+dolphin3                   normal_chat                29       0.00    0.00000      n/a
+biggie-router              unknown                    21       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  unknown                     7       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+llama3.1:8b                session_compression         2       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              16395     991.01
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: 249b955
+  repo_sha: 249b955
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 4 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-17:
+  2026-09-15 rolled up (19 model/workload rows)
+  2026-09-16 rolled up (14 model/workload rows)
+  2026-09-17 rolled up (6 model/workload rows)
+
+Deleted 8207 of 8207 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-18)
+VACUUM: not needed
+
+Unit cost — since 2026-09-14
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                session_compression       129     211.76    1.64154      n/a
+deepseek-v4.1-flash:cloud  session_compression      5644      91.31    0.01618      n/a
+deepseek-v4-pro            session_compression       997      88.06    0.08832      n/a
+gpt-5.5                    normal_chat               429      41.67    0.09712      n/a
+deepseek-v4-pro            normal_chat              3512      28.87    0.00822      n/a
+glm-5.3                    session_compression       133      26.42    0.19867      n/a
+qwen3.5                    normal_chat               920      17.15    0.01865      n/a
+deepseek-v4-flash:cloud    session_compression       270       6.40    0.02371      n/a
+glm-5.3:cloud              session_compression        34       5.89    0.17335      n/a
+gpt-5.6-luna               normal_chat                78       5.76    0.07388      n/a
+deepseek-v4.1-flash:cloud  session_compression_     2003       4.17    0.00208      n/a
+gpt-5.6-luna               session_compression         2       3.55    1.77498      n/a
+deepseek-v4-flash          session_compression       307       2.10    0.00684      n/a
+deepseek-v4-flash:cloud    session_compression_      193       1.89    0.00981      n/a
+gpt-5.6-terra              session_compression         2       0.90    0.45070      n/a
+gpt-5.6-terra              normal_chat                 6       0.64    0.10635      n/a
+deepseek-v4-flash          session_compression_      285       0.54    0.00190      n/a
+glm-5.3:cloud              normal_chat                19       0.23    0.01224      n/a
+glm-5.2:cloud              session_compression         1       0.16    0.15957      n/a
+gpt-5.6-sol                normal_chat                 2       0.14    0.06904      n/a
+deepseek-v4.1-flash:cloud  normal_chat                16       0.02    0.00131      n/a
+glm-5.3                    normal_chat                11       0.00    0.00011      n/a
+deepseek-v4-flash:cloud    normal_chat                15       0.00    0.00004      n/a
+llama3.1:8b                normal_chat               404       0.00    0.00000      n/a
+dolphin3                   normal_chat                25       0.00    0.00000      n/a
+biggie-router              unknown                    20       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  unknown                     2       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              15460     537.64
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: 249b955
+  repo_sha: 249b955
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 4 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-18:
+  2026-09-16 rolled up (14 model/workload rows)
+  2026-09-17 rolled up (7 model/workload rows)
+  2026-09-18 rolled up (6 model/workload rows)
+
+Deleted 2809 of 2809 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-19)
+VACUUM: not needed
+
+Unit cost — since 2026-09-15
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              6204      55.05    0.00887      n/a
+qwen3.5                    normal_chat               754      13.62    0.01806      n/a
+deepseek-v4.1-flash:cloud  session_compression      2004       6.86    0.00343      n/a
+glm-5.3:cloud              normal_chat               193       6.35    0.03291      n/a
+deepseek-v4.1-flash:cloud  session_compression_     1426       2.87    0.00201      n/a
+gpt-5.5                    normal_chat                35       2.79    0.07958      n/a
+deepseek-v4-flash:cloud    session_compression       162       1.27    0.00786      n/a
+deepseek-v4-flash:cloud    session_compression_      131       1.24    0.00950      n/a
+deepseek-v4-flash          session_compression_      198       0.46    0.00233      n/a
+deepseek-v4-flash          session_compression       242       0.39    0.00162      n/a
+glm-5.2:cloud              session_compression         1       0.16    0.15957      n/a
+glm-5.3:cloud              session_compression         1       0.13    0.12818      n/a
+deepseek-v4.1-flash:cloud  normal_chat                 7       0.01    0.00112      n/a
+glm-5.3                    normal_chat                10       0.00    0.00011      n/a
+deepseek-v4-flash:cloud    normal_chat                11       0.00    0.00004      n/a
+llama3.1:8b                normal_chat               286       0.00    0.00000      n/a
+biggie-router              unknown                    20       0.00    0.00000      n/a
+dolphin3                   normal_chat                19       0.00    0.00000      n/a
+deepseek-v4.1-flash:cloud  unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              11705      91.21
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: a424cf8
+  repo_sha: a424cf8
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 4 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-19:
+  2026-09-17 rolled up (7 model/workload rows)
+  2026-09-18 rolled up (8 model/workload rows)
+  2026-09-19 rolled up (7 model/workload rows)
+
+Deleted 3860 of 3860 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-20)
+VACUUM: not needed
+
+Unit cost — since 2026-09-16
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              8423      70.09    0.00832      n/a
+qwen3.5                    normal_chat               416       7.14    0.01716      n/a
+glm-5.3:cloud              normal_chat               214       6.70    0.03131      n/a
+deepseek-v4.1-flash:cloud  session_compression       932       4.41    0.00473      n/a
+glm-5.2:cloud              normal_chat                67       2.08    0.03110      n/a
+deepseek-v4.1-flash:cloud  session_compression_      305       0.54    0.00178      n/a
+deepseek-v4-flash:cloud    session_compression        57       0.54    0.00947      n/a
+deepseek-v4-flash:cloud    session_compression_       22       0.11    0.00510      n/a
+deepseek-v4.1-flash:cloud  normal_chat                21       0.11    0.00524      n/a
+deepseek-v4-flash          session_compression        56       0.05    0.00097      n/a
+deepseek-v4-flash          session_compression_       38       0.02    0.00045      n/a
+glm-5.3                    normal_chat                 8       0.00    0.00011      n/a
+deepseek-v4-flash:cloud    normal_chat                 9       0.00    0.00004      n/a
+llama3.1:8b                normal_chat               123       0.00    0.00000      n/a
+biggie-router              unknown                    27       0.00    0.00000      n/a
+dolphin3                   normal_chat                13       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                              10731      91.79
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: c102c6a
+  repo_sha: c102c6a
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 4 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-20:
+  2026-09-18 rolled up (8 model/workload rows)
+  2026-09-19 rolled up (12 model/workload rows)
+  2026-09-20 rolled up (10 model/workload rows)
+
+Deleted 2868 of 2868 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-21)
+VACUUM: not needed
+
+Unit cost — since 2026-09-17
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               290     279.40    0.96344      n/a
+deepseek-v4-pro            normal_chat              8322      63.87    0.00767      n/a
+glm-5.3:cloud              normal_chat               302       7.69    0.02547      n/a
+gpt-5.5                    normal_chat                58       6.43    0.11079      n/a
+glm-5.2:cloud              normal_chat               195       4.92    0.02524      n/a
+qwen3.5                    normal_chat               274       4.63    0.01689      n/a
+deepseek-v4.1-flash:cloud  session_compression       252       2.78    0.01103      n/a
+gpt-5.6-luna               normal_chat                 7       1.71    0.24397      n/a
+deepseek-v4-flash:cloud    session_compression        10       0.22    0.02160      n/a
+deepseek-v4.1-flash:cloud  normal_chat                21       0.11    0.00524      n/a
+deepseek-v4-flash          session_compression         3       0.03    0.01106      n/a
+deepseek-v4-flash:cloud    normal_chat                 2       0.00    0.00004      n/a
+biggie-router              unknown                    43       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 9       0.00    0.00000      n/a
+dolphin3                   normal_chat                 4       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               9793     371.78
+
+
+Deploy check — is the endpoint serving the current source?
+  status: STALE
+  reason: running build is not the current source
+  running_sha: fa254c8
+  repo_sha: e40fafe
+  ACTION: restart the endpoint to load the current code —
+    sudo systemctl restart biggie-llm-endpoint
+WARNING: a stale build is serving traffic. This does not fail the job; restart the endpoint to load the current code.
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-21:
+  2026-09-19 rolled up (12 model/workload rows)
+  2026-09-20 rolled up (11 model/workload rows)
+  2026-09-21 rolled up (8 model/workload rows)
+
+Deleted 6415 of 6415 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-22)
+VACUUM: not needed
+
+Unit cost — since 2026-09-18
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               630     603.78    0.95838      n/a
+deepseek-v4-pro            normal_chat              7601      52.97    0.00697      n/a
+gpt-5.5                    normal_chat               116      11.31    0.09747      n/a
+glm-5.2:cloud              normal_chat               247       6.17    0.02498      n/a
+glm-5.3:cloud              normal_chat               268       3.37    0.01258      n/a
+qwen3.5                    normal_chat               190       3.15    0.01660      n/a
+gpt-5.6-luna               normal_chat                12       2.91    0.24225      n/a
+deepseek-v4.1-flash:cloud  session_compression       215       2.21    0.01029      n/a
+deepseek-v4.1-flash:cloud  normal_chat                21       0.11    0.00524      n/a
+deepseek-v4-flash:cloud    normal_chat                 2       0.00    0.00004      n/a
+biggie-router              unknown                    38       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                10       0.00    0.00000      n/a
+dolphin3                   normal_chat                 4       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               9357     685.98
+
+
+Deploy check — is the endpoint serving the current source?
+  status: STALE
+  reason: running build is not the current source
+  running_sha: fa254c8
+  repo_sha: e40fafe
+  ACTION: restart the endpoint to load the current code —
+    sudo systemctl restart biggie-llm-endpoint
+WARNING: a stale build is serving traffic. This does not fail the job; restart the endpoint to load the current code.
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-22:
+  2026-09-20 rolled up (11 model/workload rows)
+  2026-09-21 rolled up (9 model/workload rows)
+  2026-09-22 rolled up (6 model/workload rows)
+
+Deleted 10254 of 10254 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-23)
+VACUUM: not needed
+
+Unit cost — since 2026-09-19
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               630     603.78    0.95838      n/a
+deepseek-v4-pro            normal_chat              6477      44.98    0.00694      n/a
+gpt-5.5                    normal_chat               116      11.31    0.09747      n/a
+glm-5.2:cloud              normal_chat               258       5.72    0.02218      n/a
+gpt-5.6-luna               normal_chat                12       2.91    0.24225      n/a
+glm-5.3:cloud              normal_chat               272       2.80    0.01028      n/a
+deepseek-v4.1-flash:cloud  session_compression       160       1.68    0.01051      n/a
+deepseek-v4.1-flash:cloud  normal_chat                24       0.07    0.00297      n/a
+deepseek-v4-flash:cloud    normal_chat                 2       0.00    0.00004      n/a
+biggie-router              unknown                    31       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                11       0.00    0.00000      n/a
+dolphin3                   normal_chat                 2       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               7998     673.24
+
+
+Deploy check — is the endpoint serving the current source?
+  status: STALE
+  reason: running build is not the current source
+  running_sha: 73f88fb
+  repo_sha: fe868c3
+  ACTION: restart the endpoint to load the current code —
+    sudo systemctl restart biggie-llm-endpoint
+WARNING: a stale build is serving traffic. This does not fail the job; restart the endpoint to load the current code.
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-23:
+  2026-09-21 rolled up (9 model/workload rows)
+  2026-09-22 rolled up (6 model/workload rows)
+  2026-09-23 rolled up (0 model/workload rows)
+
+Deleted 2920 of 2920 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-24)
+VACUUM: not needed
+
+Unit cost — since 2026-09-20
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               525     513.72    0.97851      n/a
+deepseek-v4-pro            normal_chat              6248      42.65    0.00683      n/a
+gpt-5.5                    normal_chat                70       7.12    0.10176      n/a
+glm-5.2:cloud              normal_chat               185       4.17    0.02254      n/a
+gpt-5.6-luna               normal_chat                12       2.91    0.24225      n/a
+glm-5.3:cloud              normal_chat               280       2.76    0.00985      n/a
+deepseek-v4.1-flash:cloud  session_compression       169       1.81    0.01072      n/a
+deepseek-v4.1-flash:cloud  normal_chat                82       0.40    0.00483      n/a
+biggie-router              unknown                    15       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 4       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+biggie-router              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               7593     575.53
+
+
+Deploy check — is the endpoint serving the current source?
+  status: STALE
+  reason: running build is not the current source
+  running_sha: 73f88fb
+  repo_sha: 94d40a8
+  ACTION: restart the endpoint to load the current code —
+    sudo systemctl restart biggie-llm-endpoint
+WARNING: a stale build is serving traffic. This does not fail the job; restart the endpoint to load the current code.
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-24:
+  2026-09-22 rolled up (6 model/workload rows)
+  2026-09-23 rolled up (7 model/workload rows)
+  2026-09-24 rolled up (7 model/workload rows)
+
+Deleted 10266 of 10266 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-25)
+VACUUM: ran
+
+Unit cost — since 2026-09-21
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat                95      77.44    0.81520      n/a
+deepseek-v4-pro            normal_chat              6453      43.91    0.00680      n/a
+glm-5.2:cloud              normal_chat               244       6.22    0.02549      n/a
+glm-5.3:cloud              normal_chat               363       3.76    0.01035      n/a
+deepseek-v4.1-flash:cloud  session_compression       176       1.99    0.01130      n/a
+deepseek-v4.1-flash:cloud  normal_chat               724       1.57    0.00216      n/a
+gpt-5.5                    normal_chat                18       1.10    0.06116      n/a
+biggie-router              unknown                    15       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 4       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               8093     135.99
+
+
+Deploy check — is the endpoint serving the current source?
+  status: STALE
+  reason: running build is not the current source
+  running_sha: 73f88fb
+  repo_sha: 7ed2f07
+  ACTION: restart the endpoint to load the current code —
+    sudo systemctl restart biggie-llm-endpoint
+WARNING: a stale build is serving traffic. This does not fail the job; restart the endpoint to load the current code.
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-25:
+  2026-09-23 rolled up (7 model/workload rows)
+  2026-09-24 rolled up (7 model/workload rows)
+  2026-09-25 rolled up (7 model/workload rows)
+
+Deleted 8932 of 8932 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-26)
+VACUUM: not needed
+
+Unit cost — since 2026-09-22
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              5082      32.61    0.00642      n/a
+glm-5.2:cloud              normal_chat               308       7.82    0.02540      n/a
+deepseek-v4.1-flash:cloud  normal_chat              2308       3.99    0.00173      n/a
+glm-5.3:cloud              normal_chat               378       3.73    0.00988      n/a
+deepseek-v4.1-flash:cloud  session_compression       177       2.06    0.01162      n/a
+biggie-router              unknown                    20       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 4       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               8277      50.22
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: 6f4bad9
+  repo_sha: 6f4bad9
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-26:
+  2026-09-24 rolled up (7 model/workload rows)
+  2026-09-25 rolled up (7 model/workload rows)
+  2026-09-26 rolled up (6 model/workload rows)
+
+Deleted 7972 of 7972 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-27)
+VACUUM: not needed
+
+Unit cost — since 2026-09-23
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              4586      28.49    0.00621      n/a
+glm-5.2:cloud              normal_chat               327       8.49    0.02596      n/a
+deepseek-v4.1-flash:cloud  normal_chat              2424       3.90    0.00161      n/a
+glm-5.3:cloud              normal_chat               378       3.75    0.00992      n/a
+deepseek-v4.1-flash:cloud  session_compression       145       1.74    0.01199      n/a
+biggie-router              unknown                    24       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 4       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               7888      46.37
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: 6f4bad9
+  repo_sha: 6f4bad9
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-27:
+  2026-09-25 rolled up (7 model/workload rows)
+  2026-09-26 rolled up (8 model/workload rows)
+  2026-09-27 rolled up (8 model/workload rows)
+
+Deleted 3607 of 3607 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-28)
+VACUUM: not needed
+
+Unit cost — since 2026-09-24
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               234     309.31    1.32186      n/a
+deepseek-v4-pro            normal_chat              5091      33.12    0.00651      n/a
+gpt-5.5                    normal_chat               115      19.53    0.16980      n/a
+glm-5.2:cloud              normal_chat               326       8.48    0.02600      n/a
+gpt-5.6-luna               normal_chat                24       4.83    0.20115      n/a
+deepseek-v4.1-flash:cloud  normal_chat              2811       4.07    0.00145      n/a
+deepseek-v4.1-flash:cloud  session_compression       194       2.27    0.01170      n/a
+glm-5.3:cloud              normal_chat               182       1.36    0.00746      n/a
+gpt-5.6-terra              normal_chat                21       1.32    0.06308      n/a
+biggie-router              unknown                    25       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 2       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               9025     384.28
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-28:
+  2026-09-26 rolled up (8 model/workload rows)
+  2026-09-27 rolled up (11 model/workload rows)
+  2026-09-28 rolled up (11 model/workload rows)
+
+Deleted 10535 of 10535 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-29)
+VACUUM: ran
+
+Unit cost — since 2026-09-25
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               389     518.62    1.33322      n/a
+gpt-5.5                    normal_chat               538     117.64    0.21866      n/a
+gpt-5.6-terra              normal_chat                91      69.87    0.76780      n/a
+deepseek-v4-pro            normal_chat              4455      30.15    0.00677      n/a
+gpt-5.6-luna               normal_chat               115      20.73    0.18023      n/a
+glm-5.2:cloud              normal_chat               219       5.57    0.02543      n/a
+deepseek-v4.1-flash:cloud  normal_chat              2376       3.31    0.00139      n/a
+deepseek-v4.1-flash:cloud  session_compression       160       1.85    0.01158      n/a
+glm-5.3:cloud              normal_chat               166       1.39    0.00835      n/a
+biggie-router              unknown                    22       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               8534     769.13
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-29:
+  2026-09-27 rolled up (11 model/workload rows)
+  2026-09-28 rolled up (11 model/workload rows)
+  2026-09-29 rolled up (5 model/workload rows)
+
+Deleted 6477 of 6477 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-30)
+VACUUM: not needed
+
+Unit cost — since 2026-09-26
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               389     518.62    1.33322      n/a
+gpt-5.5                    normal_chat               538     117.64    0.21866      n/a
+gpt-5.6-terra              normal_chat                91      69.87    0.76780      n/a
+deepseek-v4-pro            normal_chat              4322      28.91    0.00669      n/a
+gpt-5.6-luna               normal_chat               115      20.73    0.18023      n/a
+glm-5.2:cloud              normal_chat               157       4.45    0.02836      n/a
+deepseek-v4.1-flash:cloud  session_compression       156       1.76    0.01131      n/a
+deepseek-v4.1-flash:cloud  normal_chat              1514       1.65    0.00109      n/a
+glm-5.3:cloud              normal_chat                56       0.09    0.00164      n/a
+biggie-router              unknown                    13       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               7353     763.74
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-09-30:
+  2026-09-28 rolled up (11 model/workload rows)
+  2026-09-29 rolled up (6 model/workload rows)
+  2026-09-30 rolled up (5 model/workload rows)
+
+Deleted 6915 of 6915 candidate raw row(s) older than 30 day(s) (cutoff 2026-08-31)
+VACUUM: not needed
+
+Unit cost — since 2026-09-27
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat               370     441.97    1.19451      n/a
+gpt-5.5                    normal_chat               492     112.60    0.22886      n/a
+gpt-5.6-terra              normal_chat                91      69.87    0.76780      n/a
+deepseek-v4-pro            normal_chat              3760      25.33    0.00674      n/a
+gpt-5.6-luna               normal_chat               115      20.73    0.18023      n/a
+glm-5.2:cloud              normal_chat               164       4.94    0.03014      n/a
+deepseek-v4.1-flash:cloud  normal_chat              1553       1.78    0.00115      n/a
+deepseek-v4.1-flash:cloud  session_compression       100       1.18    0.01184      n/a
+glm-5.3:cloud              normal_chat                45       0.08    0.00176      n/a
+biggie-router              unknown                     8       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     2       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               6700     678.48
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-10-01:
+  2026-09-29 rolled up (6 model/workload rows)
+  2026-09-30 rolled up (6 model/workload rows)
+  2026-10-01 rolled up (7 model/workload rows)
+
+Deleted 4615 of 4615 candidate raw row(s) older than 30 day(s) (cutoff 2026-09-01)
+VACUUM: not needed
+
+Unit cost — since 2026-09-28
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+gpt-5.6-sol                normal_chat                45      56.67    1.25933      n/a
+gpt-5.5                    normal_chat               148      56.52    0.38187      n/a
+gpt-5.6-terra              normal_chat                29      35.04    1.20827      n/a
+deepseek-v4-pro            normal_chat              3984      26.32    0.00661      n/a
+glm-5.2:cloud              normal_chat               183       5.48    0.02994      n/a
+gpt-5.6-luna               normal_chat                20       3.01    0.15057      n/a
+glm-5.3:cloud              normal_chat               259       2.18    0.00840      n/a
+deepseek-v4.1-flash:cloud  normal_chat              1296       1.56    0.00120      n/a
+deepseek-v4.1-flash:cloud  session_compression        93       1.10    0.01180      n/a
+glm-5.3                    normal_chat                 1       0.08    0.08349      n/a
+biggie-router              unknown                    10       0.00    0.00000      n/a
+glm-5.2:cloud              unknown                     1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               6069     187.95
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-10-02:
+  2026-09-30 rolled up (6 model/workload rows)
+  2026-10-01 rolled up (8 model/workload rows)
+  2026-10-02 rolled up (6 model/workload rows)
+
+Deleted 4882 of 4882 candidate raw row(s) older than 30 day(s) (cutoff 2026-09-02)
+VACUUM: not needed
+
+Unit cost — since 2026-09-29
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              3720      23.85    0.00641      n/a
+glm-5.2:cloud              normal_chat               180       5.32    0.02954      n/a
+glm-5.3:cloud              normal_chat               254       2.18    0.00858      n/a
+deepseek-v4.1-flash:cloud  normal_chat               971       1.28    0.00132      n/a
+deepseek-v4.1-flash:cloud  session_compression        89       1.02    0.01149      n/a
+glm-5.3                    normal_chat                 1       0.08    0.08349      n/a
+biggie-router              unknown                    14       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 1       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               5230      33.73
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)
+Rolling up 3 day(s) ending 2026-10-03:
+  2026-10-01 rolled up (8 model/workload rows)
+  2026-10-02 rolled up (7 model/workload rows)
+  2026-10-03 rolled up (8 model/workload rows)
+
+Deleted 8520 of 8520 candidate raw row(s) older than 30 day(s) (cutoff 2026-09-03)
+VACUUM: not needed
+
+Unit cost — since 2026-09-30
+model                      call_type               calls    $ total     $/call  quality
+----------------------------------------------------------------------------------------
+deepseek-v4-pro            normal_chat              4629      30.04    0.00649      n/a
+glm-5.2:cloud              normal_chat               339       9.01    0.02658      n/a
+glm-5.3:cloud              normal_chat               502       8.07    0.01607      n/a
+deepseek-v4.1-flash:cloud  normal_chat              4307       5.32    0.00124      n/a
+deepseek-v4.1-flash:cloud  session_compression       176       1.81    0.01029      n/a
+glm-5.2:cloud              session_compression         2       0.18    0.09209      n/a
+glm-5.3                    normal_chat                 1       0.08    0.08349      n/a
+biggie-router              unknown                    32       0.00    0.00000      n/a
+llama3.1:8b                normal_chat                 3       0.00    0.00000      n/a
+----------------------------------------------------------------------------------------
+TOTAL                                               9991      54.52
+
+
+Deploy check — is the endpoint serving the current source?
+  status: OK
+  reason: running build matches HEAD
+  running_sha: cf04467
+  repo_sha: cf04467
+
+Routing proposal (last 3d, quality floor 0.8, min 30 calls) — NOT APPLIED
+
+ No model has measured quality, so nothing is eligible to be ranked — checked 3 workload(s).
+ The router therefore CANNOT self-optimise yet: quality is unmeasured on every call, and ranking without it would be guessing. Enabling quality scoring is the prerequisite.
+
+Wrote /home/hermes/.hermes/skills/llm-smart-router/scripts/candidate_routing.yaml (applied: false — a human promotes it)

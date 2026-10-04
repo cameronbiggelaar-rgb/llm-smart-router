@@ -56,6 +56,17 @@ MAX_TOKENS = 16384
 CAL_TIMEOUT = 900
 PROBE_TIMEOUT = 900
 
+# A bare data dump with NO instruction makes a reasoning model burn its whole
+# output budget deciding what was asked (v4-pro did this twice: ~33K reasoning
+# tokens, finish=length, zero content). That is a property of the no-task
+# prompt, not of the model as a summariser -- production always sends a real
+# task. So the run scores the model on the task it is actually hired for.
+INSTRUCTION = (
+    "Summarise the conversation above into a structured checkpoint summary. "
+    "Preserve: key facts, decisions made, file paths, command outputs, and any "
+    "unresolved questions. Be concise and factual."
+)
+
 
 def unique_filler(n_chars: int) -> str:
     """Filler with every line distinct, so dedup/collapse cannot shrink it."""
@@ -161,6 +172,52 @@ def post(model, payload, max_tokens=MAX_TOKENS, timeout=PROBE_TIMEOUT) -> dict:
     }
 
 
+def check_holds(models) -> bool:
+    """Abort if any forced model is currently circuit-open or rate-held.
+
+    Run 1 was invalidated exactly this way: v4-pro's breaker had opened on the
+    earlier credit-cap 429s, so all six v4-pro probes returned an instant
+    breaker-503 that scored as a model failure. The preflight call only
+    exercises MODELS[0], so it sails straight past a hold on another model.
+    """
+    db = Path(__file__).resolve().parent.parent / "data" / "router_state.db"
+    if not db.exists():
+        print(f"hold-check: {db} not found — skipping")
+        return True
+    now = time.time()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = dict(
+            (m, (rl, co))
+            for m, rl, co in conn.execute(
+                "SELECT model, COALESCE(rate_limited_until,0), "
+                "COALESCE(circuit_open_until,0) FROM model_state"
+            )
+        )
+    except sqlite3.Error as e:
+        print(f"hold-check: query failed ({e}) — skipping")
+        return True
+    finally:
+        conn.close()
+
+    blocked = []
+    for m in models:
+        rl, co = rows.get(m, (0, 0))
+        if rl > now or co > now:
+            left = max(rl, co) - now
+            blocked.append(f"{m} ({'rate-held' if rl > now else 'circuit-open'} "
+                           f"{left:.0f}s left)")
+    if blocked:
+        print("HOLD-CHECK FAILED — these forced models are not callable right now:")
+        for b in blocked:
+            print(f"  - {b}")
+        print("Aborting: a breaker-503 would be scored as a model failure "
+              "(this invalidated run 1).")
+        return False
+    print(f"hold-check ok ({len(models)} models callable)")
+    return True
+
+
 def preflight() -> bool:
     """One tiny call. Distinguishes 'account cap / service down' from 'model
     failed the big context', so a 503 is never scored as a model result."""
@@ -194,8 +251,14 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[150_000, 200_000, 250_000])
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--models", nargs="+", default=MODELS)
+    ap.add_argument("--no-instruction", action="store_true",
+                    help="reproduce the bare-dump run (no task) for comparison")
+    ap.add_argument("--out", default="shadow_v4pro_results.json",
+                    help="results filename (relative to this script's dir)")
     args = ap.parse_args()
 
+    if not check_holds(args.models):
+        raise SystemExit(3)
     if not preflight():
         raise SystemExit(2)
 
@@ -211,6 +274,9 @@ def main():
         base_chars = int(target * cpt)
         need = max(0, base_chars - seed_chars)
         payload = list(seed) + [{"role": "user", "content": unique_filler(need)}]
+        if not args.no_instruction:
+            # Real task last, so the model is scored on its actual job.
+            payload.append({"role": "user", "content": INSTRUCTION})
         sent_chars = sum(len(m["content"]) for m in payload)
         print(f"\n=== target {target:,} tok | seed {seed_chars:,} + filler {need:,} "
               f"= {sent_chars:,} chars (~{int(sent_chars/cpt):,} tok) ===")
@@ -228,7 +294,7 @@ def main():
                       f"empty={r.get('empty_stream')} esc={r.get('escalated_away')} "
                       f"{r.get('latency_s')}s {r.get('error','')}")
 
-    out = Path(__file__).resolve().parent / "shadow_v4pro_results.json"
+    out = Path(__file__).resolve().parent / args.out
     out.write_text(json.dumps(results, indent=2))
     print(f"\nWrote {len(results)} results -> {out}")
 

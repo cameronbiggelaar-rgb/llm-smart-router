@@ -1,0 +1,544 @@
+[
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.28,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.23,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.44,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.94,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 3.48,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.39,
+    "prompt_idx": 0,
+    "prompt": "Read the contents of the file at /home/hermes/config.yaml and show me the first 20 lines."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.3,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.71,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.86,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.81,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.34,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.62,
+    "prompt_idx": 1,
+    "prompt": "What does the file /etc/hostname contain? Show me its contents."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.32,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.62,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 2.34,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 4.24,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.57,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.8,
+    "prompt_idx": 2,
+    "prompt": "Look at the file ~/.hermes/config.yaml and tell me which models are configured there."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 1.43,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 1.95,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 1.95,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 2.02,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 1.16,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "terminal",
+      "search_files"
+    ],
+    "error": null,
+    "latency_s": 3.62,
+    "prompt_idx": 3,
+    "prompt": "Find every Python file under src/ that imports 'requests'."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.37,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.3,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.65,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.28,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.51,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.09,
+    "prompt_idx": 4,
+    "prompt": "Show me the contents of /home/hermes/notes/todo.md."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 2.32,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 1.82,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "terminal",
+      "search_files"
+    ],
+    "error": null,
+    "latency_s": 2.4,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.32,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.27,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.49,
+    "prompt_idx": 5,
+    "prompt": "Read the README at the repo root and summarise the setup instructions."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.19,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.68,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.57,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.5,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.23,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 1.68,
+    "prompt_idx": 6,
+    "prompt": "Check what's in /home/hermes/.hermes/skills/llm-smart-router/scripts/experiments.yaml."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "terminal",
+      "search_files"
+    ],
+    "error": null,
+    "latency_s": 1.33,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files"
+    ],
+    "error": null,
+    "latency_s": 1.89,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  },
+  {
+    "stream": false,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 2.94,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "read_file"
+    ],
+    "error": null,
+    "latency_s": 2.29,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 4.25,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  },
+  {
+    "stream": true,
+    "finish_reason": "tool_calls",
+    "tool_names": [
+      "search_files",
+      "terminal"
+    ],
+    "error": null,
+    "latency_s": 2.13,
+    "prompt_idx": 7,
+    "prompt": "Search the file /var/log/syslog for lines containing the word 'error'."
+  }
+]
