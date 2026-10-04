@@ -20,12 +20,13 @@ import sys
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 STATE_DB = str(Path.home() / ".hermes" / "state.db")
 ROUTER_LOGS = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "router_logs.db")
+SNAPSHOT_FILE = str(Path.home() / ".hermes" / "skills" / "llm-smart-router" / "data" / "routing_stats_snapshot.json")
 
 # Switch timestamp: 2026-07-31 14:31 AEST = 04:31 UTC
 SWITCH_DT = datetime(2026, 7, 31, 4, 31, 0, tzinfo=timezone.utc)
@@ -58,6 +59,30 @@ def fmt_num(n):
     if n >= 1_000:
         return f"{int(n):,}"
     return str(n)
+
+
+def _load_snapshot() -> Optional[dict]:
+    """Return the last persisted cumulative snapshot, or None on first run."""
+    try:
+        with open(SNAPSHOT_FILE) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _save_snapshot(snap: dict) -> None:
+    """Persist the cumulative snapshot (atomic-ish: tmp then rename)."""
+    tmp = SNAPSHOT_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(snap, fh, indent=2)
+    Path(tmp).replace(SNAPSHOT_FILE)
+
+
+def _delta(cur: float, prev):
+    """Day-over-day delta helper: None when there's no prior baseline."""
+    if prev is None:
+        return None
+    return cur - prev
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -339,48 +364,45 @@ def main():
         plan_budget = dict(plan_budget)
         plan_budget["note"] = f"router_logs unreadable: {exc}"
 
-    # ── Split canary (v41flash-tool-canary) ────────────────────────────────
-    # Served split: a slice of tool-bearing normal_chat goes to flash
-    # (treatment) instead of pro (control). Summarise volume + escalation +
-    # hard-failure + cost per completed task for both arms, so the nightly
-    # digest can catch a regression the hourly watchdog might miss.
-    canary_stats = None
-    try:
-        cconn = sqlite3.connect(ROUTER_LOGS)
-        cconn.row_factory = sqlite3.Row
+    # ── Day-over-day snapshot ─────────────────────────────────────────────
+    # Persist cumulative counters each run so the digest can report genuine
+    # day-over-day deltas instead of reading "first run" forever (the period
+    # backdates to the 2026-07-31 switch, so every run looked like the first).
+    prev = _load_snapshot()
+    snapshot = {
+        "saved_at": datetime.now(tz=timezone.utc).isoformat(),
+        "total_calls": total_calls,
+        "total_in": total_in,
+        "total_out": total_out,
+        "actual_units": actual_units,
+        "gpt55_units": gpt55_units,
+        "savings_pct": savings_pct,
+        "router_completion_rows": router_completion_rows,
+        "router_observed": router_observed,
+        "lanes": router_lanes,
+        "completion_success": completion_success,
+        "completion_failures": completion_failures,
+        "corrections": corrections,
+        "routing_misses": routing_misses,
+    }
+    _save_snapshot(snapshot)
+    dod = {
+        "has_baseline": prev is not None,
+        "calls": _delta(total_calls, prev.get("total_calls") if prev else None),
+        "completion_rows": _delta(router_completion_rows, prev.get("router_completion_rows") if prev else None),
+        "completion_success": _delta(completion_success, prev.get("completion_success") if prev else None),
+        "completion_failures": _delta(completion_failures, prev.get("completion_failures") if prev else None),
+        "corrections": _delta(corrections, prev.get("corrections") if prev else None),
+        "routing_misses": _delta(routing_misses, prev.get("routing_misses") if prev else None),
+        "lanes": {
+            lane: _delta(router_lanes.get(lane, 0), (prev.get("lanes") or {}).get(lane) if prev else None)
+            for lane in router_lanes
+        },
+    }
 
-        def _arm(arm):
-            r = cconn.execute(
-                """
-                SELECT COUNT(*) AS n,
-                       COALESCE(SUM(escalated), 0) AS esc,
-                       COALESCE(SUM(CASE WHEN error_type != '' THEN 1 ELSE 0 END), 0) AS hard_fail,
-                       COALESCE(SUM(cost_usd), 0.0) AS cost,
-                       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS ok
-                FROM router_logs
-                WHERE experiment = 'v41flash-tool-canary'
-                  AND experiment_arm = ?
-                  AND is_shadow = 0
-                  AND timestamp >= ?
-                """,
-                (arm, period_start_iso),
-            ).fetchone()
-            n = r["n"] or 0
-            ok = r["ok"] or 0
-            return {
-                "requests": n,
-                "escalated": r["esc"] or 0,
-                "hard_failures": r["hard_fail"] or 0,
-                "cost_usd": r["cost"] or 0.0,
-                "completed": ok,
-            }
-
-        cstats = {"treatment": _arm("treatment"), "control": _arm("control")}
-        cconn.close()
-        if cstats["treatment"]["requests"] + cstats["control"]["requests"] > 0:
-            canary_stats = cstats
-    except Exception:
-        pass
+    # The v41flash-tool-canary is retired (B40): its treatment was promoted into
+    # ordinary router policy (`_promote_flash_tool_model`). No canary block is
+    # emitted any more — the experiment stays frozen in router_logs history only.
 
     # Keep the legacy name for the existing report section, but now it is scoped
     # to endpoint-observed completion/failure rows since the switch.
@@ -443,15 +465,6 @@ def main():
             "task_types": task_types,
             "corrections": corrections,
             "routing_misses": routing_misses,
-            "split_canary": (
-                {
-                    "experiment": "v41flash-tool-canary",
-                    "treatment": canary_stats["treatment"],
-                    "control": canary_stats["control"],
-                }
-                if canary_stats
-                else None
-            ),
             "completion": {
                 "success": completion_success,
                 "failures": completion_failures,
@@ -542,34 +555,6 @@ def main():
                 print("  (armed, no governed traffic in window — idle, not inert)")
         print()
 
-        # ── Split canary (v41flash-tool-canary) ────────────────────────────
-        if canary_stats:
-            t = canary_stats["treatment"]
-            c = canary_stats["control"]
-            total = t["requests"] + c["requests"]
-
-            def _pct(a, b):
-                return f"{a/b*100:.1f}%" if b else "n/a"
-
-            def _usd(v, ok):
-                return f"${v/ok:.4f}" if ok else "n/a"
-
-            print(" Split Canary — v41flash-tool-canary (flash vs pro) ")
-            print(f"  requests: {total}  treatment(flash)={t['requests']} "
-                  f"control(pro)={c['requests']}  (share {_pct(t['requests'], total)})")
-            print(f"  escalation rate:  flash {_pct(t['escalated'], t['requests'])}  "
-                  f"(pro {_pct(c['escalated'], c['requests'])})")
-            print(f"  hard-failure rate:flash {_pct(t['hard_failures'], t['requests'])}  "
-                  f"(pro {_pct(c['hard_failures'], c['requests'])})")
-            print(f"  cost/completed:   flash {_usd(t['cost_usd'], t['completed'])}  "
-                  f"(pro {_usd(c['cost_usd'], c['completed'])})")
-            if t["requests"] >= 30 and (
-                t["escalated"] / t["requests"] > 0.10
-                or t["hard_failures"] / t["requests"] > 0.05
-            ):
-                print("  ⚠ flash regression signals — consider rolling back the canary")
-            print()
-
     # ── Compute savings ────────────────────────────────────────────────────
     print(f"  ── Compute Savings ──")
     print(f"  Actual compute units:  {actual_units:>10.1f}")
@@ -610,6 +595,29 @@ def main():
         print(f"  🟡 Good — {savings_pct:.0f}% compute saved vs gpt-5.5")
     else:
         print(f"  🔴 Low savings ({savings_pct:.0f}%) — check routing table")
+    print()
+
+    # ── Day-over-day delta ─────────────────────────────────────────────────
+    print(f"  ── Day-over-day (since last run) ──")
+    if not dod["has_baseline"]:
+        print("  (first run — no prior baseline; deltas from tomorrow)")
+    else:
+        def _signed(v):
+            return "n/a" if v is None else f"{v:+,d}"
+        print(f"  API calls:        {_signed(dod['calls'])}")
+        print(f"  Endpoint rows:    {_signed(dod['completion_rows'])}")
+        print(f"  Completion ok:    {_signed(dod['completion_success'])}")
+        print(f"  Completion fail:  {_signed(dod['completion_failures'])}")
+        print(f"  Corrections:      {_signed(dod['corrections'])}")
+        print(f"  Routing misses:   {_signed(dod['routing_misses'])}")
+        lane_label = {
+            "rethink_rearchitect": "rethink/rearchitect",
+            "escalation": "failure escalation",
+            "force_model": "force_model override",
+            "normal": "normal routing",
+        }
+        for lane, d in dod["lanes"].items():
+            print(f"  Lane {lane_label.get(lane, lane):20s} {_signed(d)}")
     print()
 
     conn.close()

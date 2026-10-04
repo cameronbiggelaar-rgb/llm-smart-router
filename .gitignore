@@ -14,6 +14,9 @@ data/*.db-shm
 data/*.db-wal
 # Captured raw compression samples for local/offline analysis
 data/compression_samples/
+# Routing-stats day-over-day baseline (rewritten on every nightly run)
+data/routing_stats_snapshot.json
+data/routing_stats_snapshot.json.tmp
 
 # IDE
 .vscode/
