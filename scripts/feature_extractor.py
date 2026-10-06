@@ -342,7 +342,7 @@ def compute_model_fit(
     elif complexity_score < 0.4:
         min_tier = 3  # flash is fine
     elif complexity_score < 0.6:
-        min_tier = 5  # glm-5.1 level
+        min_tier = 5  # glm-5.3-flash level (tier 5.5)
     elif complexity_score < 0.8:
         min_tier = 7  # deepseek-v4-pro level
     else:

@@ -201,7 +201,6 @@ Relative compute ratios (deepseek-v4-flash = 1.0x baseline):
 | deepseek-v4-flash | ollama-cloud | 1.0x | 0.50 | 1.50 |
 | minimax-m2.7:cloud | ollama-cloud | 2.0x | 1.00 | 3.00 |
 | glm-5 | ollama-cloud | 2.0x | 1.00 | 3.00 |
-| glm-5.1 | ollama-cloud | 2.5x | 1.25 | 3.75 |
 | glm-5.2 | ollama-cloud | 3.0x | 1.50 | 4.50 |
 | deepseek-v4-pro | ollama-cloud | 4.0x | 2.00 | 6.00 |
 | deepseek-v3.1:671b | ollama-cloud | 10.0x | 5.00 | 15.00 |

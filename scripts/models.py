@@ -133,7 +133,8 @@ class FitSummary:
 # deepseek-v4-flash 1.0x — small, fast, cheap
 # minimax-m2.7:cloud 2.0x — mid-size
 # glm-5 2.0x — mid-size
-# glm-5.1 2.5x — slightly larger
+# (glm-5.1 retired 2026-10-06: upstream HTTP 410 "was retired at 2026-09-25";
+#  never served once — see references/plan-registry-config-alignment.md)
 # glm-5.3 3.0x — larger context, more compute
 # qwen3.5 3.5x — Medium tier, SWE-bench 80
 # deepseek-v3.1:671b 10.0x — massive 671B MoE, most expensive cloud
@@ -158,7 +159,6 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "cached": 0.0030, "tier": 3, "date": "2026-09-12"},
     "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "cached": 0.0038, "tier": 5.5, "date": "2026-09-12"},
     "minimax-m2.7:cloud": {"provider": "ollama-cloud", "ratio": 2.0, "input": 0.30, "output": 1.20, "tier": 4, "date": "2026-09-13"},
-    "glm-5.1": {"provider": "ollama-cloud", "ratio": 2.5, "input": 1.00, "output": 3.20, "cached": 0.025, "tier": 5, "date": "2026-09-13"},
     "glm-5.3": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6, "date": "2026-09-13"},
     "glm-5.2": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6.5, "date": "2026-09-13"},
     "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 0.66, "output": 1.98, "cached": 0.0165, "tier": 8, "date": "2026-09-13"},

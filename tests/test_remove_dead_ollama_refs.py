@@ -52,12 +52,11 @@ def test_dead_model_absent_from_summariser_ladder():
 def test_live_catalog_names_all_registered_ollama_models_are_present():
     """Sanity anchor: the models we DO route to are still registered.
 
-    Guards against over-deletion — removing the two dead names must not touch
-    the live workhorses.
+    Guards against over-deletion — removing dead names must not touch the
+    live workhorses.
     """
     for name in (
         "deepseek-v4.1-flash",
-        "glm-5.1",
         "glm-5.2",
         "glm-5.3",
         "glm-5.3-flash",
@@ -65,3 +64,16 @@ def test_live_catalog_names_all_registered_ollama_models_are_present():
         "deepseek-v4-pro",
     ):
         assert name in m.MODEL_REGISTRY, f"{name} must remain registered"
+
+
+def test_glm51_retired_from_registry():
+    """glm-5.1 joined this file's dead-reference class on 2026-10-06.
+
+    Upstream retired it (HTTP 410 "was retired at 2026-09-25") and it never
+    served once. It left MODEL_REGISTRY the same way glm-5 and
+    deepseek-v3.1:671b did — see
+    references/plan-registry-config-alignment.md for the probe evidence.
+    """
+    assert "glm-5.1" not in m.MODEL_REGISTRY
+    assert "glm-5.1" not in m.MODEL_COST_ORDER
+    assert "glm-5.1" not in m.MODEL_CAPABILITY_TIERS

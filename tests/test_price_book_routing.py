@@ -55,7 +55,9 @@ def test_corrected_models_sit_in_their_new_positions():
     order = m.MODEL_COST_ORDER
 
     # v4-pro ($0.66) is now cheaper than every glm, so it precedes them all.
-    for glm in ("glm-5.1", "glm-5.3", "glm-5.2"):
+    # (glm-5.1 left this tuple when it left the registry — retired upstream
+    #  2026-09-25, never served once.)
+    for glm in ("glm-5.3", "glm-5.2"):
         assert order.index("deepseek-v4-pro") < order.index(glm), (
             f"deepseek-v4-pro ($0.66) should now precede {glm}"
         )

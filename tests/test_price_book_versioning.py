@@ -35,12 +35,13 @@ from unit_economics import price_for, record_price, seed_prices  # noqa: E402
 from unit_economics import Price  # noqa: E402
 
 # ollama.com/pricing, retrieved 2026-09-13. (input, output) per 1M tokens.
+# glm-5.1 removed 2026-10-06 — the upstream retired it (HTTP 410) and it left
+# the registry; superseded price rows stay in the book for history.
 VENDOR_PUBLISHED = {
     "deepseek-v4-pro": (Decimal("0.66"), Decimal("1.98")),
     "minimax-m2.7:cloud": (Decimal("0.30"), Decimal("1.20")),
     "glm-5.3": (Decimal("1.40"), Decimal("4.40")),
     "glm-5.2": (Decimal("1.40"), Decimal("4.40")),
-    "glm-5.1": (Decimal("1.00"), Decimal("3.20")),
 }
 
 # What the book charged before the correction, with the date it was in force.
@@ -50,7 +51,6 @@ SUPERSEDED = {
     "minimax-m2.7": ("1.00", "3.00", "2026-07-01"),
     "glm-5.3": ("1.50", "4.50", "2026-08-26"),
     "glm-5.2": ("1.50", "4.50", "2026-09-04"),
-    "glm-5.1": ("1.25", "3.75", "2026-07-01"),
 }
 
 # The date the correction takes effect. Must differ from every superseded date,
