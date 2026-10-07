@@ -105,6 +105,7 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
         "architectural_served": None,
         "ungoverned": None,
         "governed": None,
+        "blind": None,
         "armed": None,
         "note": "",
     }
@@ -124,7 +125,8 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
             """
             SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
                    COALESCE(plan_budget_denied, 0) AS denied,
-                   COUNT(*) AS calls
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(governor_fail_open), 0) AS blind
             FROM router_logs
             WHERE timestamp >= ?
             GROUP BY klass, denied
@@ -141,7 +143,8 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
     summary["architectural_served"] = 0
     summary["ungoverned"] = 0
     summary["governed"] = 0
-    for klass, denied, calls in rows:
+    summary["blind"] = 0
+    for klass, denied, calls, blind in rows:
         if klass == "ungoverned":
             summary["ungoverned"] += calls
         elif denied:
@@ -151,6 +154,7 @@ def _plan_budget_summary(conn: sqlite3.Connection, period_start_iso: str) -> dic
             summary["architectural_served"] += calls
         if klass != "ungoverned":
             summary["governed"] += calls
+        summary["blind"] += blind
     _attach_probe(summary)
     return summary
 
@@ -545,12 +549,18 @@ def main():
         else:
             used = plan_budget.get("window_used_percent")
             armed = plan_budget.get("armed")
+            blind = plan_budget.get("blind", 0) or 0
             print(f"  Governor:                   {'ARMED' if armed else 'off' if armed is False else 'unknown'}")
             print(f"  Window used:                {used if used is not None else 'n/a'}%")
-            print(f"  Routine denied (leak closed): {plan_budget.get('routine_denied', 0):6d}")
+            if blind:
+                print(f"  Routine denied:               {plan_budget.get('routine_denied', 0):6d}  (leak NOT provably closed — {blind} blind)")
+            else:
+                print(f"  Routine denied (leak closed): {plan_budget.get('routine_denied', 0):6d}")
             print(f"  Architectural calls served:   {plan_budget.get('architectural_served', 0):6d}")
             print(f"  Governed (class recorded):    {plan_budget.get('governed', 0):6d}")
             print(f"  Ungoverned (pre-governor):    {plan_budget.get('ungoverned', 0):6d}")
+            if blind:
+                print(f"  Blind (governor unreadable):  {blind:6d}  — cannot confirm these were denied")
             if armed and plan_budget.get("governed", 0) == 0 and plan_budget.get("ungoverned", 0) == 0:
                 print("  (armed, no governed traffic in window — idle, not inert)")
         print()

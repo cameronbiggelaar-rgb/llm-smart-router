@@ -421,18 +421,54 @@ counts by class, and why `force_model` is the unconditional escape hatch: the
 operator must never be blocked from gpt on demand, because the whole point of the
 allowlist is to have gpt ready *for* those sessions, not to ration them.
 
-### 3.5 Failure modes — fail open
+### 3.5 Failure modes
+
+**Revised by B44a (see §3.5.1).** The rule below held while the policy was a
+*deny-list*: with no allowlist to consult, refusing on an unreadable probe would
+have starved the plan for no gain.
 
 | Failure | Behaviour |
 |---|---|
-| Probe network error / timeout | Last good cache; if none or stale → **treat as open** |
-| Token expired (401) | Refresh once (reuse `_refresh_expired_codex_probe_token`); on failure → open |
-| Unparseable body | Log once → open |
+| Probe network error / timeout | Last good cache; if none or stale → **`unverified`** (B44a) |
+| Token expired (401) | Refresh once (reuse `_refresh_expired_codex_probe_token`); on failure → `unverified` |
+| Unparseable body | Log once → `unverified` |
 | `rate_limit.allowed == false` | **closed** — authoritative, overrides the allowlist |
 | State DB unwritable | In-memory for the process; never block routing |
+| Governor *bug* (exception in the hook) | **open** — a code fault must never wedge live traffic; logged |
 
-Stance: **an unreadable probe must never starve the plan.** Silent under-use is
-worse than boom-bust because it is invisible. Every fail-open emits a warning log.
+Stance (original, deny-list era): **an unreadable probe must never starve the
+plan.** Silent under-use is worse than boom-bust because it is invisible.
+
+#### 3.5.1 B44a revision — under an allowlist, an unreadable probe is not consent
+
+The stance above is right about the failure it names and wrong about the remedy
+once an allowlist exists. "Never starve the plan" was written to protect the
+*architectural* lane — the one class the policy explicitly names. As implemented
+it protected **every** class: `evaluate_policy` returned `VERDICT_OPEN` on an
+unreadable reading *before consulting the allowlist*, so routine traffic rode a
+blind probe onto the plan. That is the leak (5,211 GPT rows served,
+`plan_budget_denied = 0`, 4,392 of them routine) and it was invisible, because a
+blind allow and a deliberate allow are the same row.
+
+Revised rule: an unreadable reading yields a **third verdict**,
+`VERDICT_UNVERIFIED`, and the allowlist still decides.
+
+| reading | class | verdict | served? |
+|---|---|---|---|
+| unreadable | named by the allowlist (architectural) | `unverified` | **yes** — the plan is not starved |
+| unreadable | not named (routine) | `denied` | no |
+| readable, under cap | named | `open` | yes |
+| readable, over cap | any | `closed` | no |
+| any | any, `enabled: false` | `open` | yes — rollback unchanged |
+
+An unverifiable entitlement is not consent; the lane the policy names is still
+served, so the original intent is preserved where it was meant to apply. The
+blind case is now **countable** (`router_logs.governor_fail_open`, B44c) rather
+than invisible, and the report refuses to call the leak closed for a window it
+could not check.
+
+Rollback from the revision is the same single lever as from the governor itself:
+`enabled: false` restores exact pre-B37 behaviour byte-for-byte.
 
 ### 3.6 Configuration surface
 
@@ -456,14 +492,23 @@ one operational idiom in this repo, not two.
 
 ### 3.7 Observability
 
-- Routing reason carries class + decision (§3.3).
+- Routing reason carries class + decision (§3.3). **B44b:** the reason string
+  only claims the governor *allowed* a class when a verdict was actually
+  reached; a blind probe says UNVERIFIED, and an ungoverned request says the
+  class was recorded without a verdict.
 - New columns `router_logs.plan_budget_denied` (INTEGER DEFAULT 0) and
-  `router_logs.budget_class` (TEXT), so both are queryable.
+  `router_logs.budget_class` (TEXT), so both are queryable. **B44c:** plus
+  `router_logs.governor_fail_open` (INTEGER DEFAULT 0) — 1 marks a request
+  served while the reading was unreadable, which is what makes a blind window
+  countable instead of invisible.
 - `recovery_log` events `plan_denied_routine` / `plan_closed` / `plan_probe_open`.
 - CLI `router_ops.py plan-budget`: current reading, hard cap, class allowlist,
-  window used %, denial count by class today.
+  window used %, denial count by class today. **B44c:** plus a `blind` column, a
+  per-window blind count, and a report that refuses to say "leak closed" for a
+  window containing blind rows (`--json` carries `blind_calls`).
 - Nightly digest line: window used %, denial count by class, architectural call
-  count.
+  count, **and the blind count** — a digest that reports `routine denied: 0`
+  without the blind count cannot distinguish a closed leak from an unchecked one.
 
 ## 4. Implementation plan
 
@@ -688,7 +733,49 @@ coverage is too narrow and must be widened before enabling (§3.2).
 
 ## 10. Revision history
 
-**rev 4 (this document) — policy becomes an allowlist: architectural lane only.**
+**rev 5 — B44a/b/c: the governor's silent fail-open, closed and made countable.**
+
+- **The defect, stated correctly.** The governor was armed and wired in on both
+  hooks (B37e/B37f), and it recorded `plan_budget_denied = 0` on every one of the
+  5,211 GPT rows ever logged — 4,392 of them `budget_class='routine'`. It was not
+  missing; it was **blind**. `_read_usage_payload()` swallows every exception →
+  `Reading(source='unavailable')` → `evaluate_policy()` returned `VERDICT_OPEN`
+  at the `unavailable` branch **before the allowlist was consulted**. The plan was
+  served, the class stamped, nothing logged. `plan_budget_denied = 1` exists on
+  132 rows, all on 2026-09-27, all from a hard-cap window, never from the
+  allowlist.
+- **Every other exit was excluded by the data:** `enabled=false` would leave the
+  class empty (37,598 rows carry one); both exception exits log a warning and the
+  journal has none; `_is_plan_model` is **True** for the bare names the DB holds,
+  which kills the `:codex`-suffix theory (there is no `:codex` in the data).
+  Established by elimination over the exit set — **not** by observing the probe
+  fail inside the endpoint process, which is precisely why making it observable
+  (below) is the load-bearing part.
+- **§3.5 revised** (new §3.5.1): under an allowlist an unreadable probe is not
+  consent. `VERDICT_UNVERIFIED` is the third verdict; the allowlist still decides.
+  Routine is denied, the named architectural lane is served but flagged, and
+  `enabled: false` still opens everything byte-for-byte.
+- **Reason strings (§3.7) no longer assert a verdict that never happened.** The
+  old suffix appended `; plan governor allowed class 'X'` whenever a class was
+  truthy — on the short-circuit and the fail-open both. That sentence is how
+  4,392 served routine GPT rows read as deliberate allows. Three facts now get
+  three sentences: UNVERIFIED / allowed / recorded-without-a-verdict.
+- **Observability (§3.7) gained the third state:**
+  `router_logs.governor_fail_open` (both migration paths, additive, default 0 so
+  historical rows never read as blind), threaded from
+  `RoutingDecision.governor_fail_open` at all five log sites, plus a `blind`
+  column and count in `router_ops.py plan-budget` and `--json`. The report now
+  refuses to print "leak closed" for a window containing blind rows. Verified
+  against a copy of the production DB: 61 → 62 columns, 145,427 rows preserved,
+  idempotent.
+- **`_plan_denied_for_class`** became a membership test over
+  `{denied, closed}` instead of `!= open` — the negated form silently grew a
+  third answer with the new verdict and would have stripped plan models from
+  fallback chains we were still using.
+- **Honest limit:** the blind probe was never captured failing inside the
+  endpoint process. The fix's value is that it can now be seen when it happens.
+
+**rev 4 — policy becomes an allowlist: architectural lane only.**
 
 - **Policy changed** from rev 3's routine-ceiling + architectural-reserve split to
   an **allowlist**: `[architectural]` only, `routine_ceiling_percent: 0`. Routine

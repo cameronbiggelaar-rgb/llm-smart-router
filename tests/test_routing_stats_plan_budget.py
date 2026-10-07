@@ -67,6 +67,7 @@ def _db(tmp_path, rows, *, with_governor_cols=True):
 
     gov_cols = (
         ", budget_class TEXT NOT NULL DEFAULT '', plan_budget_denied INTEGER NOT NULL DEFAULT 0"
+        ", governor_fail_open INTEGER NOT NULL DEFAULT 0"
         if with_governor_cols
         else ""
     )
@@ -91,7 +92,7 @@ def _db(tmp_path, rows, *, with_governor_cols=True):
             "routing_reason",
         ]
         if with_governor_cols:
-            cols += ["budget_class", "plan_budget_denied"]
+            cols += ["budget_class", "plan_budget_denied", "governor_fail_open"]
         conn.execute(
             f"INSERT INTO router_logs ({', '.join(cols)})"
             f" VALUES ({','.join('?' * len(cols))})",
@@ -132,13 +133,25 @@ def _governed_rows():
     return [
         (_now(), "s1", "deepseek-v4-pro", "cloud", "coding", 1, 0, "r1", "biggie-router",
          "deepseek-v4-pro", "tool-bearing request — plan account denied to class 'routine'",
-         "routine", 1),
+         "routine", 1, 0),
         (_now(), "s1", "deepseek-v4-pro", "cloud", "coding", 1, 0, "r2", "biggie-router",
          "deepseek-v4-pro", "tool-bearing request — plan account denied to class 'routine'",
-         "routine", 1),
+         "routine", 1, 0),
         (_now(), "s1", "gpt-5.6-sol", "openai-codex", "planning", 1, 0, "r3", "biggie-router",
          "gpt-5.6-sol", "capability tier 13 needed, selected gpt-5.6-sol (tier 13)",
-         "architectural", 0),
+         "architectural", 0, 0),
+    ]
+
+
+def _blind_rows():
+    """Two routine rows served while the reading was unreadable (fail-open)."""
+    return [
+        (_now(), "s1", "gpt-5.5", "openai-codex", "coding", 1, 0, "r1", "biggie-router",
+         "gpt-5.5", "tool-bearing request — plan governor UNVERIFIED (unreadable)",
+         "routine", 0, 1),
+        (_now(), "s1", "gpt-5.5", "openai-codex", "coding", 1, 0, "r2", "biggie-router",
+         "gpt-5.5", "tool-bearing request — plan governor UNVERIFIED (unreadable)",
+         "routine", 0, 1),
     ]
 
 
@@ -156,7 +169,7 @@ def test_json_report_carries_a_plan_budget_block(tmp_path, monkeypatch):
 def test_plan_budget_reports_ungoverned_rows_separately(tmp_path, monkeypatch):
     rows = _governed_rows() + [
         (_now(), "s1", "deepseek-v4-flash", "cloud", "coding", 1, 0, "r4", "biggie-router",
-         "deepseek-v4-flash", "capability tier 3 needed", "", 0),
+         "deepseek-v4-flash", "capability tier 3 needed", "", 0, 0),
     ]
     state_db, router_db = _db(tmp_path, rows)
     pb = _run_json(state_db, router_db, monkeypatch, _reading(0.0))["router_endpoint"]["plan_budget"]
@@ -240,3 +253,47 @@ def test_digest_line_carries_the_three_required_facts(tmp_path, monkeypatch):
     pb = _run_json(state_db, router_db, monkeypatch, _reading(41.2))["router_endpoint"]["plan_budget"]
     for key in ("window_used_percent", "routine_denied", "architectural_served"):
         assert key in pb, f"digest missing {key}: {pb}"
+
+
+# ── B44d: a blind window must not read as "closed" ───────────────────────────
+
+def test_json_report_carries_a_blind_count(tmp_path, monkeypatch):
+    """The digest must report how many requests were served blind."""
+    state_db, router_db = _db(tmp_path, _blind_rows())
+    pb = _run_json(state_db, router_db, monkeypatch, _reading(41.2))["router_endpoint"]["plan_budget"]
+    assert pb["blind"] == 2, pb
+    # And those two rows are the failure mode that used to read as "closed":
+    assert pb["routine_denied"] == 0, pb
+
+
+def test_text_report_refuses_closure_on_blind(tmp_path, monkeypatch):
+    """A blind window must not print 'leak closed'."""
+    state_db, router_db = _db(tmp_path, _blind_rows())
+    monkeypatch.setattr(gb, "fetch_reading", lambda cfg=None, **kw: _reading(41.2))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        crs.STATE_DB = state_db
+        crs.ROUTER_LOGS = router_db
+        sys.argv = ["check-routing-stats.py"]
+        crs.main()
+    sys.argv = ["check-routing-stats.py"]
+    out = buf.getvalue()
+    assert "leak closed" not in out, out
+    assert "NOT provably closed" in out, out
+    assert "Blind (governor unreadable)" in out, out
+
+
+def test_text_report_claims_closure_when_clean(tmp_path, monkeypatch):
+    """A clean window still says 'leak closed' — the honest case."""
+    state_db, router_db = _db(tmp_path, _governed_rows())
+    monkeypatch.setattr(gb, "fetch_reading", lambda cfg=None, **kw: _reading(41.2))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        crs.STATE_DB = state_db
+        crs.ROUTER_LOGS = router_db
+        sys.argv = ["check-routing-stats.py"]
+        crs.main()
+    sys.argv = ["check-routing-stats.py"]
+    out = buf.getvalue()
+    assert "Routine denied (leak closed)" in out, out
+    assert "NOT provably closed" not in out, out
