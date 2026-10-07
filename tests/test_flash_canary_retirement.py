@@ -91,7 +91,7 @@ def test_eligible_route_uses_flash_without_experiment_hook(monkeypatch):
     monkeypatch.setattr(
         router,
         "_apply_plan_governor",
-        lambda selected, **kwargs: (selected, "", False, False),
+        lambda selected, **kwargs: (selected, "", False, False, False),
     )
 
     decision = router.route_task(
@@ -116,7 +116,7 @@ def test_excluded_route_uses_pro_without_experiment_hook(monkeypatch):
     monkeypatch.setattr(
         router,
         "_apply_plan_governor",
-        lambda selected, **kwargs: (selected, "", False, False),
+        lambda selected, **kwargs: (selected, "", False, False, False),
     )
 
     decision = router.route_task(

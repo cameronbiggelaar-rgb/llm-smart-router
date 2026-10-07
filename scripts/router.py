@@ -204,6 +204,12 @@ class RoutingDecision:
     limp_home_reason: str = ""      # why we're in limp-home mode
     budget_class: str = ""          # plan-governor class for reporting ("" = governor off)
     plan_budget_denied: bool = False  # True when the plan refused this request
+    # True when the plan's own account probe was UNREADABLE, so the governor
+    # decided on an unverifiable entitlement rather than on a verdict. A blind
+    # window must be countable from the row: otherwise it is indistinguishable
+    # from a deliberate allow (B44a — 1,083 routine rows rode a blind probe onto
+    # the plan with plan_budget_denied=0 and nothing logged).
+    governor_fail_open: bool = False
 
 
 @dataclass
@@ -1054,7 +1060,7 @@ def route_task(
         # no complexity gate, which is how 97.6% of the plan's burn arrived. Ask
         # the governor before returning; it only ever touches plan-account
         # models, so every ollama-cloud and flash lane is unaffected.
-        governed_model, budget_class, denied, closed = _apply_plan_governor(
+        governed_model, budget_class, denied, closed, gov_blind = _apply_plan_governor(
             tool_model, prompt=prompt, force_model=force_model
         )
         if denied:
@@ -1105,14 +1111,11 @@ def route_task(
                 f"tool-bearing request — selected proven tool-capable model "
                 f"{governed_model} (tier {MODEL_CAPABILITY_TIERS.get(governed_model, 0)}, "
                 f"capability floor {tool_floor})"
-                + (
-                    f"; plan governor allowed class '{budget_class}'"
-                    if budget_class
-                    else ""
-                )
+                + _governor_suffix(budget_class, gov_blind, governed_model)
             ),
             fallback_chain=_build_tool_fallback_chain(governed_model, klass=budget_class or None),
             budget_class=budget_class,
+            governor_fail_open=gov_blind,
         )
 
     # ── Limp-home mode: local models only ──
@@ -1221,7 +1224,7 @@ def route_task(
     # the report can tell "armed and idle" from "off". _apply_plan_governor
     # returns denied=False for any non-plan pick, so this block is a no-op for
     # them apart from the classification.
-    governed, budget_class, denied, closed = _apply_plan_governor(
+    governed, budget_class, denied, closed, gov_blind = _apply_plan_governor(
         selected, prompt=prompt, force_model=force_model
     )
     if denied:
@@ -1275,11 +1278,7 @@ def route_task(
         reason=(
             f"capability tier {min_tier} needed, selected {selected} "
             f"(tier {MODEL_CAPABILITY_TIERS.get(selected, 0)})"
-            + (
-                f"; plan governor allowed class '{budget_class}'"
-                if budget_class
-                else ""
-            )
+            + _governor_suffix(budget_class, gov_blind, selected)
         ),
         fallback_chain=(
             _build_fallback_chain(selected, context_tokens)
@@ -1290,6 +1289,7 @@ def route_task(
         ),
         all_exhausted=all_exhausted,
         budget_class=budget_class,
+        governor_fail_open=gov_blind,
     )
 
 
@@ -1445,10 +1445,14 @@ def _governed_account() -> str:
 
 
 def _governor_verdict(klass: str) -> str:
-    """Evaluate the plan policy for a class. Fails OPEN on any error.
+    """Evaluate the plan policy for a class.
 
-    An unreadable probe must never starve the plan, and a governor bug must
-    never wedge live traffic: every failure path returns "open".
+    Propagates the policy's own verdict verbatim — including
+    ``VERDICT_UNVERIFIED`` when the account probe was unreadable — so callers can
+    tell "the allowlist allowed this" from "the governor was blind".
+
+    A governor *bug* (not a blind probe) fails OPEN: it must never wedge live
+    traffic, and it is logged rather than silently returned.
     """
     try:
         import gpt_budget
@@ -1488,11 +1492,21 @@ def _plan_classify(prompt: str, force_model: str) -> str:
 
 
 def _plan_denied_for_class(klass: str) -> bool:
-    """Whether the plan is refused to this class right now."""
+    """Whether the plan is refused to this class right now.
+
+    Membership over the *refusal* verdicts, not ``!= VERDICT_OPEN``. The negated
+    form silently grew a third answer when B44a added ``VERDICT_UNVERIFIED``: an
+    unverifiable-but-served decision would have read as "denied" and started
+    stripping plan models out of fallback chains we are in fact still using.
+    Chains must agree with the decision.
+    """
     try:
         import gpt_budget
 
-        return _governor_verdict(klass) != gpt_budget.VERDICT_OPEN
+        return _governor_verdict(klass) in (
+            gpt_budget.VERDICT_DENIED,
+            gpt_budget.VERDICT_CLOSED,
+        )
     except Exception:
         return False
 
@@ -1507,15 +1521,37 @@ def _is_plan_model(model: str) -> bool:
         return False
 
 
+def _governor_suffix(klass: str, gov_blind: bool, model: str) -> str:
+    """The reason suffix for a request the governor did not deny.
+
+    Three distinct facts, three distinct sentences — because the old suffix said
+    "plan governor allowed class 'routine'" on **every** classified row, including
+    ones where no plan model was in play and the allowlist was never consulted.
+    That sentence is how 4,392 served routine GPT rows read as deliberate allows:
+
+    * blind probe          → says so, plainly, and never claims "allowed";
+    * plan model, verified → "allowed class 'X'" (a real verdict);
+    * no plan model        → the class was *recorded*, not allowed. A routine
+      deepseek pick never asked the allowlist anything.
+    """
+    if not klass:
+        return ""
+    if gov_blind:
+        return f"; plan governor UNVERIFIED (account probe unreadable) — class '{klass}' not confirmed"
+    if _is_plan_model(model):
+        return f"; plan governor allowed class '{klass}'"
+    return f"; plan governor recorded class '{klass}' (no plan model selected)"
+
+
 def _apply_plan_governor(
     selected: str,
     *,
     prompt: str,
     force_model: str = "",
-) -> Tuple[str, str, bool, bool]:
+) -> Tuple[str, str, bool, bool, bool]:
     """Gate a selected model against the plan budget.
 
-    Returns ``(model, klass, denied, closed)``:
+    Returns ``(model, klass, denied, closed, fail_open)``:
 
     * ``model`` — unchanged when the plan is entitled to it, else ``""`` so the
       caller can re-select away from the plan (or fail closed).
@@ -1526,6 +1562,12 @@ def _apply_plan_governor(
       classifier failed.
     * ``denied`` — True when the plan refused this request.
     * ``closed`` — True when the refusal was capacity, not entitlement.
+    * ``fail_open`` — True when the plan's account probe was **unreadable**, so
+      the outcome was decided on an unverifiable entitlement. Reported separately
+      from ``denied`` because the two are different facts and collapsing them is
+      what let a blind governor pass for a permissive one: 1,083 routine rows
+      rode a blind probe onto the plan with ``plan_budget_denied = 0`` and no log
+      line (2026-10-04/05).
 
     Only plan-account models are ever touched, so the flash canary and every
     ollama-cloud lane are structurally unaffected.
@@ -1536,11 +1578,12 @@ def _apply_plan_governor(
         cfg = gpt_budget.load_governor_config()
         # enabled=false is the rollback lever: byte-identical to pre-B37 behaviour.
         if not getattr(cfg, "enabled", False):
-            return selected, "", False, False
+            return selected, "", False, False, False
     except Exception as exc:  # pragma: no cover - defensive
-        # A governor bug must never wedge live traffic.
+        # A governor bug must never wedge live traffic. This is a *bug*, not a
+        # blind probe, so it is not reported as fail_open: it is logged instead.
         logger.warning("plan governor unavailable (%s) — failing open", exc)
-        return selected, "", False, False
+        return selected, "", False, False, False
 
     # Classify BEFORE the plan-model test (B39). The class is an observation about
     # the request, not a consequence of selecting a plan model: while GPT was dark
@@ -1557,28 +1600,36 @@ def _apply_plan_governor(
         klass = _plan_classify(prompt, force_model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("plan classifier unavailable (%s) — recording no class", exc)
-        return selected, "", False, False
+        return selected, "", False, False, False
 
     if not klass:
-        return selected, "", False, False
+        return selected, "", False, False, False
 
     # No plan model in play — nothing to gate. The class is still recorded, and
     # the (expensive) account probe is skipped entirely.
+    #
+    # NOTE: ``klass`` here is a *recording*, not a verdict: no allowlist and no
+    # account was consulted. Callers must not describe it as "allowed" — the
+    # suffix that used to do exactly that is fixed in the same batch.
     if not _is_plan_model(selected):
-        return selected, klass, False, False
+        return selected, klass, False, False, False
 
     try:
         reading = gpt_budget.fetch_reading()
         verdict = gpt_budget.evaluate_policy(reading, cfg, klass=klass)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("plan governor unavailable (%s) — failing open", exc)
-        return selected, klass, False, False
+        return selected, klass, False, False, False
 
-    if verdict == gpt_budget.VERDICT_OPEN:
-        return selected, klass, False, False
+    # A reading that could not be taken is its own fact. It is observable: the
+    # class is stamped either way, so without this flag an unverifiable decision
+    # is indistinguishable from a deliberate allow in the row data.
+    fail_open = verdict == gpt_budget.VERDICT_UNVERIFIED
+    if verdict in (gpt_budget.VERDICT_OPEN, gpt_budget.VERDICT_UNVERIFIED):
+        return selected, klass, False, False, fail_open
 
     closed = verdict == gpt_budget.VERDICT_CLOSED
-    return "", klass, True, closed
+    return "", klass, True, closed, fail_open
 
 
 def _reselect_without_plan(min_tier: int = 0) -> str:

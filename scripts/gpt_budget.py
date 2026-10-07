@@ -9,12 +9,18 @@ modellable — two cap events on the same plan differ 3.5x — so nothing here i
 
 Honesty + safety rules (see tests/test_gpt_budget_reading.py):
   * the account's ``allowed=false`` is authoritative and outranks everything;
-  * an unreadable probe FAILS OPEN — a broken endpoint must never starve the
-    architectural lane (the lane is the point of the whole plan);
+  * an unreadable probe must never starve the architectural lane (the lane is the
+    point of the whole plan) — but under an ALLOWLIST an unverifiable entitlement
+    is not consent either, so an unreadable reading denies every class the policy
+    does not explicitly name and reports the named ones as ``unverified``. Failing
+    open here re-opened the exact leak the allowlist exists to close, silently:
+    measured 2026-10-04/05, routine work rode a blind probe onto the plan 1,083
+    times with ``plan_budget_denied = 0``;
   * one probe per ``min_interval_seconds``, never per request — this sits on
     the hot routing path;
   * a remembered value is always labelled ``cache``, never ``live``;
-  * past the staleness bound, old data is not evidence → fail open.
+  * past the staleness bound, old data is not evidence → the reading is
+    ``unavailable``, which is a *distinct* verdict (``unverified``), never ``open``.
 
 The fetch reuses Hermes' authoritative ``agent.account_usage.fetch_account_usage``
 rather than re-implementing the HTTP (token refresh, the 401 retry, the
@@ -517,6 +523,11 @@ def classify_request(
 VERDICT_OPEN = "open"
 VERDICT_CLOSED = "closed"
 VERDICT_DENIED = "denied"
+# The account could not be read, so entitlement is UNKNOWN. Under an allowlist
+# this is not the same as "open": a class the policy does not name must not ride
+# a blind probe onto the plan. Kept as its own value so observability can tell
+# "the governor allowed this" apart from "the governor was blind".
+VERDICT_UNVERIFIED = "unverified"
 
 
 class GovernorConfig:
@@ -558,7 +569,9 @@ def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str
 
     Order of precedence (most authoritative first):
       1. ``enabled=false`` → open for every class (rollback == today).
-      2. Unreadable reading → open (fail-open safety invariant).
+      2. Unreadable reading → the allowlist still decides: a named class is
+         ``unverified`` (served, but flagged), an unnamed class is ``denied``.
+         An unverifiable entitlement is not consent under an allowlist.
       3. ``reading.allowed is False`` → closed (the account's own verdict).
       4. ``used >= hard_cap_percent`` → closed (reactive backstop, all classes).
       5. Allowlist: class in allowlist → open; otherwise → denied.
@@ -570,7 +583,13 @@ def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str
         return VERDICT_OPEN
 
     if reading.source == "unavailable":
-        return VERDICT_OPEN
+        # The probe is blind. Never starve the plan for the classes the policy
+        # explicitly names, but never let an unnamed class through on an
+        # unverifiable entitlement either: that is the leak (routine rode a blind
+        # probe onto the plan 1,083 times on 2026-10-04/05, denied=0) and it is
+        # invisible, because nothing is logged and the class is still stamped.
+        allowed = _known_classes(cfg.allowlist)
+        return VERDICT_UNVERIFIED if klass in allowed else VERDICT_DENIED
 
     if reading.allowed is False:
         return VERDICT_CLOSED

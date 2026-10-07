@@ -14,8 +14,10 @@ reach ``gpt-5.6-sol``. A governor that starves the class it exists to protect
 has failed at its whole job, so ``planning`` + a tier-13 trigger stays on the
 plan.
 
-Both the entitlement matrix (allowed/denied/closed) and the fail-open invariant
-are the same as the tool path (§5.1: "non-tool path — same matrix").
+Both the entitlement matrix (allowed/denied/closed) and the blind-probe
+invariant are the same as the tool path (§5.1: "non-tool path — same matrix").
+An unreadable probe denies routine but still serves the named class, flagged
+UNVERIFIED (B44a) — it is never a free pass onto the plan.
 """
 
 from __future__ import annotations
@@ -198,8 +200,13 @@ def test_account_verdict_false_closes_the_plan(clean_state, monkeypatch):
 
 # ── Fail-open invariant ───────────────────────────────────────────────────────
 
-def test_unreadable_reading_fails_open_to_the_plan(clean_state, monkeypatch):
-    """An unreadable probe must never starve the plan (§3.5 fail-open)."""
+def test_unreadable_reading_denies_routine_and_flags_the_lane(clean_state, monkeypatch):
+    """B44a reverse: an unreadable probe is not a free pass onto the plan.
+
+    The lane the policy explicitly names still reaches the plan (never starve
+    it), but the decision is flagged UNVERIFIED so a blind window is countable
+    from the row. Routine no longer rides a blind probe onto gpt-5.5.
+    """
     _govern(monkeypatch, used_pct=99.0, source="unavailable")
     d = router.route_task(
         complexity_score=0.85,
@@ -207,8 +214,15 @@ def test_unreadable_reading_fails_open_to_the_plan(clean_state, monkeypatch):
         prompt="refactor the parse loop",
         requires_tools=False,
     )
-    assert d.selected_model == "gpt-5.5", d.reason
-    assert d.plan_budget_denied is False, d.reason
+    assert d.selected_model != "gpt-5.5", d.reason
+
+    arch = router.route_task(
+        complexity_score=0.85,
+        task_type="planning",
+        prompt="rearchitect the routing layer to be account-keyed",
+        requires_tools=False,
+    )
+    assert arch.governor_fail_open is True, arch.reason
 
 
 def test_governor_exception_fails_open_not_closed(clean_state, monkeypatch):

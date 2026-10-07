@@ -139,10 +139,24 @@ def test_zero_limit_window_opens_architectural():
     assert v == OPEN
 
 
-def test_unreadable_reading_fails_open_for_all_classes():
+def test_unreadable_reading_is_unverified_not_a_free_pass():
+    """B44a reverse: 'could not read the account' is a distinct verdict.
+
+    An ARM-allowlist policy refuses routine on an unreadable probe (an
+    unverifiable entitlement is not consent) and reports the named class as
+    UNVERIFIED rather than allowed. Failing open here is what let routine ride a
+    blind probe onto the plan — 1,083 rows, denied=0, nothing logged.
+    """
     r = gb.Reading(source="unavailable", allowed=None, primary=None, secondary=None)
-    assert gb.evaluate_policy(r, _cfg(), klass=ARCH) == OPEN
-    assert gb.evaluate_policy(r, _cfg(), klass=ROUTINE) == OPEN
+    assert gb.evaluate_policy(r, _cfg(), klass=ARCH) == gb.VERDICT_UNVERIFIED
+    assert gb.evaluate_policy(r, _cfg(), klass=ROUTINE) == DENIED
+
+
+def test_unreadable_reading_respects_the_rollback_lever():
+    """enabled=false still opens every class, unreadable probe or not."""
+    r = gb.Reading(source="unavailable", allowed=None, primary=None, secondary=None)
+    assert gb.evaluate_policy(r, _cfg(enabled=False), klass=ARCH) == OPEN
+    assert gb.evaluate_policy(r, _cfg(enabled=False), klass=ROUTINE) == OPEN
 
 
 def test_fail_open_does_not_leak_when_verdict_is_readable():
