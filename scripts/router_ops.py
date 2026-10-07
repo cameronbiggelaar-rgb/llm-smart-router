@@ -473,6 +473,13 @@ def format_plan_budget(conn: sqlite3.Connection, days: int = 7) -> str:
     ``budget_class = ''`` predates the governor or was routed while it was
     disabled, so those rows are reported as ``ungoverned`` rather than folded
     into either class.
+
+    B44c adds the third state. A row with ``governor_fail_open = 1`` was served
+    while the account probe was unreadable: it carries a class and
+    ``plan_budget_denied = 0``, which is byte-for-byte the signature of a
+    deliberate allow. Reporting "leak closed" off a window containing such rows
+    asserts a verdict the governor never reached, so the blind count is shown
+    separately and suppresses the closed-leak claim.
     """
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     cols = _log_columns(conn)
@@ -481,17 +488,21 @@ def format_plan_budget(conn: sqlite3.Connection, days: int = 7) -> str:
             "Plan budget: `budget_class` column not present yet — "
             "the endpoint migration runs on next start (B37i)."
         )
+    blind_expr = (
+        "COALESCE(governor_fail_open, 0)" if "governor_fail_open" in cols else "0"
+    )
 
     rows = conn.execute(
-        """
+        f"""
         SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
                COALESCE(plan_budget_denied, 0) AS denied,
+               {blind_expr} AS blind,
                COUNT(*) AS calls,
                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
         FROM router_logs
         WHERE timestamp >= ?
-        GROUP BY klass, denied
-        ORDER BY klass, denied
+        GROUP BY klass, denied, blind
+        ORDER BY klass, denied, blind
         """,
         (since,),
     ).fetchall()
@@ -500,11 +511,16 @@ def format_plan_budget(conn: sqlite3.Connection, days: int = 7) -> str:
         return f"Plan budget: no routed requests in the last {days}d."
 
     lines = [f"Plan budget — last {days}d", ""]
-    lines.append(f"{'class':<16}{'denied':<9}{'calls':>8}{'tokens':>14}")
+    lines.append(f"{'class':<16}{'denied':<9}{'blind':<8}{'calls':>8}{'tokens':>14}")
     served: dict = {}
     denied_by: dict = {}
-    for klass, denied, calls, tokens in rows:
-        lines.append(f"{klass:<16}{('yes' if denied else 'no'):<9}{calls:>8}{tokens:>14,}")
+    blind_calls = 0
+    for klass, denied, blind, calls, tokens in rows:
+        lines.append(
+            f"{klass:<16}{('yes' if denied else 'no'):<9}"
+            f"{('yes' if blind else 'no'):<8}{calls:>8}{tokens:>14,}"
+        )
+        blind_calls += calls if blind else 0
         if denied:
             denied_by[klass] = denied_by.get(klass, 0) + calls
         else:
@@ -518,10 +534,28 @@ def format_plan_budget(conn: sqlite3.Connection, days: int = 7) -> str:
             "NOTE: the architectural lane served 0 calls while routine denials "
             "were recorded — check the classifier before trusting the policy."
         )
-    lines.append(
-        f"routine denied (leak closed): {routine_denied:,} | "
-        f"architectural served: {arch_served:,}"
-    )
+    if blind_calls:
+        # Do not claim closure off a window we could not check. "routine denied:
+        # 0" reads as "nothing is leaking" when the truth may be "nothing was
+        # ever checked" — the exact inversion this batch exists to remove.
+        lines.append(
+            f"routine denied: {routine_denied:,} | architectural served: {arch_served:,} "
+            "— leak NOT provably closed (blind window, see below)"
+        )
+        lines.append(f"blind (governor unreadable): {blind_calls:,}")
+        # Say the quiet part: denials count verdicts, and a blind window is not
+        # one.
+        lines.append(
+            f"BLIND WINDOW: {blind_calls:,} request(s) were served while the account "
+            "reading was unavailable. Those rows are not denials and not verified "
+            "allows — the leak cannot be called closed for this window."
+        )
+    else:
+        lines.append(
+            f"routine denied (leak closed): {routine_denied:,} | "
+            f"architectural served: {arch_served:,}"
+        )
+        lines.append(f"blind (governor unreadable): {blind_calls:,}")
     return "\n".join(lines)
 
 
@@ -534,24 +568,29 @@ def cmd_plan_budget(conn, args) -> int:
         if "budget_class" not in cols:
             print(json.dumps({"available": False, "days": days}))
             return 0
+        blind_expr = (
+            "COALESCE(governor_fail_open, 0)" if "governor_fail_open" in cols else "0"
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT COALESCE(NULLIF(budget_class, ''), 'ungoverned') AS klass,
                    COALESCE(plan_budget_denied, 0) AS denied,
+                   {blind_expr} AS blind,
                    COUNT(*) AS calls,
                    COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
             FROM router_logs
             WHERE timestamp >= ?
-            GROUP BY klass, denied
+            GROUP BY klass, denied, blind
             """,
             (since,),
         ).fetchall()
         print(json.dumps({
             "available": True,
             "days": days,
+            "blind_calls": sum(c for _, _, b, c, _ in rows if b),
             "buckets": [
-                {"class": k, "denied": bool(d), "calls": c, "tokens": t}
-                for k, d, c, t in rows
+                {"class": k, "denied": bool(d), "blind": bool(b), "calls": c, "tokens": t}
+                for k, d, b, c, t in rows
             ],
         }, indent=2))
         return 0

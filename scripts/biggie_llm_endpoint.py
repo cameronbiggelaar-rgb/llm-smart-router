@@ -306,6 +306,12 @@ _COST_OBS_COLUMNS = {
     # state, so historical rows read as "no governor", never as a denial.
     "plan_budget_denied": "INTEGER NOT NULL DEFAULT 0",
     "budget_class": "TEXT NOT NULL DEFAULT ''",
+    # Blind-window observability (B44c). Without this, a governor that could not
+    # read the account is identical in the table to one that deliberately served
+    # the request — plan_budget_denied 0 with a class stamped — which is how a
+    # blind window read as a closed leak for weeks. 1 means the verdict was
+    # UNVERIFIED; 0 covers both "verdict reached" and "governor off".
+    "governor_fail_open": "INTEGER NOT NULL DEFAULT 0",
 }
 
 # Re-auth hint surfaced when a provider credential expires (HTTP 401/403).
@@ -2862,6 +2868,7 @@ def _log_request_to_db(
     tool_args_sig: str = "",
     plan_budget_denied: bool = False,
     budget_class: str = "",
+    governor_fail_open: bool = False,
 ):
     """Log a single request to the router_logs DB for analysis.
 
@@ -2938,9 +2945,9 @@ def _log_request_to_db(
                 cost_usd, cost_unknown, quality_score, quality_method,
                 pricing_version, experiment, experiment_arm, is_shadow, finish_reason,
                 cached_tokens, session_id_source, tool_names, tool_args_sig,
-                plan_budget_denied, budget_class
+                plan_budget_denied, budget_class, governor_fail_open
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     session_id or "",
@@ -2983,6 +2990,7 @@ def _log_request_to_db(
                     tool_args_sig or "",
                     1 if plan_budget_denied else 0,
                     budget_class or "",
+                    1 if governor_fail_open else 0,
                     ),
                     )
         db.commit()
@@ -4626,6 +4634,7 @@ async def chat_completions(request: Request):
                 routing_reason=decision.reason,
                 plan_budget_denied=decision.plan_budget_denied,
                 budget_class=decision.budget_class,
+                governor_fail_open=decision.governor_fail_open,
                 **_obs,
             )
             _stream_stats: Dict[str, Any] = {"saw_content": False, "saw_tool_calls": False}
@@ -4674,6 +4683,7 @@ async def chat_completions(request: Request):
                     routing_reason=decision.reason,
                     plan_budget_denied=decision.plan_budget_denied,
                     budget_class=decision.budget_class,
+                    governor_fail_open=decision.governor_fail_open,
                     finish_reason=_stream_stats.get("finish_reason", ""),
                     tool_names=_stream_stats.get("tool_names", ""),
                     tool_args_sig=_stream_stats.get("tool_args_sig", ""),
@@ -4772,6 +4782,7 @@ async def chat_completions(request: Request):
                 routing_reason=decision.reason,
                 plan_budget_denied=decision.plan_budget_denied,
                 budget_class=decision.budget_class,
+                governor_fail_open=decision.governor_fail_open,
                 cost_usd=_cost,
                 cost_unknown=_cost_unknown,
                 pricing_version=_pricing_version(),
@@ -4931,6 +4942,7 @@ async def chat_completions(request: Request):
                     routing_reason=escalation.reason,
                     plan_budget_denied=escalation.plan_budget_denied,
                     budget_class=escalation.budget_class,
+                    governor_fail_open=escalation.governor_fail_open,
                     finish_reason=_stream_stats.get("finish_reason", ""),
                     tool_names=_stream_stats.get("tool_names", ""),
                     tool_args_sig=_stream_stats.get("tool_args_sig", ""),
@@ -5010,6 +5022,7 @@ async def chat_completions(request: Request):
                 routing_reason=escalation.reason,
                 plan_budget_denied=escalation.plan_budget_denied,
                 budget_class=escalation.budget_class,
+                governor_fail_open=escalation.governor_fail_open,
                 session_id=session_id,
                 session_id_source=session_id_source,
                 tool_names=_tool_names_from_response(result)[0],

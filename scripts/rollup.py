@@ -76,6 +76,13 @@ NEW_LOG_COLUMNS: Mapping[str, str] = {
     # governor", not as a denial.
     "plan_budget_denied": "INTEGER NOT NULL DEFAULT 0",
     "budget_class": "TEXT NOT NULL DEFAULT ''",
+    # Blind-window observability (B44c). A governor that could not read the
+    # account used to be indistinguishable from one that deliberately allowed
+    # the request: both wrote plan_budget_denied=0 with a class stamped, so a
+    # blind window was invisible in the row data and read as a closed leak.
+    # This flag makes the third state countable; default 0 keeps historical
+    # rows reading as "governor reached a verdict", never as blind.
+    "governor_fail_open": "INTEGER NOT NULL DEFAULT 0",
 }
 
 # ── New tables ────────────────────────────────────────────────────────────────
