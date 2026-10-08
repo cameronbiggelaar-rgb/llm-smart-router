@@ -1,6 +1,7 @@
 # Plan B45 — GPT by request only
 
-**Status:** scoped, not yet implemented.
+**Status:** implemented (B45, commit `02c284f`); source-only, inert until an
+external endpoint restart.
 **Predecessor:** B44a–d (the silent fail-open, closed and made countable).
 **Operator directive (2026-10-08):** *"No that's ok for now I think we can make it
 ask for the gpt model."* — decline the classifier tightening, and instead make
