@@ -539,6 +539,14 @@ class GovernorConfig:
     every class. ``routine_ceiling_percent`` is retained for explicitness (0 =
     routine gets none) but the allowlist — not this knob — is what governs.
 
+    ``explicit_only`` (B45) replaces the classifier with the explicit ask as the
+    entitlement. It exists because the classifier is a substring heuristic: any
+    keyword rule can be tripped by ordinary language ("rethink the wording of
+    this email" classifies architectural), so classification must not be what
+    admits a request to the plan. When set, entitlement is the request naming a
+    plan model; the allowlist is moot for automatic paths. Defaults to False so
+    a policy file predating B45 keeps the B44 rules exactly.
+
     Legacy pacing keys (``slack``, ``final_stretch_seconds``, ``schedule``) are
     deliberately dropped: those concepts were deleted in design rev 4 and must
     have no effect if a stale hand-edited file still carries them.
@@ -551,12 +559,14 @@ class GovernorConfig:
         allowlist: Optional[list] = None,
         routine_ceiling_percent: float = 0.0,
         hard_cap_percent: float = 95.0,
+        explicit_only: bool = False,
         **legacy: Any,
     ) -> None:
         self.enabled = bool(enabled)
         self.allowlist = list(allowlist) if allowlist is not None else [CLASS_ARCHITECTURAL]
         self.routine_ceiling_percent = float(routine_ceiling_percent)
         self.hard_cap_percent = float(hard_cap_percent)
+        self.explicit_only = bool(explicit_only)
         # legacy keys are intentionally not stored.
 
 
@@ -564,17 +574,41 @@ def _known_classes(allowlist) -> set:
     return {c for c in allowlist if c in (CLASS_ARCHITECTURAL, CLASS_ROUTINE)}
 
 
-def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str:
-    """Turn a reading + class into a verdict: open / closed / denied.
+def is_entitled(cfg: GovernorConfig, klass: str, explicit: bool) -> bool:
+    """Whether the policy grants this request the plan.
+
+    The single definition of entitlement, so the governor, the escalation guards
+    and the fallback-chain strippers cannot drift apart — a disagreement between
+    those three is precisely how the plan was re-entered through failover.
+
+    * ``explicit_only`` → entitlement is the ASK. A class the classifier
+      assigned is a label, never a grant.
+    * otherwise → the allowlist decides, as it has since B37.
+    """
+    if cfg.explicit_only:
+        return bool(explicit)
+    return klass in _known_classes(cfg.allowlist)
+
+
+def evaluate_policy(
+    reading: Reading, cfg: GovernorConfig, *, klass: str, explicit: bool = False
+) -> str:
+    """Turn a reading + class into a verdict: open / closed / denied / unverified.
+
+    ``explicit`` is whether the request named a plan-account model. It only
+    matters under ``explicit_only``; with the allowlist in force it is inert, so
+    the B44 truth table is unchanged.
 
     Order of precedence (most authoritative first):
       1. ``enabled=false`` → open for every class (rollback == today).
-      2. Unreadable reading → the allowlist still decides: a named class is
-         ``unverified`` (served, but flagged), an unnamed class is ``denied``.
-         An unverifiable entitlement is not consent under an allowlist.
+      2. Unreadable reading → the entitlement still decides: an entitled request
+         is ``unverified`` (served, but flagged), an unentitled one is
+         ``denied``. An unverifiable entitlement is not consent.
       3. ``reading.allowed is False`` → closed (the account's own verdict).
-      4. ``used >= hard_cap_percent`` → closed (reactive backstop, all classes).
-      5. Allowlist: class in allowlist → open; otherwise → denied.
+      4. No readable window → entitlement decides (never fail open into an
+         unentitled class; a blind window is not a grant).
+      5. ``used >= hard_cap_percent`` → closed (reactive backstop, all classes).
+      6. Entitlement: entitled → open; otherwise → denied.
 
     ``denied`` (policy) is distinct from ``closed`` (capacity) so observability
     can tell *why* a request was refused.
@@ -583,32 +617,36 @@ def evaluate_policy(reading: Reading, cfg: GovernorConfig, *, klass: str) -> str
         return VERDICT_OPEN
 
     if reading.source == "unavailable":
-        # The probe is blind. Never starve the plan for the classes the policy
-        # explicitly names, but never let an unnamed class through on an
-        # unverifiable entitlement either: that is the leak (routine rode a blind
-        # probe onto the plan 1,083 times on 2026-10-04/05, denied=0) and it is
-        # invisible, because nothing is logged and the class is still stamped.
-        allowed = _known_classes(cfg.allowlist)
-        return VERDICT_UNVERIFIED if klass in allowed else VERDICT_DENIED
+        # The probe is blind. Never starve the plan for requests the policy
+        # entitles, but never let an unentitled one through on an unverifiable
+        # entitlement either: that is the leak (routine rode a blind probe onto
+        # the plan 1,083 times on 2026-10-04/05, denied=0) and it is invisible,
+        # because nothing is logged and the class is still stamped.
+        return (
+            VERDICT_UNVERIFIED
+            if is_entitled(cfg, klass, explicit)
+            else VERDICT_DENIED
+        )
 
     if reading.allowed is False:
         return VERDICT_CLOSED
 
     w = binding_window(reading)
     if w is None:
-        # No readable window but no explicit close either → open (fail open).
-        return VERDICT_OPEN
+        # No window to read and no explicit close. This used to fail OPEN
+        # unconditionally, which let an unentitled class through on an empty
+        # reading — the same defect class as the blind probe, reached through a
+        # live source. Entitlement now decides here too.
+        return VERDICT_OPEN if is_entitled(cfg, klass, explicit) else VERDICT_DENIED
 
     if w.limit_window_seconds == 0:
         # Division guard: never throttle on a malformed window.
-        allowed = _known_classes(cfg.allowlist)
-        return VERDICT_OPEN if klass in allowed else VERDICT_DENIED
+        return VERDICT_OPEN if is_entitled(cfg, klass, explicit) else VERDICT_DENIED
 
     if w.used_percent >= cfg.hard_cap_percent:
         return VERDICT_CLOSED
 
-    allowed = _known_classes(cfg.allowlist)
-    return VERDICT_OPEN if klass in allowed else VERDICT_DENIED
+    return VERDICT_OPEN if is_entitled(cfg, klass, explicit) else VERDICT_DENIED
 
 
 # ── Config loading (B37d) ────────────────────────────────────────────────────
@@ -633,6 +671,7 @@ def _default_config() -> GovernorConfig:
         allowlist=[CLASS_ARCHITECTURAL],
         routine_ceiling_percent=0,
         hard_cap_percent=95.0,
+        explicit_only=False,
     )
 
 
@@ -676,12 +715,16 @@ def _parse_policy(text: str) -> Optional[GovernorConfig]:
 
     hard_cap_percent = float(account.get("hard_cap_percent", 95.0))
     routine_ceiling_percent = float(account.get("routine_ceiling_percent", 0.0))
+    # B45: opt-in, and absent must mean False so a policy file predating this
+    # batch cannot silently become explicit-only.
+    explicit_only = bool(account.get("explicit_only", False))
 
     return GovernorConfig(
         enabled=enabled,
         allowlist=allowlist,
         routine_ceiling_percent=routine_ceiling_percent,
         hard_cap_percent=hard_cap_percent,
+        explicit_only=explicit_only,
     )
 
 

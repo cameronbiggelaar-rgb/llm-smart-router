@@ -219,8 +219,12 @@ def test_recorded_class_keeps_plan_models_out_of_a_routine_chain(statuses, armed
     assert not router._is_plan_model(d.selected_model), d.reason
 
     # Non-vacuity: prove this configuration WOULD leak without the class, so the
-    # assertion below cannot pass just because the plan is dark.
-    unfiltered = router._build_tool_fallback_chain(d.selected_model)
+    # assertion below cannot pass just because the plan is dark. Build the
+    # unfiltered chain for the ENTITLED (architectural) class — plan models must
+    # be present there.
+    unfiltered = router._build_tool_fallback_chain(
+        d.selected_model, klass=gb.CLASS_ARCHITECTURAL
+    )
     assert any(router._is_plan_model(m) for m in unfiltered), (
         f"test is vacuous — the unfiltered chain contains no plan model: {unfiltered}"
     )
@@ -242,9 +246,9 @@ def test_chain_verdict_is_computed_once_not_per_model(statuses, armed, monkeypat
     calls = {"n": 0}
     real = router._plan_denied_for_class
 
-    def _counting(klass):
+    def _counting(klass, explicit=False):
         calls["n"] += 1
-        return real(klass)
+        return real(klass, explicit)
 
     monkeypatch.setattr(router, "_plan_denied_for_class", _counting)
     available = router.get_available_models()

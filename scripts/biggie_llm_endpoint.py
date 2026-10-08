@@ -4831,6 +4831,12 @@ async def chat_completions(request: Request):
             # so a failed routine request must not fail over into the reserved
             # plan while a failed architectural one may still use it.
             budget_class=decision.budget_class,
+            # B45: the explicit ask is inherited too, for the same reason. An
+            # automatic request that failed must not become entitled to the plan
+            # merely because it retried, and an explicit one must keep what the
+            # operator asked for. Without this the escalator re-derives
+            # entitlement from the failure and the two rules disagree.
+            plan_explicit=decision.plan_explicit_request,
         )
 
         if not escalation.selected_model:

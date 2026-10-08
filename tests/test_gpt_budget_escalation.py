@@ -173,19 +173,21 @@ def test_escalation_does_not_re_classify_from_the_error(clean_state, governor_op
 
 # ── Backward compatibility ───────────────────────────────────────────────────
 
-def test_class_defaults_to_empty_and_preserves_todays_behaviour(clean_state, governor_open):
-    """No class supplied (legacy caller) ⇒ today's behaviour, nothing governed.
+def test_empty_class_non_explicit_cannot_reach_plan(clean_state, governor_open):
+    """No class supplied (legacy caller) ⇒ NOT entitled, never reaches the plan.
 
     The CLI path (``router.py escalate --fail …``) and older callers pass no
-    class; a missing class must mean "ungoverned", never "deny".
+    class. Under B45 a missing class is not entitled — that empty class was the
+    431-row hole (escalations reaching ``gpt-5.6-sol`` with a blank class), so
+    escalation must not land on a plan model.
     """
     d = router.escalate_on_failure(
         failed_model="deepseek-v4-pro",
         error_type="timeout",
         requires_tools=True,
     )
-    assert d.selected_model == "gpt-5.6-sol", d.reason
     assert d.budget_class == "", d.reason
+    assert router.get_model_account(d.selected_model) != "openai-codex", d.reason
 
 
 def test_governor_disabled_preserves_escalation_behaviour(clean_state, monkeypatch):

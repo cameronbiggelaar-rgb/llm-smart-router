@@ -237,12 +237,14 @@ def test_tool_fallback_chain_does_not_contain_a_denied_plan_model(clean_state, g
     contain gpt-5.6-sol — the leak re-entering through failover. Regression
     guard for §5.5.
     """
-    # Non-vacuity: assert first that this configuration WOULD leak unfiltered.
-    # Without this the test passes trivially whenever the chain is empty.
-    unfiltered = router._build_tool_fallback_chain("deepseek-v4-pro")
+    # Non-vacuity: prove this configuration WOULD leak without the denial, by
+    # building the chain for an ENTITLED class (architectural) — the plan models
+    # must be present there, so the assertion below cannot pass just because the
+    # plan is dark.
+    unfiltered = router._build_tool_fallback_chain("deepseek-v4-pro", klass=gb.CLASS_ARCHITECTURAL)
     leaked = [m for m in unfiltered if router.get_model_account(m) == "openai-codex"]
     assert leaked, (
-        "guard is vacuous — the unfiltered chain contains no plan model, so "
+        "guard is vacuous — the entitled chain contains no plan model, so "
         "this test cannot detect the leak it exists to prevent"
     )
 

@@ -210,6 +210,11 @@ class RoutingDecision:
     # from a deliberate allow (B44a — 1,083 routine rows rode a blind probe onto
     # the plan with plan_budget_denied=0 and nothing logged).
     governor_fail_open: bool = False
+    # B45: True when the request NAMED a plan model. Under
+    # ``explicit_only: true`` this is the entitlement itself, so it is recorded
+    # on every governed row: it is what tells "served because asked" apart from
+    # "served because the old allowlist still admitted the class".
+    plan_explicit_request: bool = False
 
 
 @dataclass
@@ -1044,14 +1049,33 @@ def route_task(
             ):
                 forced_tool_model = force_model
         if forced_tool_model:
+            # B45: record the class and the explicit ask on this early return.
+            # It used to log an EMPTY class, which is how 431 escalations reached
+            # the plan with no class on the row: a blank class made the request
+            # look ungoverned, so no guard downstream would strip the plan.
+            forced_class = ""
+            try:
+                forced_class = _plan_classify(prompt, force_model)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("plan classifier unavailable (%s) — recording no class", exc)
+            forced_explicit = _plan_explicit(force_model)
             return RoutingDecision(
                 selected_model=forced_tool_model,
                 selected_provider=_get_provider(forced_tool_model),
                 reason=(
                     f"tool-bearing request — forced model {forced_tool_model} "
                     f"(tier {MODEL_CAPABILITY_TIERS.get(forced_tool_model, 0)})"
+                    + (
+                        "; plan model requested explicitly — operator intent wins"
+                        if forced_explicit
+                        else ""
+                    )
                 ),
-                fallback_chain=_build_tool_fallback_chain(forced_tool_model),
+                fallback_chain=_build_tool_fallback_chain(
+                    forced_tool_model, klass=forced_class or None, explicit=forced_explicit
+                ),
+                budget_class=forced_class,
+                plan_explicit_request=forced_explicit,
             )
 
         # ── Plan-budget governor (the leak) ──
@@ -1063,6 +1087,10 @@ def route_task(
         governed_model, budget_class, denied, closed, gov_blind = _apply_plan_governor(
             tool_model, prompt=prompt, force_model=force_model
         )
+        # B45: the ask is the entitlement under explicit_only, and it is recorded on
+        # every decision from this branch too — including the fail-closed one, so a
+        # refused request is not mistaken for an unclassified one.
+        tool_explicit = _plan_explicit(force_model)
         if denied:
             replacement = _reselect_without_plan(tool_floor)
             if not replacement:
@@ -1073,8 +1101,7 @@ def route_task(
                     selected_provider="",
                     reason=(
                         f"tool-bearing request — plan account denied to class "
-                        f"'{budget_class}' by plan governor (architectural "
-                        f"allowlist; gpt is reserved for architectural loads) "
+                        f"'{budget_class}' by plan governor ({_governor_cause(closed)}) "
                         f"and no non-plan tool-capable model is available "
                         f"(TOOL_CAPABLE_MODELS minus plan = "
                         f"{sorted(TOOL_CAPABLE_MODELS - set(models_in_account(_governed_account())))}) "
@@ -1084,12 +1111,9 @@ def route_task(
                     all_exhausted=True,
                     budget_class=budget_class,
                     plan_budget_denied=True,
+                    plan_explicit_request=tool_explicit,
                 )
-            cause = (
-                "hard cap reached"
-                if closed
-                else "architectural allowlist; gpt is reserved for architectural loads"
-            )
+            cause = _governor_cause(closed)
             return RoutingDecision(
                 selected_model=replacement,
                 selected_provider=_get_provider(replacement),
@@ -1099,9 +1123,13 @@ def route_task(
                     f"{replacement} (tier {MODEL_CAPABILITY_TIERS.get(replacement, 0)}, "
                     f"capability floor {tool_floor})"
                 ),
-                fallback_chain=_build_tool_fallback_chain(replacement, klass=budget_class),
+                fallback_chain=_build_tool_fallback_chain(
+                    replacement, klass=budget_class, explicit=tool_explicit
+                ),
                 budget_class=budget_class,
                 plan_budget_denied=True,
+                plan_explicit_request=tool_explicit,
+                governor_fail_open=gov_blind,
             )
 
         return RoutingDecision(
@@ -1111,11 +1139,16 @@ def route_task(
                 f"tool-bearing request — selected proven tool-capable model "
                 f"{governed_model} (tier {MODEL_CAPABILITY_TIERS.get(governed_model, 0)}, "
                 f"capability floor {tool_floor})"
-                + _governor_suffix(budget_class, gov_blind, governed_model)
+                + _governor_suffix(budget_class, gov_blind, governed_model, tool_explicit)
             ),
-            fallback_chain=_build_tool_fallback_chain(governed_model, klass=budget_class or None),
+            fallback_chain=_build_tool_fallback_chain(
+                governed_model,
+                klass=budget_class or None,
+                explicit=tool_explicit,
+            ),
             budget_class=budget_class,
             governor_fail_open=gov_blind,
+            plan_explicit_request=tool_explicit,
         )
 
     # ── Limp-home mode: local models only ──
@@ -1183,6 +1216,7 @@ def route_task(
                 fallback_chain=[],
                 all_exhausted=True,
             )
+        forced_explicit = _plan_explicit(force_model)
         return RoutingDecision(
             selected_model=force_model,
             selected_provider=_get_provider(force_model),
@@ -1191,6 +1225,10 @@ def route_task(
             budget_class=(
                 _plan_classify(prompt, force_model) if _is_plan_model(force_model) else ""
             ),
+            # B45: the ask itself is recorded. Under explicit_only this is the
+            # entitlement, and it is what tells "served because asked" apart from
+            # "served because the allowlist admitted the class".
+            plan_explicit_request=forced_explicit,
         )
 
     # ── Native Hermes session-compression workload ─────────────────────
@@ -1227,6 +1265,10 @@ def route_task(
     governed, budget_class, denied, closed, gov_blind = _apply_plan_governor(
         selected, prompt=prompt, force_model=force_model
     )
+    # B45: entitlement under explicit_only is the ASK. Derived here from the same
+    # signal the governor used, so this branch and the tool branch cannot
+    # disagree about a single request.
+    plan_explicit = _plan_explicit(force_model)
     if denied:
         # Design §131: degrade PREDICTABLY to deepseek-v4-pro (tier 8)
         # rather than fail closed. `min_tier` here is a quality floor, not a
@@ -1243,14 +1285,14 @@ def route_task(
                 selected_provider="",
                 reason=(
                     f"plan account denied to class '{budget_class}' by plan "
-                    f"governor ("
-                    f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
-                    f") and no non-plan model is available — failing closed"
+                    f"governor ({_governor_cause(closed)}) and no non-plan model "
+                    f"is available — failing closed"
                 ),
                 fallback_chain=[],
                 all_exhausted=True,
                 budget_class=budget_class,
                 plan_budget_denied=True,
+                plan_explicit_request=plan_explicit,
             )
         replaced_tier = MODEL_CAPABILITY_TIERS.get(replacement, 0)
         degraded = replaced_tier < min_tier
@@ -1259,16 +1301,18 @@ def route_task(
             selected_provider=_get_provider(replacement),
             reason=(
                 f"capability tier {min_tier} needed — plan account denied to "
-                f"class '{budget_class}' by plan governor ("
-                f"{'hard cap reached' if closed else 'architectural allowlist; gpt is reserved for architectural loads'}"
-                f") — selected {replacement} "
+                f"class '{budget_class}' by plan governor ({_governor_cause(closed)}) "
+                f"— selected {replacement} "
                 f"(tier {replaced_tier}{'; below the computed floor, degraded by design' if degraded else ''})"
             ),
             fallback_chain=_contain_plan_in_chain(
-                _build_fallback_chain(replacement, context_tokens), budget_class
+                _build_fallback_chain(replacement, context_tokens),
+                budget_class,
+                plan_explicit,
             ),
             budget_class=budget_class,
             plan_budget_denied=True,
+            plan_explicit_request=plan_explicit,
         )
     selected = governed or selected
 
@@ -1278,18 +1322,17 @@ def route_task(
         reason=(
             f"capability tier {min_tier} needed, selected {selected} "
             f"(tier {MODEL_CAPABILITY_TIERS.get(selected, 0)})"
-            + _governor_suffix(budget_class, gov_blind, selected)
+            + _governor_suffix(budget_class, gov_blind, selected, plan_explicit)
         ),
-        fallback_chain=(
-            _build_fallback_chain(selected, context_tokens)
-            if not budget_class
-            else _contain_plan_in_chain(
-                _build_fallback_chain(selected, context_tokens), budget_class
-            )
+        fallback_chain=_contain_plan_in_chain(
+            _build_fallback_chain(selected, context_tokens),
+            budget_class,
+            plan_explicit,
         ),
         all_exhausted=all_exhausted,
         budget_class=budget_class,
         governor_fail_open=gov_blind,
+        plan_explicit_request=plan_explicit,
     )
 
 
@@ -1444,12 +1487,28 @@ def _governed_account() -> str:
         return "openai-codex"
 
 
-def _governor_verdict(klass: str) -> str:
+def _plan_explicit(force_model: str) -> bool:
+    """Whether the request named a plan-account model.
+
+    B45: this is the ENTITLEMENT under ``explicit_only``, and the only thing
+    that grants the plan. It is deliberately not the classifier: the classifier
+    is a substring heuristic, so ordinary phrasing ("rethink the wording of this
+    email") classifies architectural and must never be what admits a request to
+    the plan.
+
+    The endpoint turns ANY client-supplied model name into ``force_model``
+    (biggie_llm_endpoint.py:4273), so the mere presence of the field is not an
+    ask — only naming a plan model is.
+    """
+    return _is_plan_model(force_model)
+
+
+def _governor_verdict(klass: str, explicit: bool = False) -> str:
     """Evaluate the plan policy for a class.
 
     Propagates the policy's own verdict verbatim — including
     ``VERDICT_UNVERIFIED`` when the account probe was unreadable — so callers can
-    tell "the allowlist allowed this" from "the governor was blind".
+    tell "the policy entitled this" from "the governor was blind".
 
     A governor *bug* (not a blind probe) fails OPEN: it must never wedge live
     traffic, and it is logged rather than silently returned.
@@ -1461,7 +1520,7 @@ def _governor_verdict(klass: str) -> str:
         if not getattr(cfg, "enabled", False):
             return gpt_budget.VERDICT_OPEN
         reading = gpt_budget.fetch_reading()
-        return gpt_budget.evaluate_policy(reading, cfg, klass=klass)
+        return gpt_budget.evaluate_policy(reading, cfg, klass=klass, explicit=explicit)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("plan governor unavailable (%s) — failing open", exc)
         try:
@@ -1491,19 +1550,23 @@ def _plan_classify(prompt: str, force_model: str) -> str:
         return "architectural"
 
 
-def _plan_denied_for_class(klass: str) -> bool:
-    """Whether the plan is refused to this class right now.
+def _plan_denied_for_class(klass: str, explicit: bool = False) -> bool:
+    """Whether the plan is refused to this request right now.
 
     Membership over the *refusal* verdicts, not ``!= VERDICT_OPEN``. The negated
     form silently grew a third answer when B44a added ``VERDICT_UNVERIFIED``: an
     unverifiable-but-served decision would have read as "denied" and started
     stripping plan models out of fallback chains we are in fact still using.
     Chains must agree with the decision.
+
+    ``explicit`` is threaded through so the escalation guards and the chain
+    strippers reach the SAME verdict the governor reached. A disagreement
+    between them is how the plan was re-entered through failover.
     """
     try:
         import gpt_budget
 
-        return _governor_verdict(klass) in (
+        return _governor_verdict(klass, explicit) in (
             gpt_budget.VERDICT_DENIED,
             gpt_budget.VERDICT_CLOSED,
         )
@@ -1521,16 +1584,42 @@ def _is_plan_model(model: str) -> bool:
         return False
 
 
-def _governor_suffix(klass: str, gov_blind: bool, model: str) -> str:
+def _governor_cause(closed: bool) -> str:
+    """Why the plan refused, in the words of the policy actually in force.
+
+    The literal "architectural allowlist; gpt is reserved for architectural
+    loads" is right under the allowlist and wrong under ``explicit_only`` (B45),
+    where the class was never the grant and an architectural prompt is refused
+    like any other. A reason string that names the wrong rule is how a refusal
+    becomes un-auditable.
+    """
+    if closed:
+        return "hard cap reached"
+    try:
+        import gpt_budget
+
+        if getattr(gpt_budget.load_governor_config(), "explicit_only", False):
+            return "explicit-request policy; the plan is served only on request"
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return "architectural allowlist; gpt is reserved for architectural loads"
+
+
+def _governor_suffix(
+    klass: str, gov_blind: bool, model: str, explicit: bool = False
+) -> str:
     """The reason suffix for a request the governor did not deny.
 
-    Three distinct facts, three distinct sentences — because the old suffix said
+    Distinct facts, distinct sentences — because the old suffix said
     "plan governor allowed class 'routine'" on **every** classified row, including
     ones where no plan model was in play and the allowlist was never consulted.
     That sentence is how 4,392 served routine GPT rows read as deliberate allows:
 
     * blind probe          → says so, plainly, and never claims "allowed";
     * plan model, verified → "allowed class 'X'" (a real verdict);
+    * explicit ask, verified → "plan model requested explicitly" — under
+      ``explicit_only`` the ASK is the entitlement, so the class is a label and
+      must not be described as the reason;
     * no plan model        → the class was *recorded*, not allowed. A routine
       deepseek pick never asked the allowlist anything.
     """
@@ -1539,6 +1628,8 @@ def _governor_suffix(klass: str, gov_blind: bool, model: str) -> str:
     if gov_blind:
         return f"; plan governor UNVERIFIED (account probe unreadable) — class '{klass}' not confirmed"
     if _is_plan_model(model):
+        if explicit:
+            return f"; plan governor allowed — plan model requested explicitly (class '{klass}' recorded, not the grant)"
         return f"; plan governor allowed class '{klass}'"
     return f"; plan governor recorded class '{klass}' (no plan model selected)"
 
@@ -1585,6 +1676,11 @@ def _apply_plan_governor(
         logger.warning("plan governor unavailable (%s) — failing open", exc)
         return selected, "", False, False, False
 
+    # B45: the entitlement under explicit_only is the ASK. Derived from the same
+    # signal ``_plan_classify`` uses, so "entitled" and "classified architectural"
+    # cannot drift apart.
+    explicit = _plan_explicit(force_model)
+
     # Classify BEFORE the plan-model test (B39). The class is an observation about
     # the request, not a consequence of selecting a plan model: while GPT was dark
     # no request selected one, so conditioning the classification on that left
@@ -1616,7 +1712,9 @@ def _apply_plan_governor(
 
     try:
         reading = gpt_budget.fetch_reading()
-        verdict = gpt_budget.evaluate_policy(reading, cfg, klass=klass)
+        verdict = gpt_budget.evaluate_policy(
+            reading, cfg, klass=klass, explicit=explicit
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("plan governor unavailable (%s) — failing open", exc)
         return selected, klass, False, False, False
@@ -1688,20 +1786,30 @@ def _reselect_without_plan_any_tier(min_tier: int = 0) -> str:
     return best
 
 
-def _contain_plan_in_chain(chain: List[str], klass: str) -> List[str]:
-    """Strip plan-account models from a fallback chain when the class is denied.
+def _contain_plan_in_chain(
+    chain: List[str], klass: str, explicit: bool = False
+) -> List[str]:
+    """Strip plan-account models from a fallback chain when the plan is denied.
 
     The chain walks *up* in tier, so a routine request served by
     ``deepseek-v4-pro`` would otherwise escalate straight into the ChatGPT plan
     — the leak re-entering through failover (§5.5). Architectural work keeps its
     full chain.
+
+    B45: an EMPTY class no longer keeps the plan. The old ``not klass``
+    short-circuit meant "no class recorded" was treated as "no restriction",
+    which is precisely the 431-row hole (escalations reaching ``gpt-5.6-sol``
+    with a blank class). The governor is now consulted either way, and under
+    ``explicit_only`` only an explicit ask survives.
     """
-    if not klass or not _plan_denied_for_class(klass):
+    if not _plan_denied_for_class(klass or "", explicit):
         return chain
     return [m for m in chain if not _is_plan_model(m)]
 
 
-def _build_tool_fallback_chain(current_model: str, *, klass: Optional[str] = None) -> List[str]:
+def _build_tool_fallback_chain(
+    current_model: str, *, klass: Optional[str] = None, explicit: bool = False
+) -> List[str]:
     """Build the escalation chain for a tool-capable model.
 
     Only includes other models that are ALSO proven tool-capable — escalation
@@ -1712,14 +1820,16 @@ def _build_tool_fallback_chain(current_model: str, *, klass: Optional[str] = Non
     plan — the leak re-entering through the back door (§5.5). When ``klass`` is
     supplied and the governor denies the plan to that class, plan-account models
     are excluded from the chain.
+
+    B45: the guard is no longer gated on a non-empty ``klass`` — a blank class
+    must not read as "unrestricted" — and ``explicit`` is threaded so the chain
+    reaches the same verdict the decision did.
     """
     current_tier = MODEL_CAPABILITY_TIERS.get(current_model, 0)
     # Hoisted out of the loop (B39): the verdict is a property of the request
     # class, not of each candidate model, so recomputing it per model scaled cost
-    # with the candidate count (~14 x 87 µs). Compute once, and only when a real
-    # class is present (``klass`` is None when the governor is off or the caller
-    # declined to pass a class; empty string means "no class recorded").
-    deny_plan = bool(klass) and _plan_denied_for_class(klass)
+    # with the candidate count (~14 x 87 µs). Compute once.
+    deny_plan = _plan_denied_for_class(klass or "", explicit)
     chain = []
     for model in get_available_models():
         if _normalize_model_name(model) not in TOOL_CAPABLE_MODELS:
@@ -1741,6 +1851,7 @@ def escalate_on_failure(
     context_tokens: int = 0,
     prefer_model: str = "",
     budget_class: str = "",
+    plan_explicit: bool = False,
 ) -> RoutingDecision:
     """Escalate to the next available model after a failure.
 
@@ -1928,9 +2039,8 @@ def escalate_on_failure(
                 # inherited class anyway: a routine request must not be routed
                 # onto the reserved plan by a preference, however configured.
                 and not (
-                    budget_class
-                    and _is_plan_model(pm_key)
-                    and _plan_denied_for_class(budget_class)
+                    _is_plan_model(pm_key)
+                    and _plan_denied_for_class(budget_class, plan_explicit)
                 )
             ):
                 return RoutingDecision(
@@ -1941,11 +2051,14 @@ def escalate_on_failure(
                         f"preferred fallback {prefer_model}"
                     ),
                     fallback_chain=_build_tool_fallback_chain(
-                        prefer_model, klass=budget_class or None
+                        prefer_model,
+                        klass=budget_class or None,
+                        explicit=plan_explicit,
                     ),
                     is_fallback=True,
                     original_model=failed_model,
                     budget_class=budget_class,
+                    plan_explicit_request=plan_explicit,
                 )
         best_tier = -1
         best_model = ""
@@ -1958,7 +2071,7 @@ def escalate_on_failure(
             # the plan. The tool ladder picks the most-capable tool model, which
             # is gpt-5.6-sol — so without this the leak re-enters through
             # failover (§3.1). An architectural request keeps the plan.
-            if budget_class and _is_plan_model(model) and _plan_denied_for_class(budget_class):
+            if _is_plan_model(model) and _plan_denied_for_class(budget_class, plan_explicit):
                 continue
             tier = MODEL_CAPABILITY_TIERS.get(model, 0)
             if tier > best_tier:
@@ -1970,11 +2083,14 @@ def escalate_on_failure(
                 selected_provider=_get_provider(best_model),
                 reason=f"tool escalation from {failed_model} ({error_type}) — fell to most-capable tool model {best_model}",
                 fallback_chain=_build_tool_fallback_chain(
-                    best_model, klass=budget_class or None
+                    best_model,
+                    klass=budget_class or None,
+                    explicit=plan_explicit,
                 ),
                 is_fallback=True,
                 original_model=failed_model,
                 budget_class=budget_class,
+                plan_explicit_request=plan_explicit,
             )
 
     for model in available:
@@ -1988,7 +2104,7 @@ def escalate_on_failure(
         # Inherited class: the capability ladder walks UP in tier, so a routine
         # request failing on deepseek-v4-pro (tier 8) would otherwise escalate
         # straight into the plan at tier 10.
-        if budget_class and _is_plan_model(model) and _plan_denied_for_class(budget_class):
+        if _is_plan_model(model) and _plan_denied_for_class(budget_class, plan_explicit):
             continue
         if tier > failed_tier:
             return RoutingDecision(
@@ -1996,11 +2112,14 @@ def escalate_on_failure(
                 selected_provider=_get_provider(model),
                 reason=f"escalation from {failed_model} ({error_type})",
                 fallback_chain=_contain_plan_in_chain(
-                    _build_fallback_chain(model, context_tokens), budget_class
+                    _build_fallback_chain(model, context_tokens),
+                    budget_class,
+                    plan_explicit,
                 ),
                 is_fallback=True,
                 original_model=failed_model,
                 budget_class=budget_class,
+                plan_explicit_request=plan_explicit,
             )
 
     # Inherited class with no upward move available: every model above the
@@ -2008,9 +2127,9 @@ def escalate_on_failure(
     # NON-PLAN model rather than plunging to local (tier 1) — the same
     # "fall DOWN to the next-most-capable" principle the tool ladder above
     # already applies, and the predictable degradation of design §131. Only
-    # reachable when a class is governed, so an ungoverned rollback is
-    # unaffected.
-    if budget_class and _plan_denied_for_class(budget_class):
+    # reachable when the plan is governed as denied, so an ungoverned rollback
+    # is unaffected.
+    if _plan_denied_for_class(budget_class, plan_explicit):
         fallback = ""
         fallback_tier = -1
         for model in available:
@@ -2039,11 +2158,14 @@ def escalate_on_failure(
                     f"{fallback} (tier {fallback_tier})"
                 ),
                 fallback_chain=_contain_plan_in_chain(
-                    _build_fallback_chain(fallback, context_tokens), budget_class
+                    _build_fallback_chain(fallback, context_tokens),
+                    budget_class,
+                    plan_explicit,
                 ),
                 is_fallback=True,
                 original_model=failed_model,
                 budget_class=budget_class,
+                plan_explicit_request=plan_explicit,
             )
 
     # Nothing available — try local as last resort (only for non-tool work,

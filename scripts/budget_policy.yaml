@@ -44,11 +44,18 @@ governor:
     # automatically with no edit here, because a 429 on the account caps every
     # model that draws on it.
     openai-codex:
-      # The ONLY class permitted on the plan. A class must be named here to
-      # reach the plan at all; everything else is refused.
+      # B45 (2026-10-08): the entitlement is the EXPLICIT ASK, not the class.
+      # With `explicit_only: true`, naming a plan model is the ONLY way to reach
+      # the plan — the classifier (a substring heuristic) stops granting
+      # anything. The allowlist below still governs NON-explicit paths only
+      # when `explicit_only` is false, so it is kept as the rollback rule.
+      explicit_only: true
+      # The ONLY class permitted on the plan when explicit_only is false.
+      # A class must be named here to reach the plan at all; everything else
+      # is refused.
       allowlist: [architectural]
-      # Explicit: routine gets none. Retained for legibility — the allowlist,
-      # not this knob, is what governs.
+      # Explicit routine requests are served under explicit_only (the ask is the
+      # entitlement); this ceiling is retained as the non-explicit rule.
       routine_ceiling_percent: 0
       # Absolute ceiling for every class, reactive backstop. At or above this the
       # plan is `closed` even for architectural work.
