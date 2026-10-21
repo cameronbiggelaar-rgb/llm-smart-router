@@ -14,20 +14,21 @@
 #         tier: N                         # override for this sub-type
 #
 # Tier reference:
-#   1  = llama3.1:8b         (local, free)
-#   3  = deepseek-v4-flash   (ollama-cloud, cheapest cloud)
-#   4  = minimax-m2.7:cloud  (ollama-cloud)
-#      = glm-5               (ollama-cloud)
-#      = glm-5.3-flash       (ollama-cloud, tier 5.5)
-#   6  = glm-5.3:cloud       (ollama-cloud)
-#   7  = deepseek-v4-pro     (ollama-cloud)
-#   8  = deepseek-v3.1:671b  (ollama-cloud, most expensive cloud)
-#   10 = gpt-5.5             (openai-codex)
-#   11 = gpt-5.6-luna        (openai-codex, agentic-coding)
-#   12 = gpt-5.6-terra       (openai-codex, agentic-coding)
-#   13 = gpt-5.6-sol         (openai-codex, agentic-coding, strongest 5.6)
-#   14 = gpt-6-astra         (openai-codex, explicit lane — force_model only,
-#                            never auto-selected)
+#   1    = llama3.1:8b         (local, free)
+#   2    = dolphin3            (local, free)
+#   3    = deepseek-v4.1-flash (ollama-cloud, cheapest cloud)
+#   4    = minimax-m3.1-flash  (ollama-cloud, flash tier)
+#   5.5  = glm-5.3-flash       (ollama-cloud)
+#   6    = glm-5.3             (ollama-cloud)
+#   6.5  = glm-5.2             (ollama-cloud)
+#   8    = minimax-m3          (ollama-cloud, frontier)
+#        = deepseek-v4-pro     (ollama-cloud)
+#   10   = gpt-5.5             (openai-codex)
+#   11   = gpt-5.6-luna        (openai-codex, agentic-coding)
+#   12   = gpt-5.6-terra       (openai-codex, agentic-coding)
+#   13   = gpt-5.6-sol         (openai-codex, agentic-coding, strongest 5.6)
+#   14   = gpt-6-astra         (openai-codex, explicit lane — force_model only,
+#                              never auto-selected)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 routing:

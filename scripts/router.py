@@ -522,7 +522,8 @@ def get_model_account(model: str) -> str:
     """
     from models import model_account
     # Exact registry name first: _normalize_model_name strips ":cloud"-style
-    # suffixes, which are part of some registry keys (minimax-m2.7:cloud).
+    # suffixes, which config backend keys carry (e.g. minimax-m3:cloud) but
+    # registry keys do not.
     for candidate in (model, _normalize_model_name(model)):
         acct = model_account(candidate)
         if acct:

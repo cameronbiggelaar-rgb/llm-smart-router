@@ -123,7 +123,8 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | dolphin3 | 0.0x | 2 | Local, free |
 | deepseek-v4.1-flash | **0.68x** | 3 | Cheapest rung of the compression ladder (cheaper than v4-flash on input AND output) |
 | deepseek-v4-flash | **1.0x** | 3 | Baseline — small, fast |
-| minimax-m2.7:cloud | **2.0x** | 4 | Mid-size |
+| minimax-m3.1-flash | **1.0x** | 4 | Flash tier (B46) |
+| minimax-m3 | **4.0x** | 8 | Frontier, parity with deepseek-v4-pro (B46) |
 | glm-5 | **2.0x** | 4 | Mid-size |
 | glm-5.2 | **3.0x** | 6 | Larger context |
 | qwen3.5 | **3.5x** | 7 | Cloud |
@@ -142,7 +143,8 @@ The "cost" values are **relative compute units** — a dimensionless measure of 
 | dolphin3 | local | 0.00 | 0.00 |
 | deepseek-v4.1-flash | ollama-cloud | 0.34 | 1.35 |
 | deepseek-v4-flash | ollama-cloud | 0.50 | 1.50 |
-| minimax-m2.7:cloud | ollama-cloud | 1.00 | 3.00 |
+| minimax-m3.1-flash | ollama-cloud | 0.50 | 1.50 |
+| minimax-m3 | ollama-cloud | 2.00 | 6.00 |
 | glm-5 | ollama-cloud | 1.00 | 3.00 |
 | glm-5.2 | ollama-cloud | 1.50 | 4.50 |
 | qwen3.5 | ollama-cloud | 1.75 | 5.25 |

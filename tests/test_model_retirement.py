@@ -11,8 +11,8 @@ reintroduce a dead model:
 * neither name is routable (MODEL_COST_ORDER / MODEL_CAPABILITY_TIERS);
 * `deepseek-v4-flash` is gone from TOOL_CAPABLE_MODELS;
 * neither name appears in the summariser ladder;
-* the tier-7 normal-chat band now resolves to `deepseek-v4-pro` (the
-  next-cheapest tier >= 7), not qwen3.5.
+* the tier-7 normal-chat band now resolves to `minimax-m3` (the
+  next-cheapest tier >= 7 after B46), not qwen3.5.
 """
 
 from __future__ import annotations
@@ -74,15 +74,15 @@ AUTO_ROUTABLE = [
 ]
 
 
-def test_tier_7_band_resolves_to_deepseek_v4_pro():
-    """The one band retirement changed: tier 7 now resolves to deepseek-v4-pro.
+def test_tier_7_band_resolves_to_minimax_m3():
+    """The tier-7 band resolves to the cheapest frontier model at tier >= 7.
 
-    qwen3.5 (tier 7) is retired with no replacement; the next-cheapest model at
-    tier >= 7 is deepseek-v4-pro (tier 8, $0.66). This is the deterministic
-    outcome of the price-ascending cost-order loop, not a special case.
+    After B46, minimax-m3 (tier 8, $0.60) undercuts deepseek-v4-pro (tier 8,
+    $1.32 peak), so it is the next-cheapest model at tier >= 7. This is the
+    deterministic outcome of the price-ascending cost-order loop, not a
+    special case.
     """
     selected = _cheapest_meeting(7, AUTO_ROUTABLE)
-    assert selected == "deepseek-v4-pro", (
-        f"tier-7 routing selected {selected}, expected deepseek-v4-pro after "
-        "qwen3.5 retirement"
+    assert selected == "minimax-m3", (
+        f"tier-7 routing selected {selected}, expected minimax-m3 after B46"
     )

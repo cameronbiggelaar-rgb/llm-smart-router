@@ -134,9 +134,9 @@ d = route_task(complexity_score=0.2, task_type="coding")
 check("Basic coding → tier 4+", MODEL_CAPABILITY_TIERS.get(d.selected_model, 0) >= 4,
       f"got {d.selected_model} (tier {MODEL_CAPABILITY_TIERS.get(d.selected_model, 0)})")
 
-# Mid complexity — should route to minimax/glm
+# Mid complexity — should route to minimax flash (tier 4)
 d = route_task(complexity_score=0.4, task_type="coding")
-check("Mid coding → minimax/glm (tier 4)", d.selected_model in ("minimax-m2.7:cloud", "glm-5"),
+check("Mid coding → minimax flash (tier 4)", d.selected_model == "minimax-m3.1-flash",
       f"got {d.selected_model}")
 
 # Complex with niche refs — should route to deepseek-v3.1 or gpt-5.5

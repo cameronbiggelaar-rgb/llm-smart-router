@@ -52,15 +52,19 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import models  # noqa: E402
 import unit_economics  # noqa: E402
 
-# ollama.com/pricing, retrieved 2026-09-12. (input, cached_input, output) per 1M.
+# ollama.com/pricing, retrieved 2026-10-22 (B46). (input, cached_input, output) per
+# 1M. deepseek-v4-pro and deepseek-v4.1-flash are PEAK rates (12:00-18:00 UTC
+# weekdays; off-peak is half). Retired names (deepseek-v4-flash, qwen3.5:397b,
+# minimax-m2.7:cloud) left the table; minimax-m3 / minimax-m3.1-flash are new
+# (vendor publishes no cached rate for them, so None).
 VENDOR_PUBLISHED = {
     "glm-5.3":            (Decimal("1.40"), Decimal("0.26"), Decimal("4.40")),
     "glm-5.2":            (Decimal("1.40"), Decimal("0.26"), Decimal("4.40")),
     "glm-5.3-flash":      (Decimal("0.15"), Decimal("0.03"), Decimal("0.50")),
-    "deepseek-v4-flash":  (Decimal("0.22"), Decimal("0.007"), Decimal("0.66")),
-    "deepseek-v4-pro":    (Decimal("0.66"), Decimal("0.022"), Decimal("1.98")),
-    "deepseek-v4.1-flash": (Decimal("0.15"), None, Decimal("0.60")),
-    "qwen3.5:397b":       (Decimal("0.60"), None, Decimal("3.60")),
+    "deepseek-v4-pro":    (Decimal("1.32"), Decimal("0.033"), Decimal("3.96")),
+    "deepseek-v4.1-flash": (Decimal("0.30"), None, Decimal("1.20")),
+    "minimax-m3":         (Decimal("0.60"), None, Decimal("2.40")),
+    "minimax-m3.1-flash": (Decimal("0.15"), None, Decimal("0.60")),
 }
 
 # The values our book carried BEFORE the correction. B17 found this drift; B18
@@ -71,7 +75,7 @@ VENDOR_PUBLISHED = {
 SUPERSEDED_DRIFT = {
     "glm-5.3": ("1.50", "4.50", "was high vs vendor 1.40 / 4.40"),
     "glm-5.2": ("1.50", "4.50", "was high vs vendor 1.40 / 4.40"),
-    "deepseek-v4-pro": ("2.00", "6.00", "was 3.03x high vs vendor 0.66 / 1.98"),
+    "deepseek-v4-pro": ("0.66", "1.98", "was off-peak; peak is 1.32 / 3.96 (B46 reprice)"),
 }
 
 
@@ -85,15 +89,20 @@ def test_price_book_has_no_silent_arithmetic_errors(db):
         assert i >= 0 and o >= 0, f"{model}: negative price"
 
 
-# Corrected prices in force since 2026-09-13 (vendor-verified).
+# Corrected prices in force since 2026-10-22 (vendor-verified, B46 peak reprice).
 CORRECTED = {
     "glm-5.3": ("1.40", "4.40"),
     "glm-5.2": ("1.40", "4.40"),
-    "deepseek-v4-pro": ("0.66", "1.98"),
+    "deepseek-v4-pro": ("1.32", "3.96"),
+    "minimax-m3": ("0.60", "2.40"),
+    "minimax-m3.1-flash": ("0.15", "0.60"),
 }
 
 
-@pytest.mark.parametrize("model", ["glm-5.3", "glm-5.2", "deepseek-v4-pro"])
+@pytest.mark.parametrize(
+    "model",
+    ["glm-5.3", "glm-5.2", "deepseek-v4-pro", "minimax-m3", "minimax-m3.1-flash"],
+)
 def test_corrected_price_matches_vendor(db, model):
     """B17 found the drift; B18 corrected the registry. Pin the corrected truth.
 

@@ -131,7 +131,8 @@ class FitSummary:
 # Relative compute ratios (unchanged by the B18 price correction — `ratio` is a
 # separate concept from the USD price columns; see the corrected table below):
 # deepseek-v4-flash 1.0x — small, fast, cheap
-# minimax-m2.7:cloud 2.0x — mid-size
+# minimax-m3.1-flash 1.0x — flash tier (B46)
+# minimax-m3 4.0x — frontier (parity with deepseek-v4-pro, B46)
 # glm-5 2.0x — mid-size
 # (glm-5.1 retired 2026-10-06: upstream HTTP 410 "was retired at 2026-09-25";
 #  never served once — see references/plan-registry-config-alignment.md)
@@ -141,7 +142,7 @@ class FitSummary:
 # gpt-5.5 30.0x — ChatGPT $20/mo, rate-limited, most capable
 #
 # USD prices are the vendor's published list rates (ollama.com/pricing,
-# re-verified 2026-09-13). They are what `unit_economics` charges per call, so
+# re-verified 2026-10-22). They are what `unit_economics` charges per call, so
 # they must match the vendor exactly — `tests/test_price_book_versioning.py`
 # enforces that. Correcting a price REQUIRES a new `date`: `seed_prices()` is
 # idempotent on `(model, effective_from)`, so editing a price at an
@@ -158,10 +159,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "dolphin3":           {"provider": "local",         "ratio": 0.0,  "input": 0.00,  "output": 0.00,  "tier": 2, "date": "2026-07-01"},
     "deepseek-v4.1-flash":{"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "cached": 0.0030, "tier": 3, "date": "2026-09-12"},
     "glm-5.3-flash":      {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.50,  "cached": 0.0038, "tier": 5.5, "date": "2026-09-12"},
-    "minimax-m2.7:cloud": {"provider": "ollama-cloud", "ratio": 2.0, "input": 0.30, "output": 1.20, "tier": 4, "date": "2026-09-13"},
+    "minimax-m3.1-flash": {"provider": "ollama-cloud",  "ratio": 1.0,  "input": 0.15,  "output": 0.60,  "tier": 4,   "date": "2026-10-22"},
     "glm-5.3": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6, "date": "2026-09-13"},
     "glm-5.2": {"provider": "ollama-cloud", "ratio": 3.0, "input": 1.40, "output": 4.40, "cached": 0.035, "tier": 6.5, "date": "2026-09-13"},
-    "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 0.66, "output": 1.98, "cached": 0.0165, "tier": 8, "date": "2026-09-13"},
+    "minimax-m3":         {"provider": "ollama-cloud",  "ratio": 4.0,  "input": 0.60,  "output": 2.40,  "tier": 8,   "date": "2026-10-22"},
+    "deepseek-v4-pro": {"provider": "ollama-cloud", "ratio": 4.0, "input": 1.32, "output": 3.96, "cached": 0.033, "tier": 8, "date": "2026-10-22"},
     "gpt-5.5":            {"provider": "openai-codex",  "ratio": 30.0, "input": 15.00, "output": 60.00, "tier": 10,"date": "2026-07-01"},
     "gpt-5.6-luna":       {"provider": "openai-codex",  "ratio": 32.0, "input": 16.00, "output": 64.00, "tier": 11,"date": "2026-09-05"},
     "gpt-5.6-terra":      {"provider": "openai-codex",  "ratio": 34.0, "input": 17.00, "output": 68.00, "tier": 12,"date": "2026-09-05"},
@@ -390,7 +392,7 @@ def get_model_cost(model: str, conn: sqlite3.Connection) -> Optional[ModelCost]:
     Reads the AUTHORITATIVE ``model_pricing`` table (newest effective row) and
     only falls back to the legacy ``model_costs`` table when no price is on
     record. The legacy table is frozen at 2026-07-01 and had drifted badly —
-    it reports ``deepseek-v4-pro`` at $2.00/$6.00 against the real $0.66/$1.98
+    it reports ``deepseek-v4-pro`` at $2.00/$6.00 against the real $1.32/$3.96
     (3x) and ``deepseek-v4-flash`` at $0.50/$1.50 against $0.22/$0.66 — so cost
     reports built on it overstated spend.
     """

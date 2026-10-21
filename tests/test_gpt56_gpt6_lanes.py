@@ -38,15 +38,13 @@ from router import (
 ALL_MODELS = [
     "llama3.1:8b",
     "dolphin3",
-    "deepseek-v4-flash",
-    "minimax-m2.7:cloud",
-    "glm-5",
-    "glm-5.1",
+    "deepseek-v4.1-flash",
+    "glm-5.3-flash",
+    "minimax-m3.1-flash",
     "glm-5.3",
     "glm-5.2",
-    "qwen3.5",
+    "minimax-m3",
     "deepseek-v4-pro",
-    "deepseek-v3.1:671b",
     "gpt-5.5",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
@@ -183,7 +181,7 @@ def test_routine_implement_still_routes_to_ollama_cloud():
     assert decision.selected_model not in {"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}, (
         f"routine implement should not hit gpt-5.6, got {decision.selected_model}"
     )
-    assert decision.selected_model in {"glm-5.3", "glm-5.2", "qwen3.5", "deepseek-v4-pro"}, (
+    assert decision.selected_model in {"glm-5.3", "glm-5.2", "minimax-m3", "deepseek-v4-pro"}, (
         f"routine implement should stay on ollama-cloud, got {decision.selected_model}"
     )
 
@@ -198,7 +196,7 @@ def test_routine_debug_crash_still_routes_to_ollama_cloud():
     assert decision.selected_model not in {"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}, (
         f"routine debug should not hit gpt-5.6, got {decision.selected_model}"
     )
-    assert decision.selected_model in {"qwen3.5", "deepseek-v4-pro", "glm-5.3", "glm-5.2"}, (
+    assert decision.selected_model in {"minimax-m3", "deepseek-v4-pro", "glm-5.3", "glm-5.2"}, (
         f"routine debug should stay on ollama-cloud, got {decision.selected_model}"
     )
 

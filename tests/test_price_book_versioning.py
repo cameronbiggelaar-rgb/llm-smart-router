@@ -34,28 +34,43 @@ import rollup  # noqa: E402
 from unit_economics import price_for, record_price, seed_prices  # noqa: E402
 from unit_economics import Price  # noqa: E402
 
-# ollama.com/pricing, retrieved 2026-09-13. (input, output) per 1M tokens.
-# glm-5.1 removed 2026-10-06 — the upstream retired it (HTTP 410) and it left
-# the registry; superseded price rows stay in the book for history.
+# ollama.com/pricing, retrieved 2026-10-22 (B46). (input, output) per 1M tokens.
+# deepseek-v4-pro is the PEAK rate ($1.32/$3.96): peak = 12:00-18:00 UTC
+# weekdays, off-peak is half ($0.66/$1.98). The ledger's governing principle is
+# *never understate*, so the peak rate is the single registered figure (see
+# references/plan-b46-model-mix-refresh.md).
+# glm-5.1 removed 2026-10-06 (upstream HTTP 410); minimax-m2.7:cloud retired
+# 2026-10-22 (0 calls, superseded by minimax-m3/m3.1-flash); superseded price
+# rows stay in the book for history.
 VENDOR_PUBLISHED = {
-    "deepseek-v4-pro": (Decimal("0.66"), Decimal("1.98")),
-    "minimax-m2.7:cloud": (Decimal("0.30"), Decimal("1.20")),
+    "deepseek-v4-pro": (Decimal("1.32"), Decimal("3.96")),
+    "minimax-m3": (Decimal("0.60"), Decimal("2.40")),
+    "minimax-m3.1-flash": (Decimal("0.15"), Decimal("0.60")),
     "glm-5.3": (Decimal("1.40"), Decimal("4.40")),
     "glm-5.2": (Decimal("1.40"), Decimal("4.40")),
 }
 
 # What the book charged before the correction, with the date it was in force.
-# Kept so the supersede test can reproduce production's starting state.
+# Only models that were actually *corrected* (had a prior price) belong here —
+# fresh registrations (minimax-m3, minimax-m3.1-flash) have nothing to
+# supersede, so the supersede tests parametrise over SUPERSEDED, not
+# VENDOR_PUBLISHED.
 SUPERSEDED = {
-    "deepseek-v4-pro": ("2.00", "6.00", "2026-07-01"),
-    "minimax-m2.7": ("1.00", "3.00", "2026-07-01"),
+    "deepseek-v4-pro": ("0.66", "1.98", "2026-09-13"),
     "glm-5.3": ("1.50", "4.50", "2026-08-26"),
     "glm-5.2": ("1.50", "4.50", "2026-09-04"),
 }
 
-# The date the correction takes effect. Must differ from every superseded date,
-# or the fix is a no-op.
-CORRECTION_DATE = "2026-09-13"
+# The date each model's current price took effect. A correction must carry a
+# *new* date or seed_prices() silently no-ops (idempotent on
+# (model, effective_from)).
+REGISTRY_DATE = {
+    "deepseek-v4-pro": "2026-10-22",
+    "minimax-m3": "2026-10-22",
+    "minimax-m3.1-flash": "2026-10-22",
+    "glm-5.3": "2026-09-13",
+    "glm-5.2": "2026-09-13",
+}
 
 
 @pytest.fixture()
@@ -87,8 +102,8 @@ def test_corrected_model_carries_the_correction_date(model):
     leaves the old date, ``seed_prices`` skips it and the fix does nothing.
     """
     cfg = models.MODEL_REGISTRY[model]
-    assert cfg["date"] == CORRECTION_DATE, (
-        f"{model} carries date {cfg['date']}, expected {CORRECTION_DATE}. "
+    assert cfg["date"] == REGISTRY_DATE[model], (
+        f"{model} carries date {cfg['date']}, expected {REGISTRY_DATE[model]}. "
         "Editing a price without moving its effective date is a silent no-op."
     )
 
@@ -120,7 +135,7 @@ def test_price_edit_without_date_bump_is_a_silent_noop(db, model):
     assert n >= 0  # no new row was written for this (model, date)
 
 
-@pytest.mark.parametrize("model", sorted(VENDOR_PUBLISHED))
+@pytest.mark.parametrize("model", sorted(SUPERSEDED))
 def test_seeding_supersedes_the_stale_price_but_keeps_it_on_record(db, model):
     """The real deploy path: production already holds the stale row.
 
@@ -128,7 +143,7 @@ def test_seeding_supersedes_the_stale_price_but_keeps_it_on_record(db, model):
     superseded row intact, so a historical call re-prices at the rate that was
     actually in force when it ran.
     """
-    base = model.split(":")[0]
+    base = model
     sup_in, sup_out, sup_date = SUPERSEDED[base]
     record_price(
         db,
@@ -137,7 +152,7 @@ def test_seeding_supersedes_the_stale_price_but_keeps_it_on_record(db, model):
 
     seed_prices(db)
 
-    want_in, want_out = VENDOR_PUBLISHED[model]
+    want_in, want_out = VENDOR_PUBLISHED[base]
     current = price_for(base, conn=db)
     assert current is not None, f"{base} lost its price entirely"
     assert current.input_usd_per_1m == want_in, (
@@ -155,10 +170,10 @@ def test_seeding_supersedes_the_stale_price_but_keeps_it_on_record(db, model):
     assert Decimal(str(old[0])) == Decimal(sup_in), "superseded price was rewritten"
 
 
-@pytest.mark.parametrize("model", sorted(VENDOR_PUBLISHED))
+@pytest.mark.parametrize("model", sorted(SUPERSEDED))
 def test_price_in_force_at_a_past_date_is_still_the_old_rate(db, model):
     """A call logged before the correction must not be re-priced retroactively."""
-    base = model.split(":")[0]
+    base = model
     sup_in, sup_out, sup_date = SUPERSEDED[base]
     record_price(
         db,
@@ -184,10 +199,10 @@ def test_seeding_is_still_idempotent_after_the_correction(db):
     assert first == second, "re-seeding added duplicate rows"
 
 
-def test_superseded_dates_are_all_distinct_from_the_correction_date():
-    """Guard the guard: if the correction date equals an old date, nothing lands."""
+def test_superseded_dates_are_all_distinct_from_the_registration_date():
+    """Guard the guard: if the registration date equals an old date, nothing lands."""
     for base, (_, _, sup_date) in SUPERSEDED.items():
-        assert sup_date != CORRECTION_DATE, (
-            f"{base}: correction date {CORRECTION_DATE} equals its superseded "
+        assert sup_date != REGISTRY_DATE[base], (
+            f"{base}: registration date {REGISTRY_DATE[base]} equals its superseded "
             "date — seed_prices would skip it"
         )

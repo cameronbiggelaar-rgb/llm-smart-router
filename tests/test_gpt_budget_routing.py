@@ -127,11 +127,11 @@ def test_non_tool_routine_high_complexity_does_not_take_plan(clean_state, monkey
 def test_denied_routine_still_gets_a_capable_model(clean_state, monkeypatch):
     """Denial re-selects, it does not degrade to nothing.
 
-    Design §131: degrade PREDICTABLY to deepseek-v4-pro (tier 8) — the
-    downgrade already proven at 99.97% success — rather than fail closed. On the
-    ordinary capability path `min_tier` is a quality floor, not a capability
-    wall, and trading a real answer for an error on the largest class of traffic
-    would be a worse failure than serving it at tier 8.
+    Design §131: degrade PREDICTABLY to minimax-m3 (tier 8) — after B46 the
+    cheapest frontier model, undercutting deepseek-v4-pro — rather than fail
+    closed. On the ordinary capability path `min_tier` is a quality floor, not
+    a capability wall, and trading a real answer for an error on the largest
+    class of traffic would be a worse failure than serving it at tier 8.
     """
     _govern(monkeypatch)
     d = router.route_task(
@@ -140,7 +140,7 @@ def test_denied_routine_still_gets_a_capable_model(clean_state, monkeypatch):
         prompt="refactor the parse loop",
         requires_tools=False,
     )
-    assert d.selected_model == "deepseek-v4-pro", d.reason
+    assert d.selected_model == "minimax-m3", d.reason
     assert router.MODEL_CAPABILITY_TIERS.get(d.selected_model, 0) >= 6
 
 

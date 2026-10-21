@@ -5,12 +5,13 @@
 | Model | Input/1M | Cached in | Output/1M | Context |
 |---|---|---|---|---|
 | deepseek-v4-flash | $0.22 | $0.007 | $0.66 | 1M |
-| deepseek-v4-pro | $0.66 | $0.022 | $1.98 | 1M |
+| deepseek-v4-pro | $1.32 (peak) / $0.66 (off) | $0.033 | $3.96 (peak) / $1.98 (off) | 1M |
 | **glm-5.3** | **$1.40** | $0.26 | **$4.40** | 1M |
 | **glm-5.2** | **$1.40** | $0.26 | **$4.40** | 1M |
 | **glm-5.3-flash** | **$0.15** | $0.03 | **$0.50** | 1M (vision/tools/thinking) |
 | glm-5.1 | $1.00 | $0.20 | $3.20 | 1M |
-| minimax-m2.7 | $0.30 | $0.06 | $1.20 | 1M |
+| minimax-m3 | $0.60 | — | $2.40 | 1M |
+| minimax-m3.1-flash | $0.15 | — | $0.60 | 1M |
 | qwen3.5:397b | $0.60 | — | $3.60 | 1M |
 | deepseek-v4.1-flash | not listed | — | — | 1M (library page exists) |
 
