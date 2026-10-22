@@ -214,7 +214,10 @@ def main():
         ORDER BY u.last_seen
     """, (period_start_ts,)).fetchall()
 
-    # Deduplicate by session_id — take the latest model_usage per session
+    # Deduplicate by session_id — one row per session. Only the distinct count
+    # and parent_session_id are consumed below, and parent_session_id is
+    # session-level (constant across a session's rows), so whether the kept row
+    # is the earliest or latest is immaterial.
     seen_sessions = set()
     session_list = []
     for r in usage:
@@ -345,7 +348,7 @@ def main():
                 failure_by_type[et] = failure_by_type.get(et, 0) + 1
             if (r["user_corrected"] if "user_corrected" in r.keys() else 0):
                 corrections += 1
-            if r["cheaper_model_would_work"]:
+            if (r["cheaper_model_would_work"] if "cheaper_model_would_work" in r.keys() else 0):
                 routing_misses += 1
 
         router_completion_rows = len(observed_rows)
