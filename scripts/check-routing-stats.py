@@ -595,8 +595,8 @@ def main():
             for et, cnt in sorted(failure_by_type.items(), key=lambda x: -x[1]):
                 print(f"    {et:34s} {cnt:6d}")
     print(f"  Corrections detected:  {corrections}")
-    if total_calls > 0:
-        print(f"  Correction rate:       {corrections / total_calls * 100:.2f}%")
+    if router_completion_rows > 0:
+        print(f"  Correction rate:       {corrections / router_completion_rows * 100:.2f}%")
     print(f"  Routing misses:        {routing_misses} (cheaper model would work)")
     print()
 

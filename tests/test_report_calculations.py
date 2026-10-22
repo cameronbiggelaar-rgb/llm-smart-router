@@ -370,6 +370,23 @@ def test_missing_fit_columns_do_not_zero_out_other_stats(tmp_path):
 
 # ── Day-over-day snapshot ────────────────────────────────────────────────────
 
+def test_correction_rate_uses_endpoint_population_not_total_calls(tmp_path):
+    """Regression: the correction rate denominator used to be ``total_calls``
+    (all API calls from state.db) while ``corrections`` is counted only over
+    endpoint observations (router_logs.db) — a cross-DB population mismatch that
+    silently diluted the rate. It must divide by ``router_completion_rows``."""
+    sdb = _state_db(tmp_path / "state.db", [_u("s1", "deepseek-v4-pro", 100)])
+    rdb = _router_db(tmp_path / "router.db", [
+        _r("biggie-llm", "minimax-m3", user_corrected=1),
+    ] + [
+        _r("biggie-llm", "minimax-m3") for _ in range(9)
+    ])
+    out = _run(sdb, rdb, tmp_path, json_out=False)
+
+    # 1 correction over 10 endpoint completions = 10.00% (not 1/100 = 1.00%).
+    assert "Correction rate:       10.00%" in out
+
+
 def test_snapshot_first_run_has_no_baseline(tmp_path):
     sdb = _state_db(tmp_path / "state.db", [_u("s1", "deepseek-v4-pro", 10)])
     rdb = _router_db(tmp_path / "router.db", [])
