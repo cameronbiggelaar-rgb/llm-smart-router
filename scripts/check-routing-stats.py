@@ -570,7 +570,7 @@ def main():
     print(f"  Actual compute units:  {actual_units:>10.1f}")
     print(f"  If all gpt-5.5:       {gpt55_units:>10.1f}")
     print(f"  Savings:              {savings_pct:>9.1f}%")
-    print(f"  Equivalent gpt-5.5 calls saved: {int(gpt55_units / 30.0 - total_calls):>6d}")
+    print(f"  Equivalent gpt-5.5 calls saved: {int((gpt55_units - actual_units) / COMPUTE_UNITS.get('gpt-5.5', 30.0)):>6d}")
     print()
 
     # ── Task type distribution ─────────────────────────────────────────────

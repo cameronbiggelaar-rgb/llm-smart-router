@@ -185,3 +185,35 @@ def test_report_json_has_completion_block(tmp_path):
     assert comp["failures"] == 1
     assert comp["success_rate_pct"] == 66.67
     assert comp["failure_by_type"] == {"timeout": 1}
+
+
+def test_equivalent_gpt55_calls_saved_matches_compute_savings(tmp_path):
+    """The "equivalent gpt-5.5 calls saved" line must track actual savings.
+
+    Regression guard for the always-zero display bug: the old formula was
+    ``gpt55_units / 30 - total_calls``, and since ``gpt55_units ==
+    total_calls * 30`` it collapsed to 0 every run, masking the savings
+    entirely. The correct value is ``(gpt55_units - actual_units) / 30`` —
+    the compute actually saved, expressed in gpt-5.5-call equivalents.
+    """
+    import re
+
+    state_db = str(tmp_path / "state.db")
+    router_db = str(tmp_path / "router_logs.db")
+    _make_state_db(state_db)
+    _make_router_db(router_db)
+
+    out = _run_report(state_db, router_db)
+
+    m = re.search(r"Equivalent gpt-5\.5 calls saved:\s+(-?\d+)", out)
+    assert m, "report is missing the equivalent-gpt-5.5-savings line"
+    reported = int(m.group(1))
+
+    # Fixture: 4 calls of "deepseek-v4-flash:cloud" -> canonical
+    # "deepseek-v4-flash" (retired, so COMPUTE_UNITS defaults to 1.0).
+    # actual_units = 4 * 1.0 = 4.0; gpt55_units = 4 * 30.0 = 120.0.
+    # Saved = (120 - 4) / 30 = 3 (floor). The buggy formula returned 0.
+    assert reported == 3, (
+        f"expected 3 equivalent gpt-5.5 calls saved, got {reported} — "
+        "the savings line no longer tracks actual compute saved"
+    )
