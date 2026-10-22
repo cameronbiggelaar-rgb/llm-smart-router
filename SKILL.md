@@ -117,11 +117,14 @@ A model change is never just a `MODEL_REGISTRY` edit — the user expects **all*
 3. `scripts/routing_table.yaml` tier-reference comment (tier → model; a retire/reprice flips which model a band resolves to).
 4. Doc tables: `SKILL.md` + `ARCHITECTURE.md` model/ratio tables, and `references/ollama-unit-economics.md` price table (a *living* reference — update it).
 5. Tests that pin the mix: `price_book_routing` / `price_book_versioning` / `price_book_drift` / `remove_dead_ollama_refs` / `gpt56_gpt6_lanes` / `scripts/test_biggie_endpoint.py` / `test_model_retirement` / `test_gpt_budget_routing`.
+6. Deploy & verify: `MODEL_REGISTRY` loads in-process, so a mix change needs a `biggie-llm-endpoint.service` restart (config-only edits hot-apply in ≤60s; a registry change does not). After restart, confirm `/health` shows the new `git_sha` and `stale: false`, then probe `router.route_task(...)` directly for each band you touched — a live probe is the proof the new mix is serving, not the restart itself.
 
 Rules that save a full pass:
 - **Historical records are frozen, never rewritten.** Prior plan docs under `references/`, `data/router_ops.log`, and ledger/DB rows mention retired models — leave them. A final grep for the retired name should surface ONLY historical records plus the tests now asserting its absence.
 - **`tests/test_registry_config_alignment.py` is dynamic** — it reads the live registry + config and asserts they agree, so it needs no edit. Run it first as the drift safety net.
 - **A cheaper frontier model flips every "cheapest meeting `min_tier`" assertion, not just the price-book test** (see Pitfalls). Grep the suite for the *workhorse* model name, not just the retired/added name, and run the FULL suite — the affected-files subset misses these.
+- **A post-restart log line showing the OLD workhorse model is not a regression.** Session compression returns from a separate curated summariser ladder (`_select_session_compression_model`) that price reorders never move, so the old workhorse keeps appearing there after it drops off the capability path. Trace which path produced the line (and probe `route_task` directly) before concluding the change didn't take.
+- **The denial-degradation path selects by tier, not price.** `_reselect_without_plan_any_tier` picks the highest-tier non-plan model (ties broken by cost order), so a cheaper same-tier model only wins the degrade target if it ties the old workhorse's tier — a cheaper model at a lower tier does not. Distinct from `_select_model`, which is cheapest-meeting-`min_tier`.
 
 ### Pricing model
 All models are **flat-subscription or free** — there's no per-call cost:
