@@ -1,9 +1,0 @@
-proposal:
-  generated: '2026-10-03T08:12:09.600874+00:00'
-  days: 3
-  quality_floor: 0.8
-  min_samples: 30
-  applied: false
-  note: Proposal only. NOT applied. Promotion requires a shadow experiment on real
-    traffic and an explicit human edit of routing_table.yaml.
-candidates: []

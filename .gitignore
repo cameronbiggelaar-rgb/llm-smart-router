@@ -17,6 +17,10 @@ data/compression_samples/
 # Routing-stats day-over-day baseline (rewritten on every nightly run)
 data/routing_stats_snapshot.json
 data/routing_stats_snapshot.json.tmp
+# Router operational log (appended by router_ops.py on every ops run)
+data/router_ops.log
+# Optimiser-generated candidate proposal (regenerated with a new timestamp each run)
+scripts/candidate_routing.yaml
 
 # IDE
 .vscode/
