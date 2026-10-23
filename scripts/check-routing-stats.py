@@ -10,14 +10,18 @@ Run daily to monitor routing effectiveness. Shows:
   - Routing table sub-type match counts
 
 Usage:
-  python3 check-routing-stats.py              # full report
+  python3 check-routing-stats.py              # full report (read-only vs snapshot)
   python3 check-routing-stats.py --brief      # one-line summary
   python3 check-routing-stats.py --json       # JSON output for dashboards
+  python3 check-routing-stats.py --save-snapshot   # persist the cumulative baseline
+                                                    # (nightly cron only; omitting it makes
+                                                    # ad-hoc runs read-only vs the baseline)
 """
 
 import sqlite3
 import sys
 import json
+import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Optional
@@ -71,11 +75,14 @@ def _load_snapshot() -> Optional[dict]:
 
 
 def _save_snapshot(snap: dict) -> None:
-    """Persist the cumulative snapshot (atomic-ish: tmp then rename)."""
-    tmp = SNAPSHOT_FILE + ".tmp"
+    """Persist the cumulative snapshot (atomic: unique tmp then rename)."""
+    Path(SNAPSHOT_FILE).parent.mkdir(parents=True, exist_ok=True)
+    # A per-process tmp path so two concurrent runs can never interleave writes
+    # into a shared temp file and move a half-written snapshot into place.
+    tmp = f"{SNAPSHOT_FILE}.tmp.{os.getpid()}"
     with open(tmp, "w") as fh:
         json.dump(snap, fh, indent=2)
-    Path(tmp).replace(SNAPSHOT_FILE)
+    os.replace(tmp, SNAPSHOT_FILE)
 
 
 def _delta(cur: float, prev):
@@ -190,6 +197,10 @@ def main():
     brief = "--brief" in sys.argv
     as_json = "--json" in sys.argv
     today = "--today" in sys.argv
+    # Snapshot persistence is opt-in so ad-hoc/verification runs can read the
+    # day-over-day baseline but never overwrite or race-corrupt it. Only the
+    # nightly cron passes --save-snapshot.
+    save_snapshot = "--save-snapshot" in sys.argv
 
     if today:
         period_start_dt = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -392,7 +403,8 @@ def main():
         "corrections": corrections,
         "routing_misses": routing_misses,
     }
-    _save_snapshot(snapshot)
+    if save_snapshot:
+        _save_snapshot(snapshot)
     dod = {
         "has_baseline": prev is not None,
         "calls": _delta(total_calls, prev.get("total_calls") if prev else None),
@@ -631,6 +643,8 @@ def main():
         }
         for lane, d in dod["lanes"].items():
             print(f"  Lane {lane_label.get(lane, lane):20s} {_signed(d)}")
+    if not save_snapshot:
+        print("  (manual run — snapshot not persisted; pass --save-snapshot to update the baseline)")
     print()
 
     conn.close()

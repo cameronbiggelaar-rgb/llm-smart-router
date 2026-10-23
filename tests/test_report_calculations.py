@@ -146,14 +146,15 @@ def _router_db(path: Path, rows: list[dict], *, fit_cols: bool = True) -> str:
 
 
 def _run(state_db: str, router_db: str, tmp_path: Path, *, json_out: bool = True,
-         snapshot: str | None = None):
+         snapshot: str | None = None, extra_args: list[str] | None = None):
     """Run main() against the given DBs, isolating the snapshot file."""
     crs.STATE_DB = state_db
     crs.ROUTER_LOGS = router_db
     crs.SNAPSHOT_FILE = str(snapshot or (tmp_path / "snapshot.json"))
     buf = io.StringIO()
     with redirect_stdout(buf):
-        sys.argv = ["check-routing-stats.py"] + (["--json"] if json_out else [])
+        sys.argv = ["check-routing-stats.py"] + (["--json"] if json_out else []) \
+            + (extra_args or [])
         crs.main()
     sys.argv = ["check-routing-stats.py"]
     return json.loads(buf.getvalue()) if json_out else buf.getvalue()
@@ -398,19 +399,45 @@ def test_snapshot_first_run_has_no_baseline(tmp_path):
 
 def test_snapshot_second_run_reports_deltas(tmp_path):
     snap = str(tmp_path / "snap.json")
-    # First run: 10 calls, no baseline.
+    # First run: 10 calls, no baseline. The cron passes --save-snapshot, so the
+    # baseline is persisted.
     sdb1 = _state_db(tmp_path / "s1.db", [_u("s1", "deepseek-v4-pro", 10)])
     rdb1 = _router_db(tmp_path / "r1.db", [])
-    out1 = _run(sdb1, rdb1, tmp_path, json_out=False, snapshot=snap)
+    out1 = _run(sdb1, rdb1, tmp_path, json_out=False, snapshot=snap,
+                extra_args=["--save-snapshot"])
     assert "first run — no prior baseline" in out1
 
     # Second run: 15 calls → +5 delta.
     sdb2 = _state_db(tmp_path / "s2.db", [_u("s1", "deepseek-v4-pro", 15)])
     rdb2 = _router_db(tmp_path / "r2.db", [])
-    out2 = _run(sdb2, rdb2, tmp_path, json_out=False, snapshot=snap)
+    out2 = _run(sdb2, rdb2, tmp_path, json_out=False, snapshot=snap,
+                extra_args=["--save-snapshot"])
 
     assert "first run — no prior baseline" not in out2
     assert "API calls:        +5" in out2
     # The persisted snapshot now carries the newer cumulative total.
     with open(snap) as fh:
         assert json.load(fh)["total_calls"] == 15
+
+
+def test_manual_run_without_flag_does_not_overwrite_snapshot(tmp_path):
+    """A run that omits --save-snapshot (ad-hoc/verification) must read the
+    baseline for deltas but leave the persisted snapshot untouched, so it can
+    never perturb or race-corrupt the cron's day-over-day baseline."""
+    snap = str(tmp_path / "snap.json")
+    # Cron run 1: 10 calls, writes baseline.
+    sdb1 = _state_db(tmp_path / "s1.db", [_u("s1", "deepseek-v4-pro", 10)])
+    rdb1 = _router_db(tmp_path / "r1.db", [])
+    _run(sdb1, rdb1, tmp_path, json_out=False, snapshot=snap,
+         extra_args=["--save-snapshot"])
+
+    # Manual run (no flag): 15 calls → reports +5 delta vs baseline ...
+    sdb2 = _state_db(tmp_path / "s2.db", [_u("s1", "deepseek-v4-pro", 15)])
+    rdb2 = _router_db(tmp_path / "r2.db", [])
+    out2 = _run(sdb2, rdb2, tmp_path, json_out=False, snapshot=snap)
+
+    assert "API calls:        +5" in out2
+    assert "snapshot not persisted" in out2
+    # ... but the snapshot still holds the cron's 10-call baseline.
+    with open(snap) as fh:
+        assert json.load(fh)["total_calls"] == 10
