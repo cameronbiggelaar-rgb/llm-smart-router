@@ -132,3 +132,18 @@ def test_numerically_consistent_monotonic_scale():
         assert min_v <= body["max_tokens"] <= max_v
         assert body["max_tokens"] >= prev
         prev = body["max_tokens"]
+
+
+def test_floor_calibration_clears_truncation_window():
+    """Regression: the raised floor must clear the observed truncation window.
+
+    The diagnosed truncation cluster emitted 16,973–19,314 output tokens at an
+    average failing context of ~24,643 because the old MIN (16,384) scaled to only
+    ~17,730 there. The 2026-10-24 calibration must grant strictly more than the
+    largest observed truncated output at that context.
+    """
+    assert ep.SESSION_COMPRESSION_MIN_MAX_TOKENS >= 24576
+    assert ep.SESSION_COMPRESSION_MAX_MAX_TOKENS >= 49152
+    body: dict = {}
+    ep.apply_session_compression_output_floor(body, "session_compression", input_tokens=24643)
+    assert body["max_tokens"] > 19314

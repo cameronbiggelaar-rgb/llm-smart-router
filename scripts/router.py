@@ -157,6 +157,21 @@ CHATGPT_PLAN_RESERVED_FROM_COMPRESSION = {
 # remembering to edit this file.
 COMPRESSION_RESERVED_PROVIDERS = {"openai-codex"}
 
+# Failure types that are model-*output* quality issues (not availability/defect).
+# Escalation on these must NOT increment the circuit-breaker failure count: the
+# backend is reachable and healthy, it just emitted bad output. ``truncation`` is
+# included because a truncated session_compression summary is the endpoint's own
+# output-floor shortfall, not a broken backend.
+_QUALITY_ERROR_TYPES = ("malformed_tool_call", "empty_content", "degeneration", "truncation")
+
+# The anti-over-escalation fence: compression *escalation* (a retry after a
+# failed or truncated summariser) must never reach a pro-tier model. The curated
+# ladder's top rung (deepseek-v4-pro) is a deliberate last-resort for very large
+# contexts on FIRST attempt, but escalation piling maintenance traffic onto a pro
+# model is exactly what this forbids. Everything tier 7+ (deepseek-v4-pro,
+# minimax-m3, gpt-5.x) is out of bounds for escalation; it caps at glm-5.2 (6.5).
+COMPRESSION_ESCALATION_MAX_TIER = 7
+
 # Defence in depth for names that are not in MODEL_REGISTRY (so the provider rule
 # above cannot see them). Normal routing only ever selects registered models, but
 # ``force_model`` can name an arbitrary string; a plan-family alias must not
@@ -1897,7 +1912,7 @@ def escalate_on_failure(
         if not (_existing and _existing.rate_limited_until
                 and _existing.rate_limited_until > time.time()):
             mark_rate_limited(failed_model_key)
-    elif error_type in ("malformed_tool_call", "empty_content", "degeneration"):
+    elif error_type in _QUALITY_ERROR_TYPES:
         # Model-output quality failures: the backend is reachable and healthy,
         # but the model emitted a malformed tool call or empty content.
         # Escalate to the next model WITHOUT incrementing the circuit-breaker
@@ -2528,8 +2543,20 @@ def _next_session_compression_rung(failed_model: str, context_tokens: int = 0) -
     summariser — never a more capable tool-calling model. Returning "" is a
     deliberate fail-closed: the ChatGPT plan must not absorb compaction traffic
     even when every rung is down.
+
+    The anti-over-escalation fence (``COMPRESSION_ESCALATION_MAX_TIER``) also
+    applies here: escalation caps below the pro tier, so a failed/truncated
+    summariser retries only among the cheap summarisers (flash, glm-5.3, glm-5.2)
+    and can never pile maintenance traffic onto deepseek-v4-pro / minimax-m3 /
+    gpt-5.x. deepseek-v4-pro remains a *first-attempt* option for very large
+    contexts via ``_select_session_compression_model``, but it is out of bounds
+    for escalation.
     """
     ladder = _session_compression_ladder(context_tokens)
+    ladder = [
+        m for m in ladder
+        if MODEL_CAPABILITY_TIERS.get(_normalize_model_name(m), 0) < COMPRESSION_ESCALATION_MAX_TIER
+    ]
     failed_key = _normalize_model_name(failed_model)
 
     start = 0
@@ -2546,7 +2573,8 @@ def _next_session_compression_rung(failed_model: str, context_tokens: int = 0) -
 
     # Every remaining rung is down. Fail open to any available non-reserved
     # summariser (a capacity incident must not become total compaction failure),
-    # but never onto the ChatGPT plan and never back onto the failed model.
+    # but never onto the ChatGPT plan, never onto a pro-tier model, and never
+    # back onto the failed model.
     for model in get_available_models():
         if _normalize_model_name(model) == failed_key:
             continue
@@ -2554,7 +2582,8 @@ def _next_session_compression_rung(failed_model: str, context_tokens: int = 0) -
             continue
         if _normalize_model_name(model) in EXCLUDED_FROM_AUTO_ROUTING:
             continue
-        if MODEL_CAPABILITY_TIERS.get(model, 0) >= 3:
+        tier = MODEL_CAPABILITY_TIERS.get(model, 0)
+        if 3 <= tier < COMPRESSION_ESCALATION_MAX_TIER:
             return model
     return ""
 

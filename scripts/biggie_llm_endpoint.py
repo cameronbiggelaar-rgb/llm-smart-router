@@ -187,13 +187,17 @@ _BUILD_STAMP: Dict[str, Any] = _capture_build_stamp()
 # native session-compression requests enough room for reasoning plus the summary;
 # models may still stop earlier, so this is a ceiling rather than reserved spend.
 SESSION_COMPRESSION_MIN_MAX_TOKENS = int(
-    os.environ.get("BIGGIE_SESSION_COMPRESSION_MIN_MAX_TOKENS", "16384")
+    os.environ.get("BIGGIE_SESSION_COMPRESSION_MIN_MAX_TOKENS", "24576")
 )
 # Scale the output floor with input size: DeepSeek's hidden reasoning trace eats
 # budget before visible summary content, so a fixed 16k floor runs out (yielding
 # finish_reason=length and a truncated/empty summary) on genuinely large inputs.
+# The 16,384→32,768 calibration granted only ~17-18K at real compression sizes
+# (~17-30K input), which is why 421/440 October compactions truncated; raised to
+# 24,576→49,152 (2026-10-24) so the floor clears the 16,973-19,314 observed
+# truncation window.
 SESSION_COMPRESSION_MAX_MAX_TOKENS = int(
-    os.environ.get("BIGGIE_SESSION_COMPRESSION_MAX_MAX_TOKENS", "32768")
+    os.environ.get("BIGGIE_SESSION_COMPRESSION_MAX_MAX_TOKENS", "49152")
 )
 SESSION_COMPRESSION_INPUT_FOR_MAX = int(
     os.environ.get("BIGGIE_SESSION_COMPRESSION_INPUT_FOR_MAX", "300000")
@@ -2403,6 +2407,39 @@ def _empty_content_reason(response: Any) -> str:
     return ""
 
 
+def _response_is_truncated(response: Any) -> bool:
+    """Return True if a completion stopped because it hit its output budget.
+
+    ``finish_reason == "length"`` means the model was mid-generation when the
+    token budget ran out. For a *session_compression* request that budget is the
+    endpoint's own floor (``apply_session_compression_output_floor``), so a
+    truncated summary is NOT a caller bug — it is a self-inflicted budget that
+    must escalate to the next summariser rung rather than surface a degenerate
+    partial summary to Hermes.
+    """
+    return _empty_content_reason(response) == "length"
+
+
+def _classify_failure_detail(detail: str) -> str:
+    """Classify a failure detail string into a router ``error_type``.
+
+    Model-output quality failures map to a specific type so ``escalate_on_failure``
+    escalates WITHOUT tripping the circuit breaker (the backend is reachable and
+    healthy; it just emitted bad output). Truncation is its own type: the summary
+    ran out of the endpoint's own output floor, which must escalate to the next
+    summariser rung, never count against the breaker.
+    """
+    if "malformed tool_call" in detail or "malformed function name" in detail:
+        return "malformed_tool_call"
+    if "degenerated" in detail:
+        return "degeneration"
+    if "truncated" in detail:
+        return "truncation"
+    if "empty content" in detail:
+        return "empty_content"
+    return "error"
+
+
 def _response_has_empty_content(response: Any) -> bool:
     """Return True if a chat-completion response has empty assistant content.
 
@@ -3618,6 +3655,16 @@ async def _preflight_openai_stream(
         # a second aiter_lines() call on the same response yields nothing. The
         # downstream stream must resume THIS iterator, never re-create it.
         pf.iterator = resp.aiter_lines()
+        # For session_compression the finish_reason arrives only on the FINAL
+        # chunk, after all content. A bounded preflight (commit at first content)
+        # therefore never learns whether the summary truncated — the exact gap
+        # that hands Hermes a truncated compaction and aborts the turn. So for
+        # compression we drain to [DONE], tracking finish_reason, and commit as
+        # "truncated" vs "ok" only once the stream is complete. The buffered list
+        # then holds the whole stream and _resume_stream replays it without
+        # re-reading the (exhausted) iterator.
+        full_drain = workload_type == "session_compression"
+        finish_reason_seen = ""
         async for line in pf.iterator:
             if not line:
                 continue
@@ -3636,20 +3683,19 @@ async def _preflight_openai_stream(
                     pf.saw_content = True
                 if saw_tool:
                     pf.saw_tool_calls = True
-                if saw_content or (saw_tool and workload_type != "session_compression"):
-                 pf.status = "ok"
-                 pf.buffered = buffered
-                 pf.response = resp
-                 return pf
-                if saw_tool and workload_type == "session_compression":
-                 pf.status = "empty"
-                 pf.error = "Backend emitted tool-call-only stream for session_compression"
-                 pf.buffered = buffered
-                 await resp.aclose()
-                 return pf
+                if saw_tool and full_drain and not pf.saw_content:
+                    # Tool-call-only stream for session_compression is empty.
+                    pf.status = "empty"
+                    pf.error = "Backend emitted tool-call-only stream for session_compression"
+                    pf.buffered = buffered
+                    await resp.aclose()
+                    return pf
                 if is_terminal:
                     if data == "[DONE]":
-                        pf.status = "empty"
+                        if full_drain and pf.saw_content:
+                            pf.status = "truncated" if finish_reason_seen == "length" else "ok"
+                        else:
+                            pf.status = "empty"
                     else:
                         pf.status = "error"
                         try:
@@ -3657,8 +3703,21 @@ async def _preflight_openai_stream(
                         except Exception:
                             pf.error = "upstream error"
                     pf.buffered = buffered
+                    pf.response = resp
                     await resp.aclose()
                     return pf
+                if saw_content or (saw_tool and not full_drain):
+                    # Non-compression commits at first meaningful content (bounded
+                    # preflight); compression keeps draining to [DONE] so the
+                    # finish_reason is known before committing.
+                    if not full_drain:
+                        pf.status = "ok"
+                        pf.buffered = buffered
+                        pf.response = resp
+                        return pf
+                reason = _sse_finish_reason(data)
+                if reason:
+                    finish_reason_seen = reason
     except httpx.RequestError as e:
         await resp.aclose()
         return _StreamPreflight(
@@ -3757,8 +3816,12 @@ async def _resume_stream(
         # Replay buffered events from the preflight
         for evt in pf.buffered:
             yield f"{evt}\n\n"
-        if pf.buffered and pf.buffered[-1] == "data: [DONE]":
-            return
+        # A full-drain session_compression preflight buffers the ENTIRE stream
+        # (including the trailing [DONE]); its iterator is therefore already
+        # exhausted. Mark that so the stats/content/on_summary pass below still
+        # runs over the buffered events, but the iterator-continuation is skipped
+        # rather than re-reading a spent iterator.
+        stream_already_complete = bool(pf.buffered and pf.buffered[-1] == "data: [DONE]")
         # Mid-stream degeneration alert: accumulate the raw streamed content and
         # scan it with the same repetition guard the non-streaming path uses.
         # The preflight stopped at the first content delta, so the degenerate
@@ -3786,8 +3849,9 @@ async def _resume_stream(
             stats["finish_reason"] = _reason
         # Continue the SAME iterator captured during preflight — never call
         # resp.aiter_lines() again (httpx responses are single-use; a second
-        # call silently drops the rest of the stream).
-        if pf.iterator is not None:
+        # call silently drops the rest of the stream). Skipped when the preflight
+        # already drained the stream to completion (full-drain compression).
+        if not stream_already_complete and pf.iterator is not None:
             async for line in pf.iterator:
                 if not line:
                     continue
@@ -4121,6 +4185,16 @@ async def proxy_to_backend_streaming(
                 status_code=502,
                 detail=f"Backend {backend_model} returned empty content",
             )
+        if request_body.get("_workload_type") == "session_compression" and _response_is_truncated(result):
+            logger.warning(
+                "Backend %s returned a truncated summary for %s, escalating",
+                provider,
+                backend_model,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {backend_model} returned truncated session compression summary",
+            )
         saw_content, saw_tool_calls = _response_delta_parts(result)
         if request_body.get("_workload_type") == "session_compression" and saw_tool_calls and not saw_content:
             logger.warning(
@@ -4169,6 +4243,17 @@ async def proxy_to_backend_streaming(
         raise HTTPException(
             status_code=502,
             detail=f"Backend {pf.backend_model} returned empty content",
+        )
+
+    if pf.status == "truncated":
+        logger.warning(
+            "Backend %s streamed a truncated summary for %s (preflight), escalating",
+            pf.provider,
+            pf.backend_model,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Backend {pf.backend_model} returned truncated session compression summary",
         )
 
     # Healthy — commit the downstream streaming response.
@@ -4522,7 +4607,7 @@ async def chat_completions(request: Request):
     ):
         logger.info(
             "Session compression max_tokens floor applied: %s",
-            SESSION_COMPRESSION_MIN_MAX_TOKENS,
+            body["max_tokens"],
         )
 
     # Proxy to the backend
@@ -4721,6 +4806,19 @@ async def chat_completions(request: Request):
                 status_code=502,
                 detail=f"Backend {decision.selected_model} returned empty content",
             )
+        # A truncated session_compression summary (finish_reason=length) is a
+        # self-inflicted output-floor shortfall, not a caller bug — escalate to
+        # the next summariser rung rather than hand Hermes a partial summary.
+        if workload_type == "session_compression" and _response_is_truncated(result):
+            logger.warning(
+                "Backend %s returned a truncated summary for %s, escalating...",
+                backend.get("provider"),
+                decision.selected_model,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Backend {decision.selected_model} returned truncated session compression summary",
+            )
         malformed_tool_error = _malformed_tool_call_error(result)
         if malformed_tool_error:
             logger.warning(
@@ -4797,14 +4895,7 @@ async def chat_completions(request: Request):
         # tripping the circuit breaker, while genuine provider/availability
         # errors count toward the breaker as before.
         detail = str(http_exc.detail)
-        if "malformed tool_call" in detail or "malformed function name" in detail:
-            fail_type = "malformed_tool_call"
-        elif "degenerated" in detail:
-            fail_type = "degeneration"
-        elif "empty content" in detail:
-            fail_type = "empty_content"
-        else:
-            fail_type = "error"
+        fail_type = _classify_failure_detail(detail)
         logger.warning("Backend %s failed (%s), escalating...", decision.selected_model, fail_type)
         # If this request was served by a split canary's treatment arm, a miss
         # must fall to the experiment's declared fallback (pro), never the
